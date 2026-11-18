@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect x="1" y="1" width="126" height="126" rx="28" fill="#09090b" stroke="#27272a" stroke-width="1.5"/>
+  <!-- Top White Module -->
+  <polygon
+    points="53,32 92,32 79,45 60,45 53,52 70,52 52,70 34,52"
+    fill="#ffffff"/>
+  <!-- Bottom Silver Module -->
+  <polygon
+    points="75,96 36,96 49,83 68,83 75,76 58,76 76,58 94,76"
+    fill="#9ca3af"/>
+</svg>

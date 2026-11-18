@@ -1,0 +1,15 @@
+[Unit]
+Description=SysAgent Personal Linux AI Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/sysagent
+ExecStart=%h/Projects/sysagent/.venv/bin/python -m sysagent.cli serve
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

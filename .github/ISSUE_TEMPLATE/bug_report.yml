@@ -1,0 +1,37 @@
+name: Bug Report
+description: Report a bug, crash, or unexpected behavior in SysAgent
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Please run `sysagent doctor` and paste relevant details below.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Run `sysagent chat`
+        2. Send '...'
+        3. Observe error...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics (`sysagent doctor` / logs)
+      render: shell
+      placeholder: Paste output of `sysagent doctor` or `journalctl --user -u sysagent -n 40`
+  - type: input
+    id: os
+    attributes:
+      label: Linux Distro & Python Version
+      placeholder: e.g. Arch Linux, Python 3.12
