@@ -853,6 +853,7 @@ class LocalMind:
             "available_presets": list(GGUF_PRESETS.keys()),
             "llama_cli_available": bool(shutil.which("llama-cli")),
             "llama_cpp_available": __import__("importlib.util").util.find_spec("llama_cpp") is not None,
+            "local_backend": os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower() or "auto",
             "llama_finetune_available": bool(shutil.which("llama-finetune")),
             "lora_status": self.weights.get("lora_status", "none"),
             "warm_model": get_warm_model_name(),
@@ -1369,8 +1370,10 @@ class LocalMind:
                 ex_block = "\n\nPast learned examples:\n" + "\n---\n".join(ex_lines)
         sys_msg = "\n".join(p for p in (system_instruction.strip(), role_hint, ex_block.strip()) if p)
 
-        srv_url = self._ensure_llama_server(gguf)
-        if srv_url:
+        def _try_server() -> str | None:
+            srv_url = self._ensure_llama_server(gguf)
+            if not srv_url:
+                return None
             try:
                 resp = httpx.post(
                     f"{srv_url}/v1/chat/completions",
@@ -1392,9 +1395,12 @@ class LocalMind:
                             return content
             except Exception:
                 pass
+            return None
 
-        llm = self._get_llama_cpp_model(gguf)
-        if llm is not None:
+        def _try_llama_cpp() -> str | None:
+            llm = self._get_llama_cpp_model(gguf)
+            if llm is None:
+                return None
             try:
                 res = llm.create_chat_completion(
                     messages=[
@@ -1411,44 +1417,60 @@ class LocalMind:
                         return content
             except Exception:
                 pass
-
-        llama_bin = shutil.which("llama-cli")
-        if not llama_bin or not gguf.is_file():
             return None
-        full_prompt = (
-            f"<|im_start|>system\n{sys_msg}<|im_end|>\n"
-            f"<|im_start|>user\n{prompt.strip()}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
-        try:
-            proc = subprocess.run(
-                [
-                    llama_bin,
-                    "-m",
-                    str(gguf),
-                    "-ngl",
-                    "99",
-                    "-c",
-                    "4096",
-                    "-n",
-                    "1024",
-                    "--temp",
-                    "0.2",
-                    "-no-cnv",
-                    "--no-display-prompt",
-                    "-p",
-                    full_prompt,
-                ],
-                input="",
-                capture_output=True,
-                text=True,
-                timeout=60,
+
+        def _try_cli() -> str | None:
+            llama_bin = shutil.which("llama-cli")
+            if not llama_bin or not gguf.is_file():
+                return None
+            full_prompt = (
+                f"<|im_start|>system\n{sys_msg}<|im_end|>\n"
+                f"<|im_start|>user\n{prompt.strip()}<|im_end|>\n"
+                "<|im_start|>assistant\n"
             )
-            if proc.returncode == 0 and proc.stdout.strip():
-                out = proc.stdout.strip()
-                return out.split("<|im_end|>")[0].strip()
-        except Exception:
-            pass
+            try:
+                proc = subprocess.run(
+                    [
+                        llama_bin,
+                        "-m",
+                        str(gguf),
+                        "-ngl",
+                        "99",
+                        "-c",
+                        "4096",
+                        "-n",
+                        "1024",
+                        "--temp",
+                        "0.2",
+                        "-no-cnv",
+                        "--no-display-prompt",
+                        "-p",
+                        full_prompt,
+                    ],
+                    input="",
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    out = proc.stdout.strip()
+                    return out.split("<|im_end|>")[0].strip()
+            except Exception:
+                pass
+            return None
+
+        backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
+        if backend in {"llama_cpp", "llama-cpp", "python"}:
+            order = (_try_llama_cpp, _try_server, _try_cli)
+        elif backend in {"llama_cli", "llama-cli", "cli"}:
+            order = (_try_cli, _try_server, _try_llama_cpp)
+        else:
+            order = (_try_server, _try_llama_cpp, _try_cli)
+
+        for runner in order:
+            out = runner()
+            if out:
+                return out
         return None
 
     def run_gguf_inference(

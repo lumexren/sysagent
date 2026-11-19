@@ -122,6 +122,25 @@ class LocalAndStorageImprovementsTests(unittest.TestCase):
             eng2 = NeuralEngine(storage=None, npz_file=npz, meta_file=meta)
             self.assertEqual(eng2.meta.get("custom_tag"), "fresh")
 
+    def test_local_backend_llama_cpp_priority(self) -> None:
+        mind = local_mind.LocalMind(storage=None)
+        calls: list[str] = []
+
+        class _FakeLlama:
+            def create_chat_completion(self, **kwargs):
+                return {"choices": [{"message": {"content": "hello from llama_cpp"}}]}
+
+        with patch.dict("os.environ", {"SYSAGENT_LOCAL_BACKEND": "llama_cpp"}), patch.object(
+            mind, "retrieve_similar_examples", return_value=[]
+        ), patch.object(
+            mind, "_ensure_llama_server", side_effect=lambda g: calls.append("server") or None
+        ), patch.object(
+            mind, "_get_llama_cpp_model", side_effect=lambda g: calls.append("llama_cpp") or _FakeLlama()
+        ):
+            out = mind._run_single_gguf(Path("/tmp/fake.gguf"), "hi")
+            self.assertEqual(out, "hello from llama_cpp")
+            self.assertEqual(calls, ["llama_cpp"])
+
 
 if __name__ == "__main__":
     unittest.main()
