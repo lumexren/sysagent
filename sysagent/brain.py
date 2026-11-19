@@ -55,6 +55,9 @@ class CognitiveBrain:
         self._consecutive_ignores: int = 0
         self._cooldown_until: float = 0.0
         self._last_cue_refresh: float = 0.0
+        from .cortex import NeuralBrainCortex
+
+        self.cortex = NeuralBrainCortex(settings, storage, watcher=watcher, brain=self)
 
     def start(self) -> None:
         if self._running or not self.settings.brain_enabled:
@@ -88,6 +91,7 @@ class CognitiveBrain:
         await asyncio.sleep(15)
         while self._running:
             try:
+                await asyncio.to_thread(self.cortex.tick)
                 res = await self.think_once(force=False)
                 if res.get("decision") == "ignore":
                     self._consecutive_ignores = min(4, self._consecutive_ignores + 1)

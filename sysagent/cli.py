@@ -1910,6 +1910,77 @@ def _cmd_notifications(
         sys.exit(1)
 
 
+def _cmd_cortex(
+    base_url: str,
+    action: str,
+    arg: str | None = None,
+    locale_override: str | None = None,
+) -> None:
+    loc = locale_override or get_settings().locale
+    hdrs = _auth_headers()
+    try:
+        if action == "dream":
+            try:
+                resp = httpx.post(f"{base_url}/api/cortex/dream", headers=hdrs, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                from .cortex import NeuralBrainCortex
+
+                with Storage() as st:
+                    data = NeuralBrainCortex(get_settings(), st).run_dream_cycle(force=True)
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return
+        if action == "heal":
+            try:
+                resp = httpx.post(f"{base_url}/api/cortex/heal", headers=hdrs, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                from .cortex import NeuralBrainCortex
+
+                with Storage() as st:
+                    data = NeuralBrainCortex(get_settings(), st).evaluate_predictive_healer(
+                        force=True, notify=False
+                    )
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return
+        if action == "flow" and arg is not None:
+            mode = None if arg.strip().lower() in {"auto", "clear", "reset"} else arg.strip().lower()
+            try:
+                resp = httpx.post(
+                    f"{base_url}/api/cortex/flow", json={"mode": mode}, headers=hdrs, timeout=5
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                from .cortex import NeuralBrainCortex
+
+                with Storage() as st:
+                    data = NeuralBrainCortex(get_settings(), st).set_flow_override(mode)
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return
+
+        try:
+            resp = httpx.get(f"{base_url}/api/cortex", headers=hdrs, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            from .cortex import NeuralBrainCortex
+
+            with Storage() as st:
+                data = NeuralBrainCortex(get_settings(), st).get_status()
+        if action == "habits":
+            print(json.dumps(data.get("habit_suggestions", []), indent=2, ensure_ascii=False))
+        elif action == "flow":
+            print(json.dumps(data.get("flow", {}), indent=2, ensure_ascii=False))
+        else:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception as exc:
+        print(f"{t('error_prefix', loc)}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     settings = get_settings()
     parser = argparse.ArgumentParser(
@@ -1971,6 +2042,9 @@ def main() -> None:
     notif_parser.add_argument("notif_action", nargs="?", default="list", choices=["list", "test"])
     notif_parser.add_argument("notif_args", nargs="*", help="Optional message for test notification")
     notif_parser.add_argument("-n", "--limit", type=int, default=20)
+    cortex_parser = sub.add_parser("cortex", help="Neural+Brain Cortex: status, dream cycle, predictive heal, habits, flow")
+    cortex_parser.add_argument("cortex_action", nargs="?", default="status", choices=["status", "dream", "heal", "habits", "flow"])
+    cortex_parser.add_argument("cortex_arg", nargs="?", default=None, help="Optional flow mode (deep_focus|meeting_media|idle_maintenance|normal|auto)")
 
     locale_override: str | None = None
     raw_argv = sys.argv[1:]
@@ -1987,7 +2061,7 @@ def main() -> None:
             filtered_argv.append(raw_argv[i])
             i += 1
 
-    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "notifications", "-h", "--help"}:
+    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "notifications", "cortex", "-h", "--help"}:
         args = parser.parse_args(filtered_argv)
         if args.subcommand == "serve":
             uvicorn.run(
@@ -2083,6 +2157,13 @@ def main() -> None:
                 args.notif_action,
                 args.notif_args,
                 args.limit,
+                locale_override,
+            )
+        elif args.subcommand == "cortex":
+            _cmd_cortex(
+                settings.base_url,
+                args.cortex_action,
+                args.cortex_arg,
                 locale_override,
             )
         return

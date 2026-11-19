@@ -271,7 +271,29 @@ async def api_brain() -> dict[str, Any]:
         "questions": storage.list_brain_questions("pending"),
         "rules": storage.list_brain_rules(),
         "thoughts": storage.list_brain_thoughts(limit=20),
+        "cortex": await asyncio.to_thread(brain.cortex.get_status),
     }
+
+
+@app.get("/api/cortex")
+async def api_cortex() -> dict[str, Any]:
+    return await asyncio.to_thread(brain.cortex.get_status)
+
+
+@app.post("/api/cortex/dream")
+async def api_cortex_dream() -> dict[str, Any]:
+    return await asyncio.to_thread(brain.cortex.run_dream_cycle, True)
+
+
+@app.post("/api/cortex/heal")
+async def api_cortex_heal() -> dict[str, Any]:
+    return await asyncio.to_thread(brain.cortex.evaluate_predictive_healer, True, True)
+
+
+@app.post("/api/cortex/flow")
+async def api_cortex_flow(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    mode = (body or {}).get("mode")
+    return await asyncio.to_thread(brain.cortex.set_flow_override, mode)
 
 
 @app.post("/api/brain/think")

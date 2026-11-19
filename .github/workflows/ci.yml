@@ -28,4 +28,4 @@ jobs:
           PYTHONPATH=. python tests/test_self_learn.py
           PYTHONPATH=. python tests/test_auto_coverage.py
           PYTHONPATH=. python tests/test_evolve_16.py
-          PYTHONPATH=. python -m unittest tests/test_snapshots_top.py tests/test_local_improvements.py tests/test_mcp_bench_schedule.py tests/test_notification.py -v
+          PYTHONPATH=. python -m unittest tests/test_snapshots_top.py tests/test_local_improvements.py tests/test_mcp_bench_schedule.py tests/test_notification.py tests/test_cortex.py -v
