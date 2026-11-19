@@ -1069,7 +1069,7 @@ class SelfEvolver:
         if self._evolve_lock.locked():
             return {"status": "skipped", "reason": "evolve_already_running"}
         cortex = getattr(self, "cortex", None)
-        if not force and cortex is not None:
+        if cortex is not None:
             flow = getattr(cortex, "last_flow", None) or {}
             if flow.get("suppress_low_priority"):
                 return {"status": "deferred", "reason": f"cortex_flow:{flow.get('mode', 'focus')}"}
