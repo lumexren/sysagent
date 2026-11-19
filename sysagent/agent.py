@@ -1022,6 +1022,23 @@ class AgentManager:
                 for call in function_calls:
                     function_results.append(await _run_single_tool(call))
 
+            if len(function_calls) == 1 and function_calls[0].name == "switch_model":
+                try:
+                    sw = json.loads(str(function_results[0].get("result") or "{}"))
+                except Exception:
+                    sw = {}
+                if sw.get("status") == "ok":
+                    m_name = str(sw.get("model") or "auto")
+                    loc_code = (locale or self.settings.locale or "en").lower()
+                    reply = (
+                        f"Aktif model {m_name} olarak değiştirildi."
+                        if loc_code.startswith("tr")
+                        else f"Active model switched to {m_name}."
+                    )
+                    self.storage.add_message(session_id, "assistant", reply)
+                    await _emit({"type": "assistant_message", "text": reply})
+                    return reply
+
             await _emit({"type": "status", "message": f"step {step_count}: processing tool results..."})
             interaction = await self._call_model_with_failover(
                 session_id,
