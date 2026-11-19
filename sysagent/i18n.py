@@ -55,7 +55,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "SysAgent daemon is not running! Start it with:\n"
             "  systemctl --user start sysagent\n"
             "or in foreground:\n"
-            "  sysagent serve"
+            "  {cli} serve"
         ),
         "cli_chat_started": "CLI chat started (session: {session_id}). Type 'exit' to quit.",
         "cli_you": "You",
@@ -72,7 +72,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "cli_name_saved": "Assistant name saved ({path}): {name}",
         "quick_prompt": "What would you like me to do?",
         "quick_title": "{name} Quick",
-        "cli_no_last_error": "No failed command recorded yet. Run `sysagent hook` to set up the shell hook.",
+        "cli_no_last_error": "No failed command recorded yet. Run `{cli} hook` to set up the shell hook.",
         "notif_yes": "Yes (Apply)",
         "notif_reply": "Reply...",
         "notif_dismiss": "Dismiss",
@@ -133,7 +133,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "SysAgent daemon çalışmıyor! Başlatmak için:\n"
             "  systemctl --user start sysagent\n"
             "veya ön planda:\n"
-            "  sysagent serve"
+            "  {cli} serve"
         ),
         "cli_chat_started": "CLI sohbeti başladı (oturum: {session_id}). Çıkmak için 'exit' yazın.",
         "cli_you": "Sen",
@@ -150,7 +150,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "cli_name_saved": "Asistanın adı kaydedildi ({path}): {name}",
         "quick_prompt": "Ne yapmamı istersin?",
         "quick_title": "{name} Hızlı Komut",
-        "cli_no_last_error": "Henüz kaydedilmiş hatalı komut yok. Shell kancasını kurmak için `sysagent hook` çalıştırın.",
+        "cli_no_last_error": "Henüz kaydedilmiş hatalı komut yok. Shell kancasını kurmak için `{cli} hook` çalıştırın.",
         "notif_yes": "Evet (Uygula)",
         "notif_reply": "Yanıtla...",
         "notif_dismiss": "Yoksay",
@@ -179,11 +179,21 @@ def resolve_locale(locale: str | None) -> str:
 
 def get_translations(locale: str | None) -> dict[str, str]:
     """Return full translation dictionary for the resolved locale."""
-    return TRANSLATIONS[resolve_locale(locale)]
+    from .config import get_cli_bin_name
+
+    cli_bin = get_cli_bin_name()
+    return {
+        k: (v.replace("{cli}", cli_bin) if "{cli}" in v else v)
+        for k, v in TRANSLATIONS[resolve_locale(locale)].items()
+    }
 
 
 def t(key: str, locale: str | None = None, /, **kwargs: Any) -> str:
     """Translate a key for the given locale with optional format arguments (positional-only key/locale prevents kwargs collision)."""
     lang = resolve_locale(locale)
     template = TRANSLATIONS[lang].get(key) or TRANSLATIONS["en"].get(key, key)
+    if "{cli}" in template and "cli" not in kwargs:
+        from .config import get_cli_bin_name
+
+        kwargs["cli"] = get_cli_bin_name()
     return template.format(**kwargs) if kwargs else template

@@ -743,7 +743,7 @@ class AgentManager:
                         "error": f"Internal runtime error in {call.name}: {exc}",
                         "location": loc_hint,
                         "traceback": "\n".join(tb_lines[-6:]),
-                        "self_repair_hint": "You can inspect this file/line under /home/eren/Projects/sysagent/sysagent and fix it directly if the user wants.",
+                        "self_repair_hint": f"You can inspect this file/line under {Path(__file__).resolve().parent} and fix it directly if the user wants.",
                     },
                     ensure_ascii=False,
                 )

@@ -1057,7 +1057,7 @@ _sysagent_err_hook() {{
   fi
 }}
 PROMPT_COMMAND="_sysagent_err_hook${{PROMPT_COMMAND:+; $PROMPT_COMMAND}}"
-alias fix="sysagent fix"
+alias fix="{_prog_name()} fix"
 """)
 
 
@@ -1662,12 +1662,9 @@ def _cmd_rollback(
 
 
 def _prog_name() -> str:
-    from pathlib import Path
+    from .config import get_cli_bin_name
 
-    argv0 = Path(sys.argv[0]).name if sys.argv else ""
-    if argv0 and argv0 not in {"cli.py", "__main__.py", "-c"}:
-        return argv0
-    return get_settings().agent_name.strip().lower().replace(" ", "-") or "sysagent"
+    return get_cli_bin_name()
 
 
 def _parse_schedule_spec(spec: str) -> tuple[str, str]:

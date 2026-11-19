@@ -336,7 +336,7 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
             "properties": {
                 "subject": {"type": "string", "description": "Entity name (e.g. 'garnet-oss')."},
                 "relation": {"type": "string", "description": "Relationship (e.g. 'located_at', 'uses_language')."},
-                "object": {"type": "string", "description": "Target value (e.g. '/home/eren/Documents/...')."},
+                "object": {"type": "string", "description": "Target value (e.g. '~/Documents/...')."},
             },
             "required": ["subject", "relation", "object"],
         },

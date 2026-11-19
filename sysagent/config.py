@@ -172,3 +172,17 @@ def persist_env_var(key: str, value: str) -> Path:
     ENV_FILE.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     os.environ[key] = value
     return ENV_FILE
+
+
+def get_cli_bin_name() -> str:
+    """Return the active CLI binary name dynamically (argv[0] -> SYSAGENT_BIN -> agent_name)."""
+    import sys
+
+    argv0 = Path(sys.argv[0]).name if sys.argv else ""
+    if argv0 and argv0 not in {"cli.py", "__main__.py", "-c", "pytest", "unittest"} and not argv0.startswith("python"):
+        return argv0
+    env_bin = os.environ.get("SYSAGENT_BIN", "").strip()
+    if env_bin:
+        return env_bin
+    name = get_settings().agent_name.strip().lower().replace(" ", "-")
+    return name or "sysagent"

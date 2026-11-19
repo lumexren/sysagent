@@ -15,7 +15,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from .config import CONFIG_DIR, Settings, get_settings, persist_env_var
+from .config import CONFIG_DIR, Settings, get_cli_bin_name, get_settings, persist_env_var
 
 
 OAUTH_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -451,7 +451,7 @@ def build_genai_client(settings: Settings) -> Any:
         return genai.Client(api_key=settings.gemini_api_key)
 
     raise RuntimeError(
-        "No Gemini credentials configured. Run `sysagent login` "
+        f"No Gemini credentials configured. Run `{get_cli_bin_name()} login` "
         "or set GEMINI_API_KEY in ~/.config/sysagent/.env."
     )
 
@@ -496,7 +496,7 @@ def run_oauth_login(
     if not secrets_path.is_file():
         raise FileNotFoundError(
             f"OAuth client secrets file not found: {secrets_path}\n"
-            "Either install `gcloud` and run `sysagent login`, or download a Desktop App OAuth 2.0 JSON "
+            f"Either install `gcloud` and run `{get_cli_bin_name()} login`, or download a Desktop App OAuth 2.0 JSON "
             "from Google Cloud Console and pass --client-secret /path/to/client_secret.json."
         )
 
@@ -613,7 +613,7 @@ class AuthManager:
         if self._client is None:
             raise RuntimeError(
                 "No Gemini credentials configured. Set GEMINI_API_KEY in ~/.config/sysagent/.env "
-                "or run `sysagent login` for Google OAuth."
+                f"or run `{get_cli_bin_name()} login` for Google OAuth."
             )
         return self._client
 
