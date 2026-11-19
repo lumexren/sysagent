@@ -127,7 +127,7 @@ DEFAULT_GGUF_NAME = GGUF_PRESETS["qwen2.5-1.5b"]["filename"]
 TEACHER_MODELS: tuple[str, ...] = (
     "gemini-3.8-flash-low",
     "gemini-4-argon-low",
-    "gpt-oss-120b-medium",
+    "gemini-4-neon-low",
 )
 
 SEED_CURRICULUM: list[dict[str, Any]] = [
