@@ -627,11 +627,11 @@ def prune_stale_codebase_memories(storage: Storage, force: bool = False) -> int:
     for mem in storage.list_memories():
         key = str(mem.get("key") or "")
         low = key.lower()
-        if any(low.startswith(p) for p in _STALE_CODE_MEM_PREFIXES) or low.endswith(
-            ("_technical_debt", "_refactoring_state")
-        ):
-            if storage.delete_memory(key):
-                removed += 1
+        if (
+            any(low.startswith(p) for p in _STALE_CODE_MEM_PREFIXES)
+            or low.endswith(("_technical_debt", "_refactoring_state"))
+        ) and storage.delete_memory(key):
+            removed += 1
     if head:
         storage.set_memory("_internal:codebase_head", head)
     return removed

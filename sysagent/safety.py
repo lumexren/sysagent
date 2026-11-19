@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import re
 import shlex
+import weakref
 from dataclasses import dataclass
 from typing import Any
+
+from .logging_setup import get_logger
+
+logger = get_logger(__name__)
 
 
 SAFE_TOOLS = frozenset(
@@ -81,13 +86,11 @@ SAFE_SHELL_COMMANDS = frozenset(
         "wc",
         "grep",
         "rg",
-        "find",
         "fd",
         "which",
         "whereis",
         "file",
         "stat",
-        "env",
         "printenv",
         "echo",
         "journalctl",
@@ -97,10 +100,147 @@ SAFE_SHELL_COMMANDS = frozenset(
         "lsusb",
         "lspci",
         "sensors",
-        "git",
-        "systemctl",
     }
 )
+
+_FIND_DANGEROUS_FLAGS = frozenset(
+    {
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-delete",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+        "-fls",
+    }
+)
+
+_SAFE_GIT_SUBCOMMANDS = frozenset(
+    {
+        "status",
+        "log",
+        "diff",
+        "show",
+        "rev-parse",
+        "describe",
+        "ls-files",
+        "ls-tree",
+        "blame",
+        "shortlog",
+        "reflog",
+        "cat-file",
+        "branch",
+        "tag",
+        "remote",
+    }
+)
+
+_GIT_DANGEROUS_GLOBAL_FLAGS = frozenset(
+    {"-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack"}
+)
+
+_GIT_MUTATING_BRANCH_TAG_FLAGS = frozenset(
+    {
+        "-d",
+        "-D",
+        "-m",
+        "-M",
+        "-c",
+        "-C",
+        "-f",
+        "--force",
+        "--delete",
+        "--move",
+        "--copy",
+        "--edit-description",
+        "--set-upstream-to",
+        "--unset-upstream",
+        "-a",
+        "-s",
+        "-u",
+        "--annotate",
+        "--sign",
+    }
+)
+
+_SAFE_SYSTEMCTL_SUBCOMMANDS = frozenset(
+    {
+        "status",
+        "is-active",
+        "is-enabled",
+        "is-failed",
+        "is-system-running",
+        "list-units",
+        "list-unit-files",
+        "list-timers",
+        "list-sockets",
+        "list-dependencies",
+        "list-jobs",
+        "show",
+        "cat",
+    }
+)
+
+_SYSTEMCTL_FLAGS_WITH_VALUE = frozenset({"-t", "--type", "--state", "-n", "--lines", "-p", "--property", "-H", "--host", "-M", "--machine"})
+
+
+def _is_safe_conditional_command(base_cmd: str, tokens: list[str]) -> bool:
+    """Validate read-only usage of shell commands that also have mutating subcommands/flags."""
+    args = tokens[1:]
+    if base_cmd == "env":
+        # Safe only when printing environment variables (no command execution).
+        return len(args) == 0
+
+    if base_cmd == "find":
+        return not any(tok in _FIND_DANGEROUS_FLAGS for tok in args)
+
+    if base_cmd == "git":
+        idx = 0
+        while idx < len(args) and args[idx].startswith("-"):
+            flag = args[idx]
+            flag_name = flag.split("=", 1)[0]
+            if flag_name in _GIT_DANGEROUS_GLOBAL_FLAGS:
+                return False
+            if flag in {"-C", "--git-dir", "--work-tree"}:
+                idx += 2
+            else:
+                idx += 1
+        if idx >= len(args):
+            return False
+        sub = args[idx]
+        if sub not in _SAFE_GIT_SUBCOMMANDS:
+            return False
+        sub_args = args[idx + 1 :]
+        if sub in {"branch", "tag"}:
+            # Allow only listing/read-only flags; reject mutating flags or creating a new branch/tag.
+            for a in sub_args:
+                if a.split("=", 1)[0] in _GIT_MUTATING_BRANCH_TAG_FLAGS:
+                    return False
+                if not a.startswith("-"):
+                    return False
+        elif sub == "remote":
+            # Only `git remote` or `git remote -v` / `--verbose`
+            if any(a not in {"-v", "--verbose"} for a in sub_args):
+                return False
+        elif sub == "reflog" and any(a in {"expire", "delete"} for a in sub_args):
+            return False
+        return True
+
+    if base_cmd == "systemctl":
+        idx = 0
+        while idx < len(args) and args[idx].startswith("-"):
+            flag = args[idx]
+            if flag in _SYSTEMCTL_FLAGS_WITH_VALUE:
+                idx += 2
+            else:
+                idx += 1
+        if idx >= len(args):
+            return True  # bare `systemctl` / `systemctl --user` lists units
+        return args[idx] in _SAFE_SYSTEMCTL_SUBCOMMANDS
+
+    return False
 
 RISKY_PATTERNS = [
     r"[;&|`$><]",  # Shell chaining, pipes to mutators, redirection, command substitution
@@ -201,7 +341,7 @@ def assess_tool_call(
             return SafetyAssessment(True, "Empty command", "moderate")
 
         base_cmd = tokens[0].split("/")[-1]
-        if base_cmd in SAFE_SHELL_COMMANDS:
+        if base_cmd in SAFE_SHELL_COMMANDS or _is_safe_conditional_command(base_cmd, tokens):
             return SafetyAssessment(
                 False, f"Read-only system command: `{base_cmd}`", "safe"
             )
@@ -276,29 +416,59 @@ NEVER_AUTO_TRUST = frozenset(
 )
 
 
-def neural_risk_note(tool_name: str, arguments: dict[str, Any], storage: Any) -> str:
+NEVER_AUTO_TRUST_TOOLS = frozenset(
+    {"forge_skill", "write_file", "edit_file", "trash_file"}
+)
+
+_NEURAL_ENGINE_CACHE: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+
+
+def _get_cached_neural_engine(storage: Any) -> Any:
+    """Return a cached NeuralEngine per storage instance to avoid repeated cold loads."""
+    try:
+        cached = _NEURAL_ENGINE_CACHE.get(storage)
+        if cached is not None:
+            return cached
+        from .neural import NeuralEngine
+
+        engine = NeuralEngine(storage)
+        _NEURAL_ENGINE_CACHE[storage] = engine
+        return engine
+    except TypeError:
+        from .neural import NeuralEngine
+
+        return NeuralEngine(storage)
+
+
+def neural_risk_note(
+    tool_name: str,
+    arguments: dict[str, Any],
+    storage: Any,
+    neural_engine: Any = None,
+) -> str:
     """Query NeuralEngine associative memory for past failure/immunity warnings related to this tool call."""
-    if storage is None:
+    if storage is None and neural_engine is None:
         return ""
     try:
         import json
 
-        from .neural import NeuralEngine
-
+        engine = neural_engine if neural_engine is not None else _get_cached_neural_engine(storage)
         q = f"{tool_name} {json.dumps(arguments, ensure_ascii=False)[:180]}"
-        hits = NeuralEngine(storage).spreading_activation(q, top_k=2)
+        hits = engine.spreading_activation(q, top_k=2)
         for h in hits:
             key = str(h.get("key") or "").lower()
             act = float(h.get("activation", 0.0) or 0.0)
             if act >= 0.55 and any(k in key for k in ("immunity", "failed", "rollback", "regressed")):
                 return f"Neural warning ({act:.2f}): {str(h.get('text') or '')[:140]}"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("neural_risk_note lookup failed for %s: %s", tool_name, exc)
     return ""
 
 
 def is_auto_trust_allowed(tool_name: str, arguments: dict[str, Any]) -> bool:
     """Whether repeated approvals may turn this call into an auto-trusted (no-prompt) pattern."""
+    if tool_name in NEVER_AUTO_TRUST_TOOLS:
+        return False
     if tool_name != "run_command":
         return True
     first = str(arguments.get("command", "")).strip().split(None, 1)

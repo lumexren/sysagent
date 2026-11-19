@@ -7,11 +7,16 @@ import difflib
 
 PROTECTED_CORE_MODULES = {
     "safety.py",
+    "evolve_safety.py",
+    "evolve_patch.py",
     "storage.py",
     "storage_brain.py",
     "evolve.py",
     "server.py",
     "agent.py",
+    "auth.py",
+    "config.py",
+    "tools.py",
 }
 
 

@@ -12,9 +12,12 @@ from typing import Any
 from .agent import AgentManager
 from .config import Settings
 from .i18n import resolve_locale, t
+from .logging_setup import get_logger
 from .prompts import DEFAULT_PROMPTS, PromptRegistry
 from .storage import Storage
 from .watcher import SystemWatcher
+
+logger = get_logger(__name__)
 
 
 BRAIN_SYSTEM_PROMPT = DEFAULT_PROMPTS["brain_eval"]["template"]
@@ -541,12 +544,12 @@ class CognitiveBrain:
             if risk_level in {"high", "critical"} and confidence < 88:
                 return False, f"world anomaly_risk={risk_level}"
             if pred_tool and score >= 0.35:
-                assessment = assess_tool_call(pred_tool, pred_args or {}, approval_mode="smart")
+                assessment = assess_tool_call(pred_tool, pred_args or {}, mode="smart")
                 if assessment.requires_approval and confidence < 92:
                     return False, f"tool={pred_tool} ({assessment.reason})"
                 return True, f"tool={pred_tool} safe"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Dry-run validation failed for action '%s': %s", action_prompt[:80], exc)
         return True, "ok"
 
     def _verify_action_impact(
