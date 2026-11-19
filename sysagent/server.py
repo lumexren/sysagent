@@ -11,24 +11,27 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from . import __version__
 from .agent import AgentManager
 from .auth import AuthManager
 from .brain import CognitiveBrain
 from .config import get_settings, persist_env_var
 from .evolve import SelfEvolver
 from .i18n import get_translations, resolve_locale, t
+from .logging_setup import configure_logging, get_logger
 from .plugins import PluginRegistry
 from .prompts import PromptRegistry
 from .self_ops import SelfMonitor, export_brain_bundle, import_brain_bundle
 from .self_learn import evolve_status_summary, learn_status_summary
-
-_BOOT_TIME = time.monotonic()
 from .storage import Storage
 from .watcher import SystemWatcher
+
+_BOOT_TIME = time.monotonic()
+logger = get_logger(__name__)
 
 settings = get_settings()
 auth = AuthManager(settings)
@@ -72,6 +75,8 @@ watcher.inspect_callback = _inspect_alert
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    configure_logging(daemon=True)
+    logger.info("Starting SysAgent Daemon v%s", __version__)
     auth.initialize()
     watcher.start()
     brain.start()
@@ -81,21 +86,21 @@ async def lifespan(_app: FastAPI):
     if sock.exists():
         try:
             sock.chmod(0o600)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.warning("Could not chmod socket %s: %s", sock, exc)
     try:
         yield
     finally:
+        logger.info("Stopping SysAgent Daemon")
         await self_monitor.stop()
         await evolver.stop()
         await brain.stop()
         await watcher.stop()
 
 
-app = FastAPI(title="SysAgent Daemon", version="0.1.0", lifespan=lifespan)
+router = APIRouter()
 
 
-@app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if settings.auth_token and request.url.path.startswith("/api/"):
         auth_hdr = request.headers.get("authorization", "")
@@ -122,7 +127,7 @@ class TerminalCommand(BaseModel):
     command: str
 
 
-@app.get("/")
+@router.get("/")
 async def index() -> dict[str, str]:
     return {"service": settings.agent_name, "status": "running"}
 
@@ -159,25 +164,25 @@ def _build_status_payload() -> dict[str, Any]:
     }
 
 
-@app.get("/api/status")
+@router.get("/api/status")
 async def api_status() -> dict[str, Any]:
     return await asyncio.to_thread(_build_status_payload)
 
 
-@app.get("/api/i18n")
+@router.get("/api/i18n")
 async def api_i18n(locale: str | None = None) -> dict[str, Any]:
     target = locale or settings.locale
     return {"locale": resolve_locale(target), "strings": get_translations(target)}
 
 
-@app.post("/api/locale")
+@router.post("/api/locale")
 async def api_set_locale(body: LocaleUpdate) -> dict[str, str]:
     settings.locale = body.locale.strip() or "auto"
     persist_env_var("SYSAGENT_LOCALE", settings.locale)
     return {"status": "updated", "locale": settings.locale}
 
 
-@app.post("/api/name")
+@router.post("/api/name")
 async def api_set_name(body: NameUpdate) -> dict[str, str]:
     new_name = body.name.strip()
     if not new_name:
@@ -187,7 +192,7 @@ async def api_set_name(body: NameUpdate) -> dict[str, str]:
     return {"status": "updated", "agent_name": settings.agent_name}
 
 
-@app.post("/api/auth/reload")
+@router.post("/api/auth/reload")
 async def api_auth_reload() -> dict[str, Any]:
     res = auth.reload()
     for field_name in vars(auth.settings):
@@ -195,17 +200,17 @@ async def api_auth_reload() -> dict[str, Any]:
     return res
 
 
-@app.get("/api/events")
+@router.get("/api/events")
 async def api_events(limit: int = 30) -> dict[str, Any]:
     return {"events": watcher.get_events(limit=limit)}
 
 
-@app.get("/api/notifications")
+@router.get("/api/notifications")
 async def api_notifications(limit: int = 20) -> dict[str, Any]:
     return {"notifications": watcher.notifier.list_recent(limit=limit)}
 
 
-@app.post("/api/approve/{approval_id}")
+@router.post("/api/approve/{approval_id}")
 async def api_approve(approval_id: str, body: ApprovalDecision) -> dict[str, Any]:
     ok = agent.resolve_approval(approval_id, body.approved)
     if not ok:
@@ -213,38 +218,38 @@ async def api_approve(approval_id: str, body: ApprovalDecision) -> dict[str, Any
     return {"status": "resolved", "approved": body.approved}
 
 
-@app.post("/api/reset/{session_id}")
+@router.post("/api/reset/{session_id}")
 async def api_reset(session_id: str) -> dict[str, str]:
     agent.reset_session(session_id)
     return {"status": "reset", "session_id": session_id}
 
 
-@app.get("/api/sessions")
+@router.get("/api/sessions")
 async def api_sessions() -> dict[str, Any]:
     return {"sessions": storage.list_sessions()}
 
 
-@app.get("/api/sessions/{session_id}/messages")
+@router.get("/api/sessions/{session_id}/messages")
 async def api_session_messages(session_id: str) -> dict[str, Any]:
     return {"messages": storage.get_messages(session_id)}
 
 
-@app.get("/api/memories")
+@router.get("/api/memories")
 async def api_memories() -> dict[str, Any]:
     return {"memories": storage.list_memories()}
 
 
-@app.delete("/api/memories/{key}")
+@router.delete("/api/memories/{key}")
 async def api_delete_memory(key: str) -> dict[str, Any]:
     return {"deleted": storage.delete_memory(key)}
 
 
-@app.get("/api/automations")
+@router.get("/api/automations")
 async def api_automations() -> dict[str, Any]:
     return {"automations": await asyncio.to_thread(storage.list_automations)}
 
 
-@app.post("/api/automations")
+@router.post("/api/automations")
 async def api_create_automation(body: dict[str, Any]) -> dict[str, Any]:
     name = str(body.get("name") or "").strip()
     trigger_type = str(body.get("trigger_type") or "").strip()
@@ -258,7 +263,7 @@ async def api_create_automation(body: dict[str, Any]) -> dict[str, Any]:
     return {"id": auto_id, "name": name, "trigger_type": trigger_type, "trigger_value": trigger_value}
 
 
-@app.post("/api/automations/{auto_id}/toggle")
+@router.post("/api/automations/{auto_id}/toggle")
 async def api_toggle_automation(auto_id: int) -> dict[str, Any]:
     state = await asyncio.to_thread(storage.toggle_automation, auto_id)
     if state is None:
@@ -266,12 +271,12 @@ async def api_toggle_automation(auto_id: int) -> dict[str, Any]:
     return {"id": auto_id, "enabled": state}
 
 
-@app.delete("/api/automations/{auto_id}")
+@router.delete("/api/automations/{auto_id}")
 async def api_delete_automation(auto_id: int) -> dict[str, Any]:
     return {"deleted": await asyncio.to_thread(storage.delete_automation, auto_id)}
 
 
-@app.get("/api/brain")
+@router.get("/api/brain")
 async def api_brain() -> dict[str, Any]:
     return {
         "enabled": settings.brain_enabled,
@@ -285,43 +290,43 @@ async def api_brain() -> dict[str, Any]:
     }
 
 
-@app.get("/api/cortex")
+@router.get("/api/cortex")
 async def api_cortex() -> dict[str, Any]:
     return await asyncio.to_thread(brain.cortex.get_status)
 
 
-@app.post("/api/cortex/dream")
+@router.post("/api/cortex/dream")
 async def api_cortex_dream() -> dict[str, Any]:
     return await asyncio.to_thread(brain.cortex.run_dream_cycle, True)
 
 
-@app.post("/api/cortex/heal")
+@router.post("/api/cortex/heal")
 async def api_cortex_heal() -> dict[str, Any]:
     return await asyncio.to_thread(brain.cortex.evaluate_predictive_healer, True, True)
 
 
-@app.post("/api/cortex/flow")
+@router.post("/api/cortex/flow")
 async def api_cortex_flow(body: dict[str, Any] | None = None) -> dict[str, Any]:
     mode = (body or {}).get("mode")
     return await asyncio.to_thread(brain.cortex.set_flow_override, mode)
 
 
-@app.post("/api/brain/think")
+@router.post("/api/brain/think")
 async def api_brain_think() -> dict[str, Any]:
     return await brain.think_once(force=True)
 
 
-@app.get("/api/brain/digest")
+@router.get("/api/brain/digest")
 async def api_brain_digest() -> dict[str, Any]:
     return await brain.generate_daily_digest()
 
 
-@app.get("/api/brain/questions")
+@router.get("/api/brain/questions")
 async def api_brain_questions(status: str = "pending") -> dict[str, Any]:
     return {"questions": storage.list_brain_questions(status)}
 
 
-@app.post("/api/brain/answer/{qid}")
+@router.post("/api/brain/answer/{qid}")
 async def api_brain_answer(qid: int, answer_body: dict[str, Any]) -> dict[str, Any]:
     answer_text = str(answer_body.get("answer", ""))
     learn_rule = bool(answer_body.get("learn_rule", True))
@@ -331,18 +336,18 @@ async def api_brain_answer(qid: int, answer_body: dict[str, Any]) -> dict[str, A
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.post("/api/brain/dismiss/{qid}")
+@router.post("/api/brain/dismiss/{qid}")
 async def api_brain_dismiss(qid: int) -> dict[str, str]:
     storage.resolve_brain_question(qid, "dismissed")
     return {"status": "dismissed"}
 
 
-@app.get("/api/brain/rules")
+@router.get("/api/brain/rules")
 async def api_brain_rules() -> dict[str, Any]:
     return {"rules": storage.list_brain_rules()}
 
 
-@app.put("/api/brain/rules/{rule_id}")
+@router.put("/api/brain/rules/{rule_id}")
 async def api_update_brain_rule(rule_id: int, body: dict[str, Any]) -> dict[str, Any]:
     ok = storage.update_brain_rule(rule_id, str(body.get("pattern", "")), str(body.get("action_policy", "")))
     if not ok:
@@ -350,17 +355,17 @@ async def api_update_brain_rule(rule_id: int, body: dict[str, Any]) -> dict[str,
     return {"status": "updated", "id": rule_id}
 
 
-@app.delete("/api/brain/rules/{rule_id}")
+@router.delete("/api/brain/rules/{rule_id}")
 async def api_delete_brain_rule(rule_id: int) -> dict[str, Any]:
     return {"deleted": storage.delete_brain_rule(rule_id)}
 
 
-@app.get("/api/plugins")
+@router.get("/api/plugins")
 async def api_plugins() -> dict[str, Any]:
     return {"plugins": list(plugins.tools.keys()), "plugins_dir": str(plugins.plugins_dir)}
 
 
-@app.get("/api/evolve")
+@router.get("/api/evolve")
 async def api_evolve() -> dict[str, Any]:
     return {
         "enabled": settings.evolve_enabled,
@@ -371,17 +376,17 @@ async def api_evolve() -> dict[str, Any]:
     }
 
 
-@app.post("/api/evolve/run")
+@router.post("/api/evolve/run")
 async def api_evolve_run() -> dict[str, Any]:
     return await evolver.evolve_once(force=True)
 
 
-@app.get("/api/evolve/proposals")
+@router.get("/api/evolve/proposals")
 async def api_evolve_proposals() -> dict[str, Any]:
     return {"proposals": storage.list_evolve_proposals()}
 
 
-@app.get("/api/processes")
+@router.get("/api/processes")
 async def api_processes() -> dict[str, Any]:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -405,7 +410,7 @@ async def api_processes() -> dict[str, Any]:
         return {"processes": [], "error": str(exc)}
 
 
-@app.post("/api/processes/{pid}/kill")
+@router.post("/api/processes/{pid}/kill")
 async def api_kill_process(pid: int) -> dict[str, Any]:
     try:
         proc = await asyncio.create_subprocess_exec("kill", "-9", str(pid))
@@ -415,7 +420,7 @@ async def api_kill_process(pid: int) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/api/terminal/run")
+@router.post("/api/terminal/run")
 async def api_terminal_run(body: TerminalCommand) -> dict[str, Any]:
     cmd = body.command.strip()
     if not cmd:
@@ -441,7 +446,7 @@ async def api_terminal_run(body: TerminalCommand) -> dict[str, Any]:
         return {"stdout": "", "stderr": str(exc), "returncode": -1}
 
 
-@app.get("/api/logs")
+@router.get("/api/logs")
 async def api_logs(unit: str = "sysagent.service", lines: int = 50) -> dict[str, Any]:
     clean_lines = str(min(200, max(1, int(lines))))
     try:
@@ -463,7 +468,7 @@ async def api_logs(unit: str = "sysagent.service", lines: int = 50) -> dict[str,
         return {"unit": unit, "logs": f"Error fetching logs: {exc!s}"}
 
 
-@app.post("/api/control/{action}")
+@router.post("/api/control/{action}")
 async def api_quick_control(action: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     from .tools import execute_tool
 
@@ -499,7 +504,7 @@ async def api_quick_control(action: str, body: dict[str, Any] | None = None) -> 
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/api/evolve/apply/{proposal_id}")
+@router.post("/api/evolve/apply/{proposal_id}")
 async def api_evolve_apply(proposal_id: int) -> dict[str, Any]:
     ok = evolver.apply_proposal(proposal_id)
     if not ok:
@@ -507,33 +512,33 @@ async def api_evolve_apply(proposal_id: int) -> dict[str, Any]:
     return {"status": "applied", "id": proposal_id}
 
 
-@app.post("/api/evolve/reject/{proposal_id}")
+@router.post("/api/evolve/reject/{proposal_id}")
 async def api_evolve_reject(proposal_id: int) -> dict[str, str]:
     storage.update_evolve_status(proposal_id, "rejected")
     return {"status": "rejected"}
 
 
-@app.post("/api/evolve/rollback")
+@router.post("/api/evolve/rollback")
 async def api_evolve_rollback() -> dict[str, Any]:
     return {"rolled_back": await asyncio.to_thread(evolver.rollback_last_evolve)}
 
 
-@app.get("/api/self")
+@router.get("/api/self")
 async def api_self_health() -> dict[str, Any]:
     return await asyncio.to_thread(self_monitor.get_self_health)
 
 
-@app.get("/api/prompts")
+@router.get("/api/prompts")
 async def api_list_prompts() -> dict[str, Any]:
     return {"prompts": PromptRegistry(storage).list_status()}
 
 
-@app.post("/api/prompts/evolve")
+@router.post("/api/prompts/evolve")
 async def api_prompts_evolve() -> dict[str, Any]:
     return await evolver.evolve_prompts_once()
 
 
-@app.post("/api/prompts/{key}/rollback")
+@router.post("/api/prompts/{key}/rollback")
 async def api_prompts_rollback(key: str) -> dict[str, Any]:
     res = PromptRegistry(storage).rollback_prompt(key)
     if res.get("status") == "error":
@@ -541,26 +546,26 @@ async def api_prompts_rollback(key: str) -> dict[str, Any]:
     return res
 
 
-@app.post("/api/self/maintain")
+@router.post("/api/self/maintain")
 async def api_self_maintain() -> dict[str, Any]:
     return await asyncio.to_thread(self_monitor.run_maintenance)
 
 
-@app.get("/api/local")
+@router.get("/api/local")
 async def api_local_status() -> dict[str, Any]:
     from .local_mind import LocalMind
 
     return LocalMind(storage).get_status()
 
 
-@app.post("/api/local/train")
+@router.post("/api/local/train")
 async def api_local_train(run_lora: bool = False) -> dict[str, Any]:
     from .local_mind import LocalMind
 
     return await asyncio.to_thread(LocalMind(storage).train, run_lora)
 
 
-@app.post("/api/local/download")
+@router.post("/api/local/download")
 async def api_local_download(preset: str = "qwen2.5-1.5b") -> dict[str, Any]:
     from .local_mind import download_default_gguf
 
@@ -568,28 +573,28 @@ async def api_local_download(preset: str = "qwen2.5-1.5b") -> dict[str, Any]:
     return {"status": "downloaded", "preset": preset, "path": str(path)}
 
 
-@app.post("/api/local/distill")
+@router.post("/api/local/distill")
 async def api_local_distill(count_per_teacher: int = 2) -> dict[str, Any]:
     from .local_mind import LocalMind
 
     return await asyncio.to_thread(LocalMind(storage).distill_from_teachers, count_per_teacher)
 
 
-@app.get("/api/neural")
+@router.get("/api/neural")
 async def api_neural_status() -> dict[str, Any]:
     from .neural import NeuralEngine
 
     return NeuralEngine(storage).get_status()
 
 
-@app.post("/api/neural/train")
+@router.post("/api/neural/train")
 async def api_neural_train() -> dict[str, Any]:
     from .neural import NeuralEngine
 
     return await asyncio.to_thread(NeuralEngine(storage).train)
 
 
-@app.post("/api/neural/pulse")
+@router.post("/api/neural/pulse")
 async def api_neural_pulse(body: dict[str, Any] | None = None) -> dict[str, Any]:
     from .neural import NeuralEngine
 
@@ -597,29 +602,29 @@ async def api_neural_pulse(body: dict[str, Any] | None = None) -> dict[str, Any]
     return await asyncio.to_thread(NeuralEngine(storage).pulse, q, watcher.get_health_snapshot())
 
 
-@app.get("/api/self/export")
+@router.get("/api/self/export")
 async def api_self_export() -> dict[str, Any]:
     return export_brain_bundle(storage)
 
 
-@app.post("/api/self/import")
+@router.post("/api/self/import")
 async def api_self_import(bundle: dict[str, Any]) -> dict[str, int]:
     counts = import_brain_bundle(bundle, storage)
     plugins.reload()
     return counts
 
 
-@app.get("/api/plans")
+@router.get("/api/plans")
 async def api_plans() -> dict[str, Any]:
     return {"plans": storage.list_goal_plans(limit=15)}
 
 
-@app.get("/api/lessons")
+@router.get("/api/lessons")
 async def api_lessons() -> dict[str, Any]:
     return {"lessons": storage.list_lessons(limit=20)}
 
 
-@app.post("/api/undo-batch")
+@router.post("/api/undo-batch")
 async def api_undo_batch(batch_id: str | None = None) -> dict[str, Any]:
     from .tools import execute_tool
 
@@ -634,14 +639,14 @@ async def api_undo_batch(batch_id: str | None = None) -> dict[str, Any]:
     return json.loads(raw) if isinstance(raw, str) else {"result": raw}
 
 
-@app.get("/api/snapshots")
+@router.get("/api/snapshots")
 async def api_snapshots(limit: int = 15) -> dict[str, Any]:
     from .snapshots import unified_snapshots
 
     return await asyncio.to_thread(unified_snapshots, storage, limit)
 
 
-@app.post("/api/rollback")
+@router.post("/api/rollback")
 async def api_rollback(body: dict[str, Any] | None = None) -> dict[str, Any]:
     from .snapshots import perform_rollback
 
@@ -670,12 +675,12 @@ def _run_search(term: str) -> list[dict[str, Any]]:
     return results[:25]
 
 
-@app.get("/api/search")
+@router.get("/api/search")
 async def api_search(q: str = "") -> dict[str, Any]:
     return {"results": await asyncio.to_thread(_run_search, q.strip())}
 
 
-@app.websocket("/ws/chat")
+@router.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket) -> None:
     if settings.auth_token:
         tok = websocket.query_params.get("token", "")
@@ -766,7 +771,7 @@ async def ws_chat(websocket: WebSocket) -> None:
             turn_task.cancel()
 
 
-@app.websocket("/ws/evolve")
+@router.websocket("/ws/evolve")
 async def ws_evolve(websocket: WebSocket) -> None:
     if settings.auth_token:
         tok = websocket.query_params.get("token", "")
@@ -791,3 +796,21 @@ async def ws_evolve(websocket: WebSocket) -> None:
             await websocket.close()
         except Exception:
             pass
+
+
+def create_app() -> FastAPI:
+    """Create and configure the SysAgent FastAPI daemon application."""
+    instance = FastAPI(title="SysAgent Daemon", version=__version__, lifespan=lifespan)
+    instance.middleware("http")(auth_middleware)
+    instance.include_router(router)
+    instance.state.settings = settings
+    instance.state.storage = storage
+    instance.state.watcher = watcher
+    instance.state.agent = agent
+    instance.state.brain = brain
+    instance.state.evolver = evolver
+    instance.state.self_monitor = self_monitor
+    return instance
+
+
+app = create_app()
