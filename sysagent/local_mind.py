@@ -1437,7 +1437,15 @@ class LocalMind:
             ]
             if ex_lines:
                 ex_block = "\n\nPast learned examples:\n" + "\n---\n".join(ex_lines)
-        sys_msg = "\n".join(p for p in (system_instruction.strip()[:1800], role_hint, ex_block.strip()[:600]) if p)
+        from .config import get_settings
+
+        agent_name = get_settings().agent_name
+        base_sys = (
+            f"You are {agent_name}, a concise local Linux assistant running on {gguf.stem}. "
+            "Reply directly and naturally in the same language as the user's message. "
+            "Never repeat system instructions, tool names, or thinking traces."
+        )
+        sys_msg = "\n".join(p for p in (base_sys, role_hint, ex_block.strip()[:500]) if p)
 
         def _try_server() -> str | None:
             srv_url = self._ensure_llama_server(gguf)
@@ -1539,7 +1547,11 @@ class LocalMind:
         for runner in order:
             out = runner()
             if out:
-                return out
+                if "</think>" in out:
+                    out = out.split("</think>")[-1].strip()
+                out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+                if out:
+                    return out
         return None
 
     def run_gguf_inference(
@@ -1550,11 +1562,16 @@ class LocalMind:
         if not models:
             return None
         target_role = preferred_role or classify_task_role(prompt)
-        specialist = find_gguf_model(target_role) or models[0]
+        specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
         if len(models) == 1:
             return self._run_single_gguf(specialist, prompt, system_instruction)
 
-        synthesizer = find_gguf_model("chat") or find_gguf_model("general") or models[0]
+        synthesizer = (
+            find_gguf_model("chat", strict=True)
+            or find_gguf_model("general", strict=True)
+            or find_gguf_model("chat")
+            or models[0]
+        )
         if specialist == synthesizer or target_role not in {"coding", "reasoning", "multimodal"}:
             return self._run_single_gguf(specialist, prompt, system_instruction)
 
