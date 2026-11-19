@@ -1437,7 +1437,7 @@ class LocalMind:
             ]
             if ex_lines:
                 ex_block = "\n\nPast learned examples:\n" + "\n---\n".join(ex_lines)
-        sys_msg = "\n".join(p for p in (system_instruction.strip(), role_hint, ex_block.strip()) if p)
+        sys_msg = "\n".join(p for p in (system_instruction.strip()[:1800], role_hint, ex_block.strip()[:600]) if p)
 
         def _try_server() -> str | None:
             srv_url = self._ensure_llama_server(gguf)
@@ -1617,7 +1617,7 @@ class LocalMind:
         )
         word_count = len(msg.split())
         if role == "chat":
-            specialist = find_gguf_model("chat") or models[0]
+            specialist = find_gguf_model("chat", strict=True) or find_gguf_model("chat") or models[0]
             eligible = word_count <= 14 and pred_tool is None and not has_action
         elif local_first and role in {"general", "coding", "reasoning"}:
             specialist = find_gguf_model(role, strict=True)

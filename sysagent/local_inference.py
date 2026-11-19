@@ -157,7 +157,7 @@ def get_llama_cpp_model(gguf: Path) -> Any | None:
         _LLAMA_CPP_INSTANCE = Llama(
             model_path=model_key,
             n_gpu_layers=-1,
-            n_ctx=2048,
+            n_ctx=4096,
             use_mmap=True,
             verbose=False,
         )
