@@ -1298,8 +1298,11 @@ def _cmd_local(base_url: str, action: str, query: str | None = None, locale: str
     hdrs = _auth_headers()
     try:
         if action == "train":
-            mind = LocalMind(Storage())
-            st = mind.train(run_lora=True)
+            with Storage() as st_db:
+                mind = LocalMind(st_db)
+                cb = mind.train_on_own_codebase(force=(query or "").strip().lower() == "codebase")
+                st = mind.train(run_lora=True)
+            st["codebase_sync"] = {"status": cb.get("status"), "samples": cb.get("samples", 0)}
             print(json.dumps(st, indent=2, ensure_ascii=False))
             return
         if action == "distill":

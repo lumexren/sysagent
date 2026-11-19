@@ -141,6 +141,28 @@ class LocalAndStorageImprovementsTests(unittest.TestCase):
             self.assertEqual(out, "hello from llama_cpp")
             self.assertEqual(calls, ["llama_cpp"])
 
+    def test_train_on_own_codebase_dedup_and_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            ds = p / "distilled.jsonl"
+            wf = p / "weights.json"
+            with patch.object(local_mind, "DISTILLED_FILE", ds), patch.object(
+                local_mind, "WEIGHTS_FILE", wf
+            ):
+                mind = local_mind.LocalMind(storage=None)
+                res1 = mind.train_on_own_codebase(force=False)
+                self.assertEqual(res1["status"], "ok")
+                self.assertGreater(res1["samples"], 10)
+                lines_after_first = len(ds.read_text(encoding="utf-8").splitlines())
+
+                res2 = mind.train_on_own_codebase(force=False)
+                self.assertEqual(res2["status"], "up_to_date")
+
+                res3 = mind.train_on_own_codebase(force=True)
+                self.assertEqual(res3["status"], "ok")
+                lines_after_force = len(ds.read_text(encoding="utf-8").splitlines())
+                self.assertEqual(lines_after_first, lines_after_force)
+
 
 if __name__ == "__main__":
     unittest.main()

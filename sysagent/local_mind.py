@@ -1097,6 +1097,76 @@ class LocalMind:
             "model_status": status,
         }
 
+    def train_on_own_codebase(self, force: bool = False) -> dict[str, Any]:
+        """AST-scan SysAgent's own Python modules and refresh self-codebase training samples."""
+        import ast
+        import hashlib
+
+        pkg_dir = Path(__file__).resolve().parent
+        py_files = sorted(p for p in pkg_dir.glob("*.py") if p.name != "__init__.py")
+        sig_parts = [f"{p.name}:{p.stat().st_mtime_ns}:{p.stat().st_size}" for p in py_files if p.is_file()]
+        cb_hash = hashlib.sha256("|".join(sig_parts).encode("utf-8")).hexdigest()[:16]
+        if not force and self.weights.get("codebase_train_hash") == cb_hash:
+            return {"status": "up_to_date", "modules": len(py_files), "samples": 0}
+
+        new_records: list[dict[str, Any]] = []
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for mod_path in py_files:
+            try:
+                tree = ast.parse(mod_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            doc = (ast.get_docstring(tree) or "").splitlines()[0].strip() if ast.get_docstring(tree) else ""
+            syms = [
+                node.name
+                for node in tree.body
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and not node.name.startswith("_")
+            ][:8]
+            sym_txt = ", ".join(syms) if syms else "internal helpers"
+            stem = mod_path.stem
+            reply = f"{mod_path.name} ({mod_path}): {doc or stem} Key symbols: {sym_txt}."
+            new_records.append(
+                {
+                    "ts": ts,
+                    "user": f"inspect sysagent {mod_path.name} {stem} {sym_txt}",
+                    "tool": "read_file",
+                    "args": {"path": str(mod_path)},
+                    "reply": reply,
+                    "role": "coding",
+                    "source": "self_codebase",
+                }
+            )
+
+        kept_lines: list[str] = []
+        if DISTILLED_FILE.is_file():
+            for ln in DISTILLED_FILE.read_text(encoding="utf-8").splitlines():
+                if not ln.strip():
+                    continue
+                try:
+                    row = json.loads(ln)
+                    if row.get("source") == "self_codebase":
+                        continue
+                except Exception:
+                    pass
+                kept_lines.append(ln)
+
+        for rec in new_records:
+            kept_lines.append(json.dumps(rec, ensure_ascii=False))
+        DISTILLED_FILE.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+
+        self.weights["codebase_train_hash"] = cb_hash
+        status = self.train()
+        self.weights["codebase_train_hash"] = cb_hash
+        WEIGHTS_FILE.write_text(json.dumps(self.weights, ensure_ascii=False), encoding="utf-8")
+        return {
+            "status": "ok",
+            "modules": len(py_files),
+            "samples": len(new_records),
+            "codebase_hash": cb_hash,
+            "model_status": status,
+        }
+
     def predict_tool(
         self, user_text: str, allowed_names: set[str] | None = None
     ) -> tuple[str | None, dict[str, Any], float]:

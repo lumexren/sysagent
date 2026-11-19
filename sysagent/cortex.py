@@ -243,6 +243,14 @@ class NeuralBrainCortex:
             pruned_code_mems = int(prune_stale_codebase_memories(self.storage) or 0)
         except Exception:
             pass
+        codebase_trained = 0
+        try:
+            from .local_mind import LocalMind
+
+            cb_res = LocalMind(self.storage).train_on_own_codebase(force=False)
+            codebase_trained = int(cb_res.get("samples", 0) or 0)
+        except Exception:
+            pass
 
         thoughts = self.storage.list_brain_thoughts(limit=80)
         decision_counts = Counter(str(t.get("decision") or "") for t in thoughts)
@@ -266,6 +274,7 @@ class NeuralBrainCortex:
             "decayed_rules": decayed_rules,
             "pruned_thoughts": pruned_thoughts,
             "pruned_codebase_memories": pruned_code_mems,
+            "codebase_trained_samples": codebase_trained,
             "thought_summary": dict(decision_counts),
             "synapses": synapses,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
