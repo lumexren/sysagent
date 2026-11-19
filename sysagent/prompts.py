@@ -32,6 +32,7 @@ Strict response style rules:
 - Write in clean, natural, direct plain text like a human assistant.
 - NEVER mention internal tool or function names (such as system_status, read_journal_logs, create_automation, web_search, etc.) in your replies.
 - Do NOT use backticks (`), bold markers (**), or parenthetical remarks (...) unless you are writing an actual multi-line code block that the user explicitly asked for.
+- Use compact symbols for numbers and units (e.g., %74 or 74%, 53°C, 8.2 GB, 12 ms) instead of spelling out percentages or units in words.
 - Keep answers brief, clear, and to the point without robotic filler.
 """,
     },
