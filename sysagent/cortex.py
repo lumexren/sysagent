@@ -47,9 +47,6 @@ class NeuralBrainCortex:
             "reason": "initial",
         }
 
-    # ------------------------------------------------------------------
-    # 1. Flow Guardian
-    # ------------------------------------------------------------------
     def evaluate_flow_state(self) -> dict[str, Any]:
         """Classify active user flow mode from watcher context + NeuralEngine world forecast."""
         if self._flow_override:
@@ -108,9 +105,6 @@ class NeuralBrainCortex:
             self.storage.add_brain_thought("act", 90, f"Flow Guardian override -> {mode}")
         return self.evaluate_flow_state()
 
-    # ------------------------------------------------------------------
-    # 2. Predictive Self-Healer
-    # ------------------------------------------------------------------
     def _apply_safe_heal(self) -> dict[str, Any]:
         """Run non-destructive preventative relief (unload warm GGUF + SQLite WAL checkpoint)."""
         from .local_inference import _release_all_warm_models
@@ -214,9 +208,6 @@ class NeuralBrainCortex:
             )
         return result
 
-    # ------------------------------------------------------------------
-    # 3. Dream / Sleep Consolidation Cycle
-    # ------------------------------------------------------------------
     def run_dream_cycle(self, force: bool = False) -> dict[str, Any]:
         """Consolidate memories, decay stale rules, distill recurring patterns, and sync Neural synapses."""
         now = time.monotonic()
@@ -287,12 +278,9 @@ class NeuralBrainCortex:
         )
         return report
 
-    # ------------------------------------------------------------------
-    # 4. Habit Copilot
-    # ------------------------------------------------------------------
     def suggest_habit_automations(self, notify: bool = False) -> list[dict[str, Any]]:
         """Combine recurring habits with Neural activation to suggest unscheduled automations."""
-        habits = self.storage.get_recurring_habits(min_occurrences=3)
+        habits = self.storage.get_recurring_habits(min_count=3)
         existing_prompts = {
             str(a.get("prompt", "")).strip().lower() for a in self.storage.list_automations()
         }
@@ -307,10 +295,10 @@ class NeuralBrainCortex:
             eng = None
 
         for h in habits[:8]:
-            action_txt = str(h.get("action") or h.get("detail") or h.get("kind") or "").strip()
+            action_txt = str(h.get("detail") or h.get("action") or h.get("category") or "").strip()
             if not action_txt:
                 continue
-            hour = int(h.get("hour", 9) or 9)
+            hour = int(h.get("hour_bucket", h.get("hour", 9)) or 9)
             tval = f"{hour % 24:02d}:00"
             prompt = f"Check and assist with recurring habit: {action_txt}"
             if prompt.lower() in existing_prompts:
@@ -322,7 +310,7 @@ class NeuralBrainCortex:
                     boost = max((float(a.get("activation", 0.0) or 0.0) for a in acts), default=0.0)
                 except Exception:
                     boost = 0.0
-            occ = int(h.get("count", h.get("occurrences", 3)) or 3)
+            occ = int(h.get("hits", h.get("count", 3)) or 3)
             conf = round(min(0.99, 0.55 + 0.05 * occ + 0.25 * boost), 2)
             slug = "".join(ch if ch.isalnum() else "-" for ch in action_txt.lower())[:24].strip("-") or "habit"
             suggestions.append(
@@ -371,9 +359,6 @@ class NeuralBrainCortex:
 
         return suggestions[:5]
 
-    # ------------------------------------------------------------------
-    # Unified Periodic Tick & Status
-    # ------------------------------------------------------------------
     def tick(self) -> dict[str, Any]:
         """Run one lightweight Cortex cycle (Flow -> Predictive Healer -> Dream -> Habit Copilot)."""
         flow = self.evaluate_flow_state()
