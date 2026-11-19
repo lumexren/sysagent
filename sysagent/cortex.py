@@ -236,6 +236,13 @@ class NeuralBrainCortex:
             pruned_thoughts = int(self.storage.prune_and_checkpoint(stale_days=21) or 0)
         except Exception:
             pass
+        pruned_code_mems = 0
+        try:
+            from .self_ops import prune_stale_codebase_memories
+
+            pruned_code_mems = int(prune_stale_codebase_memories(self.storage) or 0)
+        except Exception:
+            pass
 
         thoughts = self.storage.list_brain_thoughts(limit=80)
         decision_counts = Counter(str(t.get("decision") or "") for t in thoughts)
@@ -258,6 +265,7 @@ class NeuralBrainCortex:
             "conflicts_resolved": conflicts_resolved,
             "decayed_rules": decayed_rules,
             "pruned_thoughts": pruned_thoughts,
+            "pruned_codebase_memories": pruned_code_mems,
             "thought_summary": dict(decision_counts),
             "synapses": synapses,
             "timestamp": datetime.now().isoformat(timespec="seconds"),

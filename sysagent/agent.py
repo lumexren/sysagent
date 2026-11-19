@@ -484,6 +484,17 @@ class AgentManager:
             if isinstance(heal, dict) and heal.get("summary"):
                 cortex_line += f" | predictive_health={heal['summary']}"
             system_instruction += cortex_line
+        try:
+            from .self_ops import get_live_codebase_summary
+
+            system_instruction += (
+                "\n"
+                + get_live_codebase_summary()
+                + "\nTrust the live codebase snapshot over older memory notes; "
+                "when modifying your own code, read the target file with read_file and apply edits with edit_file."
+            )
+        except Exception:
+            pass
         self.storage.upsert_session(session_id, prev_id, title=user_message[:60])
         self.storage.add_message(session_id, "user", user_message)
         self.storage.record_activity("prompt", user_message[:80])

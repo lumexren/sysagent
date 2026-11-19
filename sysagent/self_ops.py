@@ -548,3 +548,88 @@ class SelfMonitor:
             except Exception as exc:
                 self.watcher.add_event("info", "warning", f"Self-Watchdog error: {exc}")
             await asyncio.sleep(max(60, self.interval_sec))
+
+
+_CODEBASE_SUMMARY_CACHE: tuple[float, str] = (0.0, "")
+_STALE_CODE_MEM_PREFIXES = (
+    "pending_architectur",
+    "codebase_",
+    "assistant_architecture",
+    "assistant_memory_improvement",
+    "assistant_error_handling",
+    "self_improvement_engine_architecture",
+    "memory_management_",
+    "memory_deletion_integrated",
+    "brain_memory_pool_tasks",
+    "storage_memory_optimization",
+    "evolve_refactoring_state",
+    "error_handling_quality",
+    "sysagent_memories_table_",
+)
+
+
+def _git_head_and_log(repo_dir: Path) -> tuple[str, list[str]]:
+    try:
+        import subprocess
+
+        head_p = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        log_p = subprocess.run(
+            ["git", "log", "-n", "5", "--oneline"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        head = head_p.stdout.strip() if head_p.returncode == 0 else ""
+        commits = [ln.strip() for ln in log_p.stdout.splitlines() if ln.strip()] if log_p.returncode == 0 else []
+        return head, commits
+    except Exception:
+        return "", []
+
+
+def get_live_codebase_summary(ttl_sec: float = 60.0) -> str:
+    """Return a concise live snapshot of SysAgent's Python modules and recent git commits."""
+    global _CODEBASE_SUMMARY_CACHE
+    now = time.monotonic()
+    cached_ts, cached_txt = _CODEBASE_SUMMARY_CACHE
+    if cached_txt and (now - cached_ts) < ttl_sec:
+        return cached_txt
+
+    pkg_dir = Path(__file__).resolve().parent
+    repo_dir = pkg_dir.parent
+    modules = sorted(p.name for p in pkg_dir.glob("*.py") if p.name != "__init__.py")
+    head, commits = _git_head_and_log(repo_dir)
+    parts = [f"Live codebase ({pkg_dir}, HEAD={head or 'unknown'}): {', '.join(modules)}"]
+    if commits:
+        parts.append("Recent commits: " + " | ".join(commits))
+    summary = "\n".join(parts)
+    _CODEBASE_SUMMARY_CACHE = (now, summary)
+    return summary
+
+
+def prune_stale_codebase_memories(storage: Storage, force: bool = False) -> int:
+    """Remove outdated codebase/architecture memory notes when git HEAD advances."""
+    repo_dir = Path(__file__).resolve().parent.parent
+    head, _ = _git_head_and_log(repo_dir)
+    last_head = storage.get_memory("_internal:codebase_head") or ""
+    if not force and head and head == last_head:
+        return 0
+
+    removed = 0
+    for mem in storage.list_memories():
+        key = str(mem.get("key") or "")
+        low = key.lower()
+        if any(low.startswith(p) for p in _STALE_CODE_MEM_PREFIXES) or low.endswith(
+            ("_technical_debt", "_refactoring_state")
+        ):
+            if storage.delete_memory(key):
+                removed += 1
+    if head:
+        storage.set_memory("_internal:codebase_head", head)
+    return removed

@@ -124,6 +124,21 @@ class CortexTests(unittest.TestCase):
             data = json.loads(mcp_resp["result"]["content"][0]["text"])
             self.assertIn("flow", data)
 
+    def test_live_codebase_summary_and_stale_memory_pruning(self) -> None:
+        from sysagent.self_ops import get_live_codebase_summary, prune_stale_codebase_memories
+
+        summary = get_live_codebase_summary(ttl_sec=0.0)
+        self.assertIn("cortex.py", summary)
+        self.assertIn("ipc.py", summary)
+
+        with tempfile.TemporaryDirectory() as td, Storage(db_path=Path(td) / "c5.db") as st:
+            st.set_memory("pending_architectural_improvements", "old todo")
+            st.set_memory("user_name", "Eren")
+            removed = prune_stale_codebase_memories(st, force=True)
+            self.assertEqual(removed, 1)
+            self.assertIsNone(st.get_memory("pending_architectural_improvements"))
+            self.assertEqual(st.get_memory("user_name"), "Eren")
+
 
 if __name__ == "__main__":
     unittest.main()
