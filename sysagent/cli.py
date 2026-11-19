@@ -2121,12 +2121,10 @@ def main() -> None:
             removed = logout_oauth(settings)
             print("OAuth token removed." if removed else "No OAuth token found.")
         elif args.subcommand == "export":
-            from pathlib import Path
             bundle = export_brain_bundle(Storage())
             Path(args.file).write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
             print(f"Exported brain bundle to {args.file}")
         elif args.subcommand == "import":
-            from pathlib import Path
             bundle = json.loads(Path(args.file).read_text(encoding="utf-8"))
             counts = import_brain_bundle(bundle, Storage())
             print(f"Imported brain bundle: {counts}")
