@@ -56,7 +56,7 @@ class LocalAndStorageImprovementsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             fake_big = Path(td) / "big.gguf"
             fake_big.write_bytes(b"0")
-            fake_stat = SimpleNamespace(st_size=int(5.5 * (1024**3)))
+            fake_stat = SimpleNamespace(st_size=int(5.5 * (1024**3)), st_mode=0o100644)
             with patch.object(Path, "stat", return_value=fake_stat), patch(
                 "psutil.virtual_memory", return_value=SimpleNamespace(available=int(0.9 * (1024**3)))
             ):
