@@ -175,8 +175,8 @@ class NotificationCenter:
             dkey = dedup_key or f"{category}:{clean_title}:{clean_body[:60]}"
             now_mono = time.monotonic()
             with self._lock:
-                last_ts = self._recent_keys.get(dkey, 0.0)
-                if (now_mono - last_ts) < dedup_sec:
+                last_ts = self._recent_keys.get(dkey)
+                if last_ts is not None and (now_mono - last_ts) < dedup_sec:
                     entry["status"] = "deduplicated"
                     self._history.append(entry)
                     return None
