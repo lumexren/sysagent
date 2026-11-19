@@ -769,7 +769,35 @@ class SystemWatcher:
         if not self.storage or not self.automation_callback:
             return
         automations = self.storage.list_automations(enabled_only=True)
+        if not automations:
+            return
         now = datetime.now()
+
+        # Fetch Neural world forecast once per tick for triggers & load deferral
+        world_forecast: dict[str, Any] = {}
+        try:
+            from .neural import NeuralEngine
+
+            world_forecast = NeuralEngine(self.storage).predict_world_state()
+        except Exception:
+            world_forecast = {}
+
+        # Check Brain quiet hours once per tick
+        quiet_now = False
+        try:
+            from .config import get_settings
+
+            qh = (get_settings().quiet_hours or "").strip()
+            if "-" in qh:
+                s_str, e_str = qh.split("-", 1)
+                sh, sm = (int(x) for x in s_str.strip().split(":", 1))
+                eh, em = (int(x) for x in e_str.strip().split(":", 1))
+                cur_m = now.hour * 60 + now.minute
+                s_m, e_m = sh * 60 + sm, eh * 60 + em
+                quiet_now = (cur_m >= s_m or cur_m < e_m) if s_m > e_m else (s_m <= cur_m < e_m)
+        except Exception:
+            quiet_now = False
+
         for auto in automations:
             ttype = auto["trigger_type"]
             tval = auto["trigger_value"]
@@ -781,7 +809,6 @@ class SystemWatcher:
             trigger_context: str | None = None
 
             if ttype == "daily_time":
-                # Fire once per day at/after the scheduled time (exact HH:MM matching misses
                 try:
                     hh, mm = (int(x) for x in tval.split(":", 1))
                     due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -800,6 +827,21 @@ class SystemWatcher:
                 matched = [str(p) for p in added_files if fnmatch.fnmatch(p.name, tval)]
                 if matched:
                     trigger_context = f"New matching file(s): {', '.join(matched)}"
+            elif ttype == "neural_anomaly":
+                if (
+                    world_forecast.get("anomaly_detected")
+                    and (not last_run or (now - last_run).total_seconds() >= 1800)
+                ):
+                    score = world_forecast.get("anomaly_score", 0.0)
+                    trigger_context = f"Neural anomaly detected (score={score})."
+            elif ttype == "neural_bottleneck":
+                try:
+                    thresh = float(tval) if tval else 0.70
+                except ValueError:
+                    thresh = 0.70
+                prob = float(world_forecast.get("bottleneck_prob", 0.0) or 0.0)
+                if prob >= thresh and (not last_run or (now - last_run).total_seconds() >= 1800):
+                    trigger_context = f"Neural bottleneck predicted (prob={prob:.2f} >= {thresh:.2f})."
             elif ttype == "multi_condition" and (not last_run or (now - last_run).total_seconds() >= 3600):
                 try:
                     import json as _json
@@ -823,13 +865,54 @@ class SystemWatcher:
                 except Exception:
                     pass
 
-            if trigger_context:
-                self.storage.mark_automation_ran(auto["id"])
-                self.add_event("info", "info", f"Running automation '{auto['name']}': {trigger_context}")
+            if not trigger_context:
+                continue
+
+            # Brain rule gate: honor ignore rules
+            if self.storage.is_ignored_by_brain_rule(f"{auto['name']} {auto['prompt']}"):
+                self.storage.add_brain_thought(
+                    "ignore", 90, f"Skipped automation '{auto['name']}' due to brain ignore rule"
+                )
+                continue
+
+            # Brain quiet-hours gate for routine interval tasks
+            if quiet_now and ttype == "interval":
+                continue
+
+            # Neural load deferral: postpone routine tasks during predicted bottlenecks
+            b_prob = float(world_forecast.get("bottleneck_prob", 0.0) or 0.0)
+            if ttype in {"daily_time", "interval"} and b_prob >= 0.75:
+                self.add_event(
+                    "info",
+                    "info",
+                    f"Deferred automation '{auto['name']}' due to neural bottleneck (prob={b_prob:.2f})",
+                )
+                continue
+
+            self.storage.mark_automation_ran(auto["id"])
+            self.add_event("info", "info", f"Running automation '{auto['name']}': {trigger_context}")
+            try:
+                await self.automation_callback(auto, trigger_context)
+                self.storage.add_brain_thought(
+                    "act", 85, f"Automation '{auto['name']}' completed: {trigger_context}"
+                )
                 try:
-                    await self.automation_callback(auto, trigger_context)
-                except Exception as exc:
-                    self.add_event("info", "warning", f"Automation '{auto['name']}' failed: {exc}")
+                    from .neural import NeuralEngine
+
+                    NeuralEngine(self.storage).online_step(str(auto["prompt"]), "run_command", reward=0.8)
+                except Exception:
+                    pass
+            except Exception as exc:
+                self.add_event("info", "warning", f"Automation '{auto['name']}' failed: {exc}")
+                self.storage.add_brain_thought(
+                    "warn", 70, f"Automation '{auto['name']}' failed: {exc}"
+                )
+                try:
+                    from .neural import NeuralEngine
+
+                    NeuralEngine(self.storage).online_step(str(auto["prompt"]), "run_command", reward=-0.8)
+                except Exception:
+                    pass
 
     @staticmethod
     def _top_cpu_process() -> str:

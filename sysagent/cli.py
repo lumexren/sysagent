@@ -1661,16 +1661,33 @@ def _cmd_rollback(
         sys.exit(1)
 
 
+def _prog_name() -> str:
+    from pathlib import Path
+
+    argv0 = Path(sys.argv[0]).name if sys.argv else ""
+    if argv0 and argv0 not in {"cli.py", "__main__.py", "-c"}:
+        return argv0
+    return get_settings().agent_name.strip().lower().replace(" ", "-") or "sysagent"
+
+
 def _parse_schedule_spec(spec: str) -> tuple[str, str]:
-    """Parse shorthand schedule spec (`09:00`, `30m`, `2h`, `60s`, `file:*.log`) into (trigger_type, trigger_value)."""
+    """Parse shorthand schedule spec (`09:00`, `30m`, `2h`, `60s`, `file:*.log`, `neural:anomaly`, `neural:bottleneck`)."""
     s = spec.strip()
+    low = s.lower()
+    if low == "neural:anomaly":
+        return "neural_anomaly", "anomaly"
+    if low == "neural:bottleneck":
+        return "neural_bottleneck", "0.70"
+    if low.startswith("neural:bottleneck:"):
+        thresh = s.split(":", 2)[2].strip()
+        float(thresh)
+        return "neural_bottleneck", thresh
     if s.startswith("file:"):
         return "file_created", s.split(":", 1)[1].strip()
     if ":" in s and len(s) <= 5:
         hh, mm = s.split(":", 1)
         if hh.isdigit() and mm.isdigit() and 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59:
             return "daily_time", f"{int(hh):02d}:{int(mm):02d}"
-    low = s.lower()
     if low.endswith("h") and low[:-1].isdigit():
         return "interval", str(max(30, int(low[:-1]) * 3600))
     if low.endswith("m") and low[:-1].isdigit():
@@ -1679,7 +1696,9 @@ def _parse_schedule_spec(spec: str) -> tuple[str, str]:
         return "interval", str(max(30, int(low[:-1])))
     if low.isdigit():
         return "interval", str(max(30, int(low)))
-    raise ValueError(f"Unsupported schedule spec '{spec}'. Use HH:MM, 30m, 2h, 60s, or file:*.log")
+    raise ValueError(
+        f"Unsupported schedule spec '{spec}'. Use HH:MM, 30m, 2h, 60s, file:*.log, neural:anomaly, or neural:bottleneck"
+    )
 
 
 def _cmd_schedule(
@@ -1728,7 +1747,7 @@ def _cmd_schedule(
         if action == "add":
             if len(rest) < 3:
                 print(
-                    "Usage: sysagent schedule add <name> <HH:MM|30m|2h|file:*.log> <prompt...>",
+                    f"Usage: {_prog_name()} schedule add <name> <HH:MM|30m|2h|file:*.log|neural:anomaly|neural:bottleneck> <prompt...>",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -1755,7 +1774,7 @@ def _cmd_schedule(
 
         if action in {"delete", "toggle"}:
             if not rest or not rest[0].isdigit():
-                print(f"Usage: sysagent schedule {action} <id>", file=sys.stderr)
+                print(f"Usage: {_prog_name()} schedule {action} <id>", file=sys.stderr)
                 sys.exit(1)
             aid = int(rest[0])
             if action == "delete":
@@ -1788,8 +1807,8 @@ def _cmd_schedule(
 def main() -> None:
     settings = get_settings()
     parser = argparse.ArgumentParser(
-        prog="sysagent",
-        description="SysAgent — Personal Linux system daemon and AI assistant",
+        prog=_prog_name(),
+        description=f"{settings.agent_name} — Personal Linux system daemon and AI assistant",
     )
     sub = parser.add_subparsers(dest="subcommand")
     sub.add_parser("serve", help="Start the daemon server in the foreground")

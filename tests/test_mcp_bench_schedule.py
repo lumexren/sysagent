@@ -70,8 +70,16 @@ class McpBenchScheduleTests(unittest.TestCase):
         self.assertEqual(_parse_schedule_spec("30m"), ("interval", "1800"))
         self.assertEqual(_parse_schedule_spec("2h"), ("interval", "7200"))
         self.assertEqual(_parse_schedule_spec("file:*.log"), ("file_created", "*.log"))
+        self.assertEqual(_parse_schedule_spec("neural:anomaly"), ("neural_anomaly", "anomaly"))
+        self.assertEqual(_parse_schedule_spec("neural:bottleneck"), ("neural_bottleneck", "0.70"))
+        self.assertEqual(_parse_schedule_spec("neural:bottleneck:0.85"), ("neural_bottleneck", "0.85"))
         with self.assertRaises(ValueError):
             _parse_schedule_spec("every-blue-moon")
+
+        from sysagent.cli import _prog_name
+
+        with patch("sys.argv", ["/usr/local/bin/vex", "schedule"]):
+            self.assertEqual(_prog_name(), "vex")
 
         with tempfile.TemporaryDirectory() as td, Storage(db_path=Path(td) / "s.db") as st:
             aid = st.create_automation("cleanup", "interval", "3600", "clean tmp")
@@ -79,6 +87,42 @@ class McpBenchScheduleTests(unittest.TestCase):
             self.assertTrue(st.toggle_automation(aid))
             self.assertTrue(st.delete_automation(aid))
             self.assertIsNone(st.toggle_automation(aid))
+
+    def test_watcher_neural_and_brain_schedule_gates(self) -> None:
+        import asyncio
+        from types import SimpleNamespace
+
+        from sysagent.watcher import SystemWatcher
+
+        with tempfile.TemporaryDirectory() as td, Storage(db_path=Path(td) / "w.db") as st:
+            st.create_automation("anom-watch", "neural_anomaly", "anomaly", "inspect spike")
+            st.create_automation("routine-clean", "interval", "60", "clean cache")
+            st.create_automation("ignored-job", "neural_anomaly", "anomaly", "noisy job")
+
+            ran: list[str] = []
+
+            async def cb(auto, ctx):
+                ran.append(auto["name"])
+
+            w = SystemWatcher.__new__(SystemWatcher)
+            w.storage = st
+            w.automation_callback = cb
+            w.events = []
+            w.add_event = lambda *a, **kw: None
+            w.current_context = "general"
+
+            fake_wf = {"anomaly_detected": True, "anomaly_score": 1.8, "bottleneck_prob": 0.85}
+            fake_engine = SimpleNamespace(
+                predict_world_state=lambda: fake_wf,
+                online_step=lambda *a, **kw: None,
+            )
+            with patch("sysagent.neural.NeuralEngine", return_value=fake_engine), patch.object(
+                st, "is_ignored_by_brain_rule", side_effect=lambda txt: "noisy job" in txt
+            ):
+                asyncio.run(w._check_automations([]))
+
+            # anom-watch ran; routine-clean deferred (bottleneck 0.85 >= 0.75); ignored-job skipped by Brain rule
+            self.assertEqual(ran, ["anom-watch"])
 
 
 if __name__ == "__main__":
