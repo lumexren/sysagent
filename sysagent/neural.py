@@ -1,12 +1,4 @@
-"""5-Pillar Vectorized NumPy Neural Engine for SysAgent.
-
-1. Multi-Head Neural Network (256 -> 128 -> 128 -> [Tools, 6 Specialist Roles, Patch Value])
-   trained online with analytical backpropagation, GELU, LayerNorm, residual gating, and AdamW.
-2. Associative Neural Memory & Spreading Activation with Hebbian synaptic plasticity.
-3. Predictive World Model extrapolating 10-minute system telemetry & hourly role intent.
-4. Neural Patch Value Critic predicting P(success) for Self-Evolve candidates.
-5. Live Neural Pulse telemetry & activation map inspection for CLI/API.
-"""
+"""Vectorized NumPy Neural Engine for SysAgent."""
 
 from __future__ import annotations
 
@@ -208,7 +200,6 @@ class NeuralEngine:
             self.meta_file.write_text(json.dumps(self.meta, ensure_ascii=False), encoding="utf-8")
             mtime = self.npz_file.stat().st_mtime_ns
             meta_mtime = self.meta_file.stat().st_mtime_ns
-            # Evict stale entries for same path
             for k in [key for key in _ENGINE_CACHE if key[0] == str(self.npz_file)]:
                 _ENGINE_CACHE.pop(k, None)
             _ENGINE_CACHE[(str(self.npz_file), mtime, meta_mtime)] = (

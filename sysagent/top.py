@@ -87,7 +87,6 @@ def build_dashboard(state: dict[str, Any]) -> Layout:
     health = st.get("health", {})
     online = bool(state.get("online"))
 
-    # Header
     hdr = Table.grid(expand=True)
     hdr.add_column(justify="left")
     hdr.add_column(justify="center")
@@ -101,7 +100,6 @@ def build_dashboard(state: dict[str, Any]) -> Layout:
         f"[dim]{datetime.now().strftime('%H:%M:%S')}  (Ctrl+C to exit)[/]",
     )
 
-    # System Metrics
     sys_tbl = Table.grid(padding=(0, 1), expand=True)
     sys_tbl.add_column(width=10, style="bold")
     sys_tbl.add_column()
@@ -121,7 +119,6 @@ def build_dashboard(state: dict[str, Any]) -> Layout:
     gpu_str = f"GPU {gpu.get('util_percent', '?')}% {gpu.get('temp_c', '?')}°C" if gpu else "no GPU"
     sys_tbl.add_row("Thermals", Text(f"{temp}°C" if temp is not None else "n/a", style="cyan"), gpu_str)
 
-    # Brain & Evolve
     brain_tbl = Table.grid(padding=(0, 2), expand=True)
     brain_tbl.add_column(style="dim")
     brain_tbl.add_column(justify="right", style="bold")
@@ -132,7 +129,6 @@ def build_dashboard(state: dict[str, Any]) -> Layout:
     brain_tbl.add_row("Evolve Proposals", str(st.get("evolve_proposals", 0)))
     brain_tbl.add_row("Evolve Mode", str(evolve_info.get("auto_apply", evolve_info.get("enabled", "-"))))
 
-    # Events
     ev_tbl = Table(show_header=True, header_style="bold dim", box=None, expand=True)
     ev_tbl.add_column("Time", width=8, style="dim")
     ev_tbl.add_column("Source", width=12, style="cyan")
@@ -143,7 +139,6 @@ def build_dashboard(state: dict[str, Any]) -> Layout:
     if not state.get("events"):
         ev_tbl.add_row("-", "-", "[dim]No recent events[/]")
 
-    # Recent Snapshots / Audit
     sn_tbl = Table(show_header=True, header_style="bold dim", box=None, expand=True)
     sn_tbl.add_column("ID", width=5, style="dim")
     sn_tbl.add_column("Action", width=11, style="magenta")

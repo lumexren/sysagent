@@ -328,12 +328,7 @@ class AgentManager:
 
     @staticmethod
     async def _create_safe(client: Any, kwargs: dict[str, Any]) -> Any:
-        """Call interactions.create, never sending a previous_interaction_id minted by another backend.
-
-        agy/local clients mint synthetic ids ("agy-...", "local-...") that the real Gemini API rejects
-        with `400 invalid_request`; the shared client can switch backends mid-session (key rotation /
-        failover), so incompatible chain ids are dropped and a 400 on a chained call is retried unchained.
-        """
+        """Call interactions.create, dropping synthetic chain IDs on backend switches."""
         call_kwargs = dict(kwargs)
         prev = str(call_kwargs.get("previous_interaction_id") or "")
         is_synthetic_client = type(client).__name__ in {"AgyCliClient", "LocalMindClient"}

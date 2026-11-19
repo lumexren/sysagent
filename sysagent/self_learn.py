@@ -1,8 +1,4 @@
-"""Self-learning helpers: patch outcome tracking, proposal statistics, error clustering,
-workflow-to-skill suggestions, and the Self-Evolve status summary.
-
-All functions only read/write through `Storage`, so they stay cheap, testable, and LLM-free.
-"""
+"""Self-learning helpers: patch outcomes, error clustering, and evolve status summaries."""
 
 from __future__ import annotations
 
@@ -178,12 +174,7 @@ def _count_errors_for(storage: Storage, name: str, after: datetime | None, befor
 
 
 def check_patch_outcomes(storage: Storage, rollback: Any, window_hours: int = 24) -> list[dict[str, Any]]:
-    """Watch recently applied patches; roll back ones followed by more errors in the same file.
-
-    `rollback(proposal_id)` must restore the most recent evolve backup (SelfEvolver.rollback_last_evolve).
-    Only the latest undoable evolve edit can be reverted safely, so older regressions are recorded as
-    lessons instead of being force-reverted.
-    """
+    """Monitor applied patches and roll back regressions in the same file."""
     state: dict[str, str] = _load_json_memory(storage, _OUTCOMES_KEY, {})
     now = datetime.now()
     events: list[dict[str, Any]] = []

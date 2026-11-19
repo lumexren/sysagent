@@ -775,7 +775,6 @@ class SystemWatcher:
             return
         now = datetime.now()
 
-        # Fetch Neural world forecast once per tick for triggers & load deferral
         world_forecast: dict[str, Any] = {}
         try:
             from .neural import NeuralEngine
@@ -784,7 +783,6 @@ class SystemWatcher:
         except Exception:
             world_forecast = {}
 
-        # Check Brain quiet hours once per tick
         quiet_now = False
         try:
             from .config import get_settings
@@ -870,18 +868,15 @@ class SystemWatcher:
             if not trigger_context:
                 continue
 
-            # Brain rule gate: honor ignore rules
             if self.storage.is_ignored_by_brain_rule(f"{auto['name']} {auto['prompt']}"):
                 self.storage.add_brain_thought(
                     "ignore", 90, f"Skipped automation '{auto['name']}' due to brain ignore rule"
                 )
                 continue
 
-            # Brain quiet-hours gate for routine interval tasks
             if quiet_now and ttype == "interval":
                 continue
 
-            # Neural load deferral: postpone routine tasks during predicted bottlenecks
             b_prob = float(world_forecast.get("bottleneck_prob", 0.0) or 0.0)
             if ttype in {"daily_time", "interval"} and b_prob >= 0.75:
                 self.add_event(

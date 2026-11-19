@@ -1,11 +1,4 @@
-"""NeuralBrainCortex — unified NeuralEngine + CognitiveBrain fusion layer.
-
-Combines:
-1. Predictive Self-Healer (world-model anomaly/bottleneck -> root-cause match -> actionable fix)
-2. Dream / Sleep Consolidation Cycle (quiet-hours memory/rule/synapse consolidation)
-3. Flow Guardian (context + neural role autopilot for focus & background scheduling)
-4. Habit Copilot (recurring habits + neural activation -> one-click schedule suggestions)
-"""
+"""NeuralEngine + CognitiveBrain fusion layer."""
 
 from __future__ import annotations
 
@@ -244,7 +237,6 @@ class NeuralBrainCortex:
         except Exception:
             pass
 
-        # Distill repeated brain thoughts into a summary rule candidate count
         thoughts = self.storage.list_brain_thoughts(limit=80)
         decision_counts = Counter(str(t.get("decision") or "") for t in thoughts)
 
