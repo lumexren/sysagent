@@ -228,8 +228,26 @@ async def _send_and_stream(
 
             async def _pump_events() -> None:
                 nonlocal stop_spin, spin_task, handled_final
+                import select
+                import threading
+                from collections import deque
+
+                queued_raw: deque[str] = deque()
+
+                def _read_line_cancelable(prompt_txt: str, stop_ev: threading.Event) -> str | None:
+                    sys.stdout.write(prompt_txt)
+                    sys.stdout.flush()
+                    while not stop_ev.is_set():
+                        try:
+                            ready, _, _ = select.select([sys.stdin], [], [], 0.15)
+                        except Exception:
+                            return sys.stdin.readline()
+                        if ready:
+                            return sys.stdin.readline()
+                    return None
+
                 while True:
-                    raw = await ws.recv()
+                    raw = queued_raw.popleft() if queued_raw else await ws.recv()
                     if not stop_spin.is_set():
                         stop_spin.set()
                         await spin_task
@@ -253,21 +271,52 @@ async def _send_and_stream(
                         if event.get("preview"):
                             print(f"\033[90m  Preview: {event['preview']}\033[0m")
                         _flush_stdin()
-                        ans = (await asyncio.to_thread(input, t("cli_confirm", loc))).strip().lower()
-                        yes_set = set(t("cli_yes_tokens", loc).split(","))
-                        approved = ans in yes_set
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "approval_response",
-                                    "approval_id": event["approval_id"],
-                                    "approved": approved,
-                                }
-                            )
+                        stop_stdin = threading.Event()
+                        stdin_task = asyncio.create_task(
+                            asyncio.to_thread(_read_line_cancelable, t("cli_confirm", loc), stop_stdin)
                         )
+                        ws_task = asyncio.create_task(ws.recv())
+                        done, _ = await asyncio.wait(
+                            {stdin_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        if stdin_task in done:
+                            ws_task.cancel()
+                            try:
+                                await ws_task
+                            except BaseException:
+                                pass
+                            ans = (stdin_task.result() or "").strip().lower()
+                            yes_set = set(t("cli_yes_tokens", loc).split(","))
+                            approved = ans in yes_set
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "approval_response",
+                                        "approval_id": event["approval_id"],
+                                        "approved": approved,
+                                    }
+                                )
+                            )
+                        else:
+                            stop_stdin.set()
+                            await stdin_task
+                            ws_raw = ws_task.result()
+                            ws_ev = json.loads(ws_raw)
+                            if (
+                                ws_ev.get("type") == "approval_resolved"
+                                and ws_ev.get("approval_id") == event["approval_id"]
+                            ):
+                                approved = bool(ws_ev.get("approved"))
+                                lbl = t("cli_ok", loc) if approved else t("cli_denied", loc)
+                                col = "\033[32m" if approved else "\033[31m"
+                                print(f"\n{col}[{lbl} via notification]\033[0m")
+                            else:
+                                queued_raw.append(ws_raw)
                         spin_label[0] = f"running {event['tool_name']}..."
                         stop_spin = asyncio.Event()
                         spin_task = asyncio.create_task(_spinner(stop_spin))
+                    elif etype == "approval_resolved":
+                        pass
                     elif etype == "tool_result":
                         status_lbl = t("cli_ok", loc) if event.get("approved") else t("cli_denied", loc)
                         summary = _format_tool_preview(event.get("result_preview"))

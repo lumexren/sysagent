@@ -609,10 +609,11 @@ class AgentManager:
                     if n_warn:
                         parts_body.append(n_warn)
                     notif_body = "\n".join(parts_body)
-                    self.watcher._send_desktop_notification(
-                        "SysAgent Approval Required",
+                    notif_handle = self.watcher._send_desktop_notification(
+                        f"{self.settings.agent_name} — {t('approval_required', loc)}",
                         notif_body[:240],
                         urgency="critical" if assessment.risk_level == "high" else "normal",
+                        category="approval",
                         actions=[
                             ("approve", t("notif_approve", loc)),
                             ("deny", t("notif_deny", loc)),
@@ -620,6 +621,7 @@ class AgentManager:
                         on_action=lambda act: loop.call_soon_threadsafe(
                             self.resolve_approval, approval_id, act == "approve"
                         ),
+                        bypass_gates=True,
                     )
                     if interactive:
                         await _emit(
@@ -658,6 +660,17 @@ class AgentManager:
                         self.pending_approvals.pop(approval_id, None)
                         approved = False
                         self.storage.record_notification_feedback(fb_key, "timeout")
+                    finally:
+                        if notif_handle is not None:
+                            notif_handle.cancel()
+                        if interactive:
+                            await _emit(
+                                {
+                                    "type": "approval_resolved",
+                                    "approval_id": approval_id,
+                                    "approved": approved,
+                                }
+                            )
 
                 if approved:
                     cached = self._tool_cache.get(call.name, args)

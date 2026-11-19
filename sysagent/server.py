@@ -190,6 +190,11 @@ async def api_events(limit: int = 30) -> dict[str, Any]:
     return {"events": watcher.get_events(limit=limit)}
 
 
+@app.get("/api/notifications")
+async def api_notifications(limit: int = 20) -> dict[str, Any]:
+    return {"notifications": watcher.notifier.list_recent(limit=limit)}
+
+
 @app.post("/api/approve/{approval_id}")
 async def api_approve(approval_id: str, body: ApprovalDecision) -> dict[str, Any]:
     ok = agent.resolve_approval(approval_id, body.approved)

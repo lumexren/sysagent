@@ -68,6 +68,9 @@ class SystemWatcher:
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._loop_ref: asyncio.AbstractEventLoop | None = None
+        from .notification import NotificationCenter
+
+        self.notifier = NotificationCenter(settings, storage)
         try:
             psutil.cpu_percent(interval=None)
         except Exception:
@@ -937,70 +940,21 @@ class SystemWatcher:
         actions: list[tuple[str, str]] | None = None,
         on_action: Callable[[str], Any] | None = None,
         on_timeout: Callable[[], Any] | None = None,
-    ) -> None:
-        if not shutil.which("notify-send"):
-            return
-        if (
-            category in {"health", "filesystem", "security", "term_error"}
-            and self.storage
-            and self.storage.is_ignored_by_brain_rule(f"{title} {body}")
-        ):
-            return
-        if urgency != "critical" and self.storage is not None:
-            try:
-                from .neural import NeuralEngine
+        bypass_gates: bool = False,
+    ) -> Any:
+        notifier = getattr(self, "notifier", None)
+        if notifier is None:
+            from .notification import NotificationCenter
 
-                for hit in NeuralEngine(self.storage).spreading_activation(f"{title} {body}", top_k=2):
-                    if (
-                        str(hit.get("key") or "") == "brain_dismiss"
-                        and float(hit.get("activation", 0.0) or 0.0) >= 0.68
-                    ):
-                        return
-            except Exception:
-                pass
-        icon_path = Path(__file__).resolve().parent.parent / "assets" / "sysagent.svg"
-        icon_arg = str(icon_path) if icon_path.is_file() else "utilities-system-monitor"
-        if urgency == "critical":
-            icon_arg = "dialog-error"
-        elif category == "security":
-            icon_arg = "security-high"
-        cmd = [
-            "notify-send",
-            "-a",
-            self.settings.agent_name,
-            "-i",
-            icon_arg,
-            "-u",
-            urgency,
-            "-h",
-            "string:desktop-entry:sysagent-quick",
-        ]
-        if actions:
-            for act_key, act_label in actions:
-                cmd.extend(["-A", f"{act_key}={act_label}"])
-        cmd.extend([title, body])
-
-        def _worker() -> None:
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=300 if actions else 5,
-                )
-                selected = (proc.stdout or "").strip()
-                if selected and on_action is not None:
-                    on_action(selected)
-                elif actions and not selected and on_timeout is not None:
-                    on_timeout()
-            except subprocess.TimeoutExpired:
-                if actions and on_timeout is not None:
-                    try:
-                        on_timeout()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        threading.Thread(target=_worker, daemon=True).start()
+            notifier = NotificationCenter(self.settings, self.storage)
+            self.notifier = notifier
+        return notifier.send(
+            title,
+            body,
+            urgency=urgency,
+            category=category,
+            actions=actions,
+            on_action=on_action,
+            on_timeout=on_timeout,
+            bypass_gates=bypass_gates,
+        )
