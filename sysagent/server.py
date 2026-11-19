@@ -226,12 +226,34 @@ async def api_delete_memory(key: str) -> dict[str, Any]:
 
 @app.get("/api/automations")
 async def api_automations() -> dict[str, Any]:
-    return {"automations": storage.list_automations()}
+    return {"automations": await asyncio.to_thread(storage.list_automations)}
+
+
+@app.post("/api/automations")
+async def api_create_automation(body: dict[str, Any]) -> dict[str, Any]:
+    name = str(body.get("name") or "").strip()
+    trigger_type = str(body.get("trigger_type") or "").strip()
+    trigger_value = str(body.get("trigger_value") or "").strip()
+    prompt = str(body.get("prompt") or "").strip()
+    if not (name and trigger_type and trigger_value and prompt):
+        raise HTTPException(status_code=400, detail="name, trigger_type, trigger_value, and prompt are required")
+    auto_id = await asyncio.to_thread(
+        storage.create_automation, name, trigger_type, trigger_value, prompt
+    )
+    return {"id": auto_id, "name": name, "trigger_type": trigger_type, "trigger_value": trigger_value}
+
+
+@app.post("/api/automations/{auto_id}/toggle")
+async def api_toggle_automation(auto_id: int) -> dict[str, Any]:
+    state = await asyncio.to_thread(storage.toggle_automation, auto_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Automation not found")
+    return {"id": auto_id, "enabled": state}
 
 
 @app.delete("/api/automations/{auto_id}")
 async def api_delete_automation(auto_id: int) -> dict[str, Any]:
-    return {"deleted": storage.delete_automation(auto_id)}
+    return {"deleted": await asyncio.to_thread(storage.delete_automation, auto_id)}
 
 
 @app.get("/api/brain")

@@ -1323,6 +1323,41 @@ def _cmd_local(base_url: str, action: str, query: str | None = None, locale: str
             print(f"Predicted Tool: {tool} (score={score}) args={args}")
             print(f"Offline Reply : {mind.synthesize_reply(q)}")
             return
+        if action == "bench":
+            from rich import box
+            from rich.console import Console
+            from rich.table import Table
+
+            from .bench import benchmark_local_models
+
+            report = benchmark_local_models(role_filter=query, storage=Storage())
+            tbl = Table(title="Local GGUF Model Benchmark", box=box.ROUNDED, border_style="cyan")
+            tbl.add_column("Role", style="bold cyan")
+            tbl.add_column("Model")
+            tbl.add_column("Size", justify="right")
+            tbl.add_column("Latency", justify="right")
+            tbl.add_column("tok/s", justify="right", style="bold green")
+            tbl.add_column("RAM Δ", justify="right")
+            tbl.add_column("Status")
+            for row in report.get("results") or []:
+                lat = f"{row['latency_s']}s" if row.get("latency_s") is not None else "-"
+                tps = f"{row['tok_per_s']}" if row.get("tok_per_s") is not None else "-"
+                tbl.add_row(
+                    str(row.get("role", "")),
+                    str(row.get("model", "")),
+                    f"{row.get('size_gb', 0)} GB",
+                    lat,
+                    tps,
+                    f"+{row.get('ram_delta_mb', 0)} MB",
+                    str(row.get("status", "")),
+                )
+            console = Console()
+            console.print(tbl)
+            if report.get("fastest_model"):
+                console.print(
+                    f"[bold green]Fastest:[/] {report['fastest_role']} ({report['fastest_model']})"
+                )
+            return
         try:
             resp = httpx.get(f"{base_url}/api/local", headers=hdrs, timeout=5)
             resp.raise_for_status()
@@ -1626,6 +1661,130 @@ def _cmd_rollback(
         sys.exit(1)
 
 
+def _parse_schedule_spec(spec: str) -> tuple[str, str]:
+    """Parse shorthand schedule spec (`09:00`, `30m`, `2h`, `60s`, `file:*.log`) into (trigger_type, trigger_value)."""
+    s = spec.strip()
+    if s.startswith("file:"):
+        return "file_created", s.split(":", 1)[1].strip()
+    if ":" in s and len(s) <= 5:
+        hh, mm = s.split(":", 1)
+        if hh.isdigit() and mm.isdigit() and 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59:
+            return "daily_time", f"{int(hh):02d}:{int(mm):02d}"
+    low = s.lower()
+    if low.endswith("h") and low[:-1].isdigit():
+        return "interval", str(max(30, int(low[:-1]) * 3600))
+    if low.endswith("m") and low[:-1].isdigit():
+        return "interval", str(max(30, int(low[:-1]) * 60))
+    if low.endswith("s") and low[:-1].isdigit():
+        return "interval", str(max(30, int(low[:-1])))
+    if low.isdigit():
+        return "interval", str(max(30, int(low)))
+    raise ValueError(f"Unsupported schedule spec '{spec}'. Use HH:MM, 30m, 2h, 60s, or file:*.log")
+
+
+def _cmd_schedule(
+    base_url: str,
+    action: str,
+    rest: list[str],
+    locale_override: str | None = None,
+) -> None:
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+
+    loc = locale_override or get_settings().locale
+    hdrs = _auth_headers()
+    try:
+        if action == "list":
+            try:
+                resp = httpx.get(f"{base_url}/api/automations", headers=hdrs, timeout=5)
+                resp.raise_for_status()
+                items = resp.json().get("automations") or []
+            except Exception:
+                with Storage() as st:
+                    items = st.list_automations()
+            tbl = Table(title="Scheduled Automations", box=box.ROUNDED, border_style="cyan")
+            tbl.add_column("ID", style="dim")
+            tbl.add_column("Name", style="bold")
+            tbl.add_column("Trigger", style="cyan")
+            tbl.add_column("Prompt")
+            tbl.add_column("State")
+            tbl.add_column("Last Run", style="dim")
+            for a in items:
+                state = "[green]enabled[/]" if a.get("enabled") else "[dim]disabled[/]"
+                tbl.add_row(
+                    str(a.get("id", "")),
+                    str(a.get("name", "")),
+                    f"{a.get('trigger_type')}:{a.get('trigger_value')}",
+                    str(a.get("prompt", ""))[:55],
+                    state,
+                    str(a.get("last_run_at") or "-"),
+                )
+            if not items:
+                tbl.add_row("-", "No scheduled tasks", "-", "-", "-", "-")
+            Console().print(tbl)
+            return
+
+        if action == "add":
+            if len(rest) < 3:
+                print(
+                    "Usage: sysagent schedule add <name> <HH:MM|30m|2h|file:*.log> <prompt...>",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            name, spec = rest[0], rest[1]
+            prompt = " ".join(rest[2:]).strip()
+            ttype, tval = _parse_schedule_spec(spec)
+            try:
+                resp = httpx.post(
+                    f"{base_url}/api/automations",
+                    json={"name": name, "trigger_type": ttype, "trigger_value": tval, "prompt": prompt},
+                    headers=hdrs,
+                    timeout=5,
+                )
+                resp.raise_for_status()
+                out = resp.json()
+            except Exception:
+                with Storage() as st:
+                    aid = st.create_automation(name, ttype, tval, prompt)
+                out = {"id": aid, "name": name, "trigger_type": ttype, "trigger_value": tval}
+            Console().print(
+                f"[bold green]Scheduled #{out['id']}:[/] {name} ({ttype}={tval})"
+            )
+            return
+
+        if action in {"delete", "toggle"}:
+            if not rest or not rest[0].isdigit():
+                print(f"Usage: sysagent schedule {action} <id>", file=sys.stderr)
+                sys.exit(1)
+            aid = int(rest[0])
+            if action == "delete":
+                try:
+                    resp = httpx.delete(f"{base_url}/api/automations/{aid}", headers=hdrs, timeout=5)
+                    resp.raise_for_status()
+                    ok = bool(resp.json().get("deleted"))
+                except Exception:
+                    with Storage() as st:
+                        ok = st.delete_automation(aid)
+                print(f"Deleted automation #{aid}." if ok else f"Automation #{aid} not found.")
+            else:
+                try:
+                    resp = httpx.post(f"{base_url}/api/automations/{aid}/toggle", headers=hdrs, timeout=5)
+                    resp.raise_for_status()
+                    enabled = resp.json().get("enabled")
+                except Exception:
+                    with Storage() as st:
+                        enabled = st.toggle_automation(aid)
+                if enabled is None:
+                    print(f"Automation #{aid} not found.", file=sys.stderr)
+                    sys.exit(1)
+                print(f"Automation #{aid} is now {'enabled' if enabled else 'disabled'}.")
+            return
+    except Exception as exc:
+        print(f"{t('error_prefix', loc)}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     settings = get_settings()
     parser = argparse.ArgumentParser(
@@ -1658,8 +1817,8 @@ def main() -> None:
     prompts_parser = sub.add_parser("prompts", help="List, evolve, or rollback centralized system prompts")
     prompts_parser.add_argument("prompts_action", nargs="?", default="list", choices=["list", "evolve", "rollback"])
     prompts_parser.add_argument("prompt_key", nargs="?", default=None, help="Target prompt key (e.g. agent_main)")
-    local_parser = sub.add_parser("local", help="Self-training local offline model status, train, distill, download, or test")
-    local_parser.add_argument("local_action", nargs="?", default="status", choices=["status", "train", "distill", "download", "test", "prune", "profile"])
+    local_parser = sub.add_parser("local", help="Self-training local offline model status, train, distill, download, bench, or test")
+    local_parser.add_argument("local_action", nargs="?", default="status", choices=["status", "train", "distill", "download", "test", "bench", "prune", "profile"])
     local_parser.add_argument("local_query", nargs="?", default=None, help="Optional test query")
     neural_parser = sub.add_parser("neural", help="Vectorized Neural Engine status, train, or pulse inspection")
     neural_parser.add_argument("neural_action", nargs="?", default="status", choices=["status", "train", "pulse", "activate"])
@@ -1679,6 +1838,10 @@ def main() -> None:
     rb_parser.add_argument("rollback_target", nargs="?", default="auto", choices=["auto", "list", "file", "evolve", "config"])
     rb_parser.add_argument("rollback_id", nargs="?", default=None, help="Optional snapshot, batch, or evolve proposal ID")
     rb_parser.add_argument("--list", action="store_true", dest="rollback_list", help="List available snapshots")
+    sub.add_parser("mcp", help="Run SysAgent as a stdio MCP (Model Context Protocol) server")
+    sched_parser = sub.add_parser("schedule", help="List, add, toggle, or delete scheduled automations")
+    sched_parser.add_argument("schedule_action", nargs="?", default="list", choices=["list", "add", "delete", "toggle"])
+    sched_parser.add_argument("schedule_args", nargs="*", help="Arguments for add/delete/toggle")
 
     locale_override: str | None = None
     raw_argv = sys.argv[1:]
@@ -1695,7 +1858,7 @@ def main() -> None:
             filtered_argv.append(raw_argv[i])
             i += 1
 
-    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "-h", "--help"}:
+    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "-h", "--help"}:
         args = parser.parse_args(filtered_argv)
         if args.subcommand == "serve":
             uvicorn.run(
@@ -1772,6 +1935,17 @@ def main() -> None:
                 args.rollback_target,
                 args.rollback_id,
                 args.rollback_list,
+                locale_override,
+            )
+        elif args.subcommand == "mcp":
+            from .mcp_server import run_mcp_stdio
+
+            run_mcp_stdio()
+        elif args.subcommand == "schedule":
+            _cmd_schedule(
+                settings.base_url,
+                args.schedule_action,
+                args.schedule_args,
                 locale_override,
             )
         return

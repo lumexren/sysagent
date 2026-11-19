@@ -518,6 +518,19 @@ class Storage(_BrainStorageMixin):
             cur = conn.execute("DELETE FROM automations WHERE id = ?", (automation_id,))
             return cur.rowcount > 0
 
+    def toggle_automation(self, automation_id: int) -> bool | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT enabled FROM automations WHERE id = ?", (automation_id,)
+            ).fetchone()
+            if not row:
+                return None
+            new_val = 0 if int(row["enabled"]) else 1
+            conn.execute(
+                "UPDATE automations SET enabled = ? WHERE id = ?", (new_val, automation_id)
+            )
+            return bool(new_val)
+
 
     def record_file_backup(
         self,
