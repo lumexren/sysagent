@@ -41,6 +41,9 @@
 | **SelfEvolver** | [`evolve.py`](sysagent/evolve.py) | AST survey, isolated staging + Ruff gate, A/B benchmark, auto-rollback & git commit |
 | **Watcher** | [`watcher.py`](sysagent/watcher.py) | Continuous telemetry, systemd/security monitoring, RSS leak guard |
 | **Safety** | [`safety.py`](sysagent/safety.py) | Smart approval policy, dry-run impact preview, Neural risk warnings |
+| **Notifications** | [`notification.py`](sysagent/notification.py) | Centralized `NotificationCenter` with Brain/Neural gating, dedup, and bidirectional chat↔toast approval sync |
+| **Snapshots** | [`snapshots.py`](sysagent/snapshots.py) | Unified file/audit, config, and self-evolve snapshot management & rollback |
+| **MCP Server** | [`mcp_server.py`](sysagent/mcp_server.py) | Zero-dependency stdio JSON-RPC 2.0 Model Context Protocol server |
 | **Storage** | [`storage.py`](sysagent/storage.py) | SQLite WAL + FTS5 full-text search, audit log, knowledge graph, learned cues |
 
 ## Installation
@@ -49,6 +52,8 @@
 git clone https://github.com/lumexren/sysagent.git
 cd sysagent
 bash install.sh
+# Or install as a standard editable Python package:
+pip install -e .
 ```
 
 Configure your credentials in `~/.config/sysagent/.env`, then enable and start the user daemon:
@@ -66,6 +71,10 @@ GEMINI_API_KEY=your_api_key_here
 # Or use Antigravity CLI / OAuth / ADC:
 # SYSAGENT_AUTH_MODE=agy_cli
 
+# Local GGUF backend & local-first specialist routing:
+# SYSAGENT_LOCAL_BACKEND=auto        # auto | llama_server | llama_cpp | llama_cli
+# SYSAGENT_LOCAL_FIRST=1
+
 # Optional: automatically push SelfEvolver commits to origin
 # SYSAGENT_EVOLVE_AUTO_PUSH=true
 ```
@@ -75,7 +84,13 @@ GEMINI_API_KEY=your_api_key_here
 | Command | Description |
 |:--------|:------------|
 | `sysagent chat` | Interactive terminal chat (`/model`, `/paste`, `/resume`, `/doctor`, `/digest`) |
+| `sysagent top [--once] [-n 1.5]` | Live Rich terminal dashboard showing CPU/RAM/Disk/GPU, Brain, Evolve, events, and snapshots |
 | `sysagent status` | Rich grid overview of daemon, host/GPU, models/RPD, Brain, Evolve, and NeuralEngine |
+| `sysagent rollback [list\|file\|config\|evolve] [id]` | List or restore file/batch, config, or SelfEvolver snapshots |
+| `sysagent schedule [list\|add\|toggle\|delete]` | Manage scheduled automations (`HH:MM`, `30m`, `2h`, `file:*.log`, `neural:anomaly`, `neural:bottleneck`) |
+| `sysagent notifications [list\|test]` | Inspect recent desktop notifications (including Brain/Neural suppressions) or send a test toast |
+| `sysagent local [status\|train\|distill\|download\|bench\|test]` | Manage local GGUF specialist ensemble and run hardware `tok/s` benchmarks |
+| `sysagent mcp` | Run SysAgent as a stdio MCP (Model Context Protocol) server |
 | `sysagent doctor` | Diagnostics for daemon API, systemd unit, SQLite DB, NeuralEngine, GGUF models, disk, and Ruff |
 | `sysagent digest` | Render the daily system and Brain digest |
 | `sysagent neural [status\|train\|pulse]` | Inspect NeuralEngine metrics, retrain, or run a live query `pulse` |

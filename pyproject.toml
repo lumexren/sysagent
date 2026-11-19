@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sysagent"
+version = "1.0.0"
+description = "Autonomous, self-evolving Linux system daemon and AI assistant powered by a hybrid Cloud + Local Neural architecture"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai>=3.2.0",
+    "google-auth-oauthlib>=1.2.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "psutil>=6.0.0",
+    "httpx>=0.27.0",
+    "websockets>=13.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+sysagent = "sysagent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sysagent*"]

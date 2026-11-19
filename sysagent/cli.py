@@ -1850,6 +1850,66 @@ def _cmd_schedule(
         sys.exit(1)
 
 
+def _cmd_notifications(
+    base_url: str,
+    action: str,
+    rest: list[str],
+    limit: int = 20,
+    locale_override: str | None = None,
+) -> None:
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+
+    loc = locale_override or get_settings().locale
+    hdrs = _auth_headers()
+    try:
+        if action == "test":
+            from .notification import NotificationCenter
+
+            msg = " ".join(rest).strip() or "Test notification from NotificationCenter"
+            with Storage() as st:
+                nc = NotificationCenter(get_settings(), st)
+                h = nc.send(
+                    f"{get_settings().agent_name} — Test",
+                    msg,
+                    category="info",
+                    bypass_gates=True,
+                )
+            print(f"Sent test notification ({h.notif_id})." if h else "notify-send unavailable.")
+            return
+
+        resp = httpx.get(
+            f"{base_url}/api/notifications",
+            params={"limit": limit},
+            headers=hdrs,
+            timeout=5,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("notifications") or []
+        tbl = Table(title="Recent Notifications", box=box.ROUNDED, border_style="cyan")
+        tbl.add_column("Time", style="dim", width=8)
+        tbl.add_column("Cat", style="cyan", width=10)
+        tbl.add_column("Status", width=22)
+        tbl.add_column("Title")
+        tbl.add_column("Action", style="green")
+        for n in items:
+            ts = str(n.get("created_at") or "")[-8:]
+            tbl.add_row(
+                ts,
+                str(n.get("category", "")),
+                str(n.get("status", "")),
+                str(n.get("title", ""))[:45],
+                str(n.get("action") or "-"),
+            )
+        if not items:
+            tbl.add_row("-", "-", "No notifications yet", "-", "-")
+        Console().print(tbl)
+    except Exception as exc:
+        print(f"{t('error_prefix', loc)}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     settings = get_settings()
     parser = argparse.ArgumentParser(
@@ -1907,6 +1967,10 @@ def main() -> None:
     sched_parser = sub.add_parser("schedule", help="List, add, toggle, or delete scheduled automations")
     sched_parser.add_argument("schedule_action", nargs="?", default="list", choices=["list", "add", "delete", "toggle"])
     sched_parser.add_argument("schedule_args", nargs="*", help="Arguments for add/delete/toggle")
+    notif_parser = sub.add_parser("notifications", help="Inspect recent notifications or send a test notification")
+    notif_parser.add_argument("notif_action", nargs="?", default="list", choices=["list", "test"])
+    notif_parser.add_argument("notif_args", nargs="*", help="Optional message for test notification")
+    notif_parser.add_argument("-n", "--limit", type=int, default=20)
 
     locale_override: str | None = None
     raw_argv = sys.argv[1:]
@@ -1923,7 +1987,7 @@ def main() -> None:
             filtered_argv.append(raw_argv[i])
             i += 1
 
-    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "-h", "--help"}:
+    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "notifications", "-h", "--help"}:
         args = parser.parse_args(filtered_argv)
         if args.subcommand == "serve":
             uvicorn.run(
@@ -2011,6 +2075,14 @@ def main() -> None:
                 settings.base_url,
                 args.schedule_action,
                 args.schedule_args,
+                locale_override,
+            )
+        elif args.subcommand == "notifications":
+            _cmd_notifications(
+                settings.base_url,
+                args.notif_action,
+                args.notif_args,
+                args.limit,
                 locale_override,
             )
         return
