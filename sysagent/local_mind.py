@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import subprocess
-import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -240,12 +239,12 @@ SEED_CURRICULUM: list[dict[str, Any]] = [
 
 
 from .local_inference import (
-    _has_ram_for_gguf,
-    _release_all_warm_models,
+    _has_ram_for_gguf as _has_ram_for_gguf,
+    _release_all_warm_models as _release_all_warm_models,
     ensure_llama_server,
     get_llama_cpp_model,
     get_warm_model_name,
-    unload_idle_servers,
+    unload_idle_servers as unload_idle_servers,
 )
 
 _EMBED_CACHE: dict[str, list[float]] = {}
@@ -1020,7 +1019,7 @@ class LocalMind:
             "chat": "brief conversational greetings, status check-ins, or concise assistant Q&A",
         }
 
-        for idx, teacher in enumerate(TEACHER_MODELS):
+        for t_idx, teacher in enumerate(TEACHER_MODELS):
             prompt = (
                 "You are a Teacher Model generating high-quality training examples for a local Linux system assistant.\n"
                 f"Available tool names: {json.dumps(tool_names)}\n"
@@ -1032,7 +1031,7 @@ class LocalMind:
                     f"Solve these user queries and map each to the best tool + arguments and a clean plain-text reply: {json.dumps(batch_q, ensure_ascii=False)}\n"
                 )
             else:
-                focus_role = weak_roles[idx % len(weak_roles)]
+                focus_role = weak_roles[t_idx % len(weak_roles)]
                 user_examples = self.sample_user_utterances(limit=5)
                 lang_hint = (
                     f"Match the natural language(s) observed in the user's real history ({json.dumps(user_examples, ensure_ascii=False)}) as well as English"

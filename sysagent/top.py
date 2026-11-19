@@ -18,7 +18,7 @@ from rich.text import Text
 
 def _bar(pct: float, width: int = 18) -> Text:
     clamped = max(0.0, min(100.0, float(pct)))
-    filled = int(round((clamped / 100.0) * width))
+    filled = round((clamped / 100.0) * width)
     color = "green" if clamped < 65 else ("yellow" if clamped < 85 else "red")
     t = Text()
     t.append("█" * filled, style=color)
