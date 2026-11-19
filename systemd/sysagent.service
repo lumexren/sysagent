@@ -10,6 +10,11 @@ ExecStart=%h/Projects/sysagent/.venv/bin/python -m sysagent.cli serve
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+MemoryHigh=4G
+MemoryMax=6G
+TasksMax=256
 
 [Install]
 WantedBy=default.target
