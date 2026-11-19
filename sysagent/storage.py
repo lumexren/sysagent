@@ -18,6 +18,7 @@ def _now_iso() -> str:
 
 _DB_LOCKS_GUARD = threading.Lock()
 _DB_LOCKS: dict[str, threading.RLock] = {}
+_INITIALIZED_DBS: set[str] = set()
 
 
 def _get_db_lock(db_path: Path) -> threading.RLock:
@@ -40,7 +41,25 @@ class Storage(_BrainStorageMixin):
         self._conn: sqlite3.Connection | None = None
         self._fts_enabled = False
         self._fts_dirty = True
-        self._init_schema()
+        db_key = str(self.db_path.resolve())
+        if db_key not in _INITIALIZED_DBS or not self.db_path.is_file():
+            self._init_schema()
+            _INITIALIZED_DBS.add(db_key)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+    def __enter__(self) -> "Storage":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:

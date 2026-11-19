@@ -118,8 +118,7 @@ async def index() -> dict[str, str]:
     return {"service": settings.agent_name, "status": "running"}
 
 
-@app.get("/api/status")
-async def api_status() -> dict[str, Any]:
+def _build_status_payload() -> dict[str, Any]:
     a_status = auth.status
     return {
         "status": "running",
@@ -148,6 +147,11 @@ async def api_status() -> dict[str, Any]:
         "lessons": len(storage.list_lessons()),
         "uptime_sec": int(time.monotonic() - _BOOT_TIME),
     }
+
+
+@app.get("/api/status")
+async def api_status() -> dict[str, Any]:
+    return await asyncio.to_thread(_build_status_payload)
 
 
 @app.get("/api/i18n")
@@ -452,12 +456,12 @@ async def api_evolve_reject(proposal_id: int) -> dict[str, str]:
 
 @app.post("/api/evolve/rollback")
 async def api_evolve_rollback() -> dict[str, Any]:
-    return {"rolled_back": evolver.rollback_last_evolve()}
+    return {"rolled_back": await asyncio.to_thread(evolver.rollback_last_evolve)}
 
 
 @app.get("/api/self")
 async def api_self_health() -> dict[str, Any]:
-    return self_monitor.get_self_health()
+    return await asyncio.to_thread(self_monitor.get_self_health)
 
 
 @app.get("/api/prompts")
@@ -560,12 +564,13 @@ async def api_lessons() -> dict[str, Any]:
 async def api_undo_batch(batch_id: str | None = None) -> dict[str, Any]:
     from .tools import execute_tool
 
-    raw = execute_tool(
+    raw = await asyncio.to_thread(
+        execute_tool,
         "undo_batch_actions",
         {"batch_id": batch_id} if batch_id else {},
         watcher,
         storage,
-        plugins=plugins,
+        plugins,
     )
     return json.loads(raw) if isinstance(raw, str) else {"result": raw}
 
@@ -574,7 +579,7 @@ async def api_undo_batch(batch_id: str | None = None) -> dict[str, Any]:
 async def api_snapshots(limit: int = 15) -> dict[str, Any]:
     from .snapshots import unified_snapshots
 
-    return unified_snapshots(storage, limit=limit)
+    return await asyncio.to_thread(unified_snapshots, storage, limit)
 
 
 @app.post("/api/rollback")
@@ -584,19 +589,18 @@ async def api_rollback(body: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = body or {}
     target = str(payload.get("target", "auto"))
     target_id = payload.get("id")
-    return perform_rollback(
+    return await asyncio.to_thread(
+        perform_rollback,
         target,
         str(target_id) if target_id is not None else None,
         storage,
-        watcher=watcher,
-        plugins=plugins,
-        evolver=evolver,
+        watcher,
+        plugins,
+        evolver,
     )
 
 
-@app.get("/api/search")
-async def api_search(q: str = "") -> dict[str, Any]:
-    term = q.strip()
+def _run_search(term: str) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if term:
         low = term.lower()
@@ -604,7 +608,12 @@ async def api_search(q: str = "") -> dict[str, Any]:
             if low in s["title"].lower():
                 results.append({"type": "session", "title": s["title"], "detail": s["session_id"]})
         results.extend(storage.search_knowledge(term, limit=25))
-    return {"results": results[:25]}
+    return results[:25]
+
+
+@app.get("/api/search")
+async def api_search(q: str = "") -> dict[str, Any]:
+    return {"results": await asyncio.to_thread(_run_search, q.strip())}
 
 
 @app.websocket("/ws/chat")

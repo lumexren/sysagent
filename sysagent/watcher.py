@@ -180,8 +180,14 @@ class SystemWatcher:
         hours_left = round(current_free_gb / rate, 1) if rate > 0.05 else None
         return rate, hours_left
 
-    def get_health_snapshot(self) -> dict[str, Any]:
-        """Return current CPU, RAM, disk, temperature, zombie count, and burn-rate stats."""
+    def get_health_snapshot(self, ttl_sec: float = 2.5, force: bool = False) -> dict[str, Any]:
+        """Return current CPU, RAM, disk, temperature, zombie count, and burn-rate stats (TTL cached)."""
+        now = time.monotonic()
+        cached = getattr(self, "_health_cache", None)
+        cached_ts = float(getattr(self, "_health_cache_ts", 0.0) or 0.0)
+        if not force and cached is not None and ttl_sec > 0.0 and (now - cached_ts) < ttl_sec:
+            return dict(cached)
+
         cpu = psutil.cpu_percent(interval=None)
         if cpu == 0.0:
             cpu = psutil.cpu_percent(interval=0.05)
@@ -198,7 +204,7 @@ class SystemWatcher:
         free_gb = round(disk.free / (1024**3), 2)
         burn_rate, hours_to_full = self._compute_disk_burn_rate(free_gb)
         boot = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
-        return {
+        snap = {
             "cpu_percent": round(cpu, 1),
             "ram_percent": round(mem.percent, 1),
             "ram_used_gb": round(mem.used / (1024**3), 2),
@@ -212,6 +218,9 @@ class SystemWatcher:
             "zombie_count": self._last_zombie_count,
             "boot_time": boot,
         }
+        self._health_cache = snap
+        self._health_cache_ts = now
+        return dict(snap)
 
     def start(self) -> None:
         if self._running:

@@ -32,7 +32,7 @@ _DEFAULT_MODELS_DIR = Path.home() / ".local" / "share" / "sysagent" / "models"
 NEURAL_NPZ_FILE = _DEFAULT_MODELS_DIR / "neural_engine.npz"
 NEURAL_META_FILE = _DEFAULT_MODELS_DIR / "neural_meta.json"
 
-_ENGINE_CACHE: dict[tuple[str, int], tuple[dict[str, np.ndarray], dict[str, Any]]] = {}
+_ENGINE_CACHE: dict[tuple[str, int, int], tuple[dict[str, np.ndarray], dict[str, Any]]] = {}
 
 
 def _gelu_and_grad(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -112,7 +112,8 @@ class NeuralEngine:
 
     def _load(self) -> None:
         npz_mtime = self.npz_file.stat().st_mtime_ns if self.npz_file.is_file() else 0
-        cache_key = (str(self.npz_file), npz_mtime)
+        meta_mtime = self.meta_file.stat().st_mtime_ns if self.meta_file.is_file() else 0
+        cache_key = (str(self.npz_file), npz_mtime, meta_mtime)
         if npz_mtime > 0 and cache_key in _ENGINE_CACHE:
             cached_w, cached_m = _ENGINE_CACHE[cache_key]
             self.weights = cached_w
@@ -206,10 +207,11 @@ class NeuralEngine:
             np.savez_compressed(self.npz_file, **self.weights)
             self.meta_file.write_text(json.dumps(self.meta, ensure_ascii=False), encoding="utf-8")
             mtime = self.npz_file.stat().st_mtime_ns
+            meta_mtime = self.meta_file.stat().st_mtime_ns
             # Evict stale entries for same path
             for k in [key for key in _ENGINE_CACHE if key[0] == str(self.npz_file)]:
                 _ENGINE_CACHE.pop(k, None)
-            _ENGINE_CACHE[(str(self.npz_file), mtime)] = (
+            _ENGINE_CACHE[(str(self.npz_file), mtime, meta_mtime)] = (
                 {k: v.copy() for k, v in self.weights.items()},
                 json.loads(json.dumps(self.meta)),
             )
@@ -957,8 +959,11 @@ class NeuralEngine:
             try:
                 self.meta_file.write_text(json.dumps(self.meta, ensure_ascii=False), encoding="utf-8")
                 mtime = self.npz_file.stat().st_mtime_ns if self.npz_file.is_file() else 0
+                meta_mtime = self.meta_file.stat().st_mtime_ns if self.meta_file.is_file() else 0
                 if mtime > 0:
-                    _ENGINE_CACHE[(str(self.npz_file), mtime)] = (
+                    for k in [key for key in _ENGINE_CACHE if key[0] == str(self.npz_file)]:
+                        _ENGINE_CACHE.pop(k, None)
+                    _ENGINE_CACHE[(str(self.npz_file), mtime, meta_mtime)] = (
                         {k: v.copy() for k, v in self.weights.items()},
                         json.loads(json.dumps(self.meta)),
                     )

@@ -81,6 +81,47 @@ class LocalAndStorageImprovementsTests(unittest.TestCase):
             self.assertEqual(res["tier"], "local:coding")
             self.assertEqual(res["model"], "OmniCoder-9B.Q4_K_M.gguf")
 
+    def test_storage_context_manager_and_watcher_ttl_cache(self) -> None:
+        from sysagent.watcher import SystemWatcher
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "ctx.db"
+            with Storage(db_path=db) as st:
+                st.set_memory("k", "v")
+                self.assertEqual(st.get_memory("k"), "v")
+            self.assertIsNone(st._conn)
+
+        w = SystemWatcher.__new__(SystemWatcher)
+        w._disk_history = []
+        w._last_zombie_count = 0
+        calls = {"n": 0}
+        with patch.object(w, "_read_max_temperature_c", side_effect=lambda: (calls.__setitem__("n", calls["n"] + 1) or 50.0)), patch.object(
+            w, "_read_gpu_stats", return_value=None
+        ):
+            s1 = w.get_health_snapshot(ttl_sec=10.0)
+            s2 = w.get_health_snapshot(ttl_sec=10.0)
+            self.assertEqual(calls["n"], 1)
+            self.assertEqual(s1["max_temp_c"], s2["max_temp_c"])
+            w.get_health_snapshot(ttl_sec=10.0, force=True)
+            self.assertEqual(calls["n"], 2)
+
+    def test_neural_cache_invalidates_on_meta_mtime_change(self) -> None:
+        from sysagent.neural import NeuralEngine
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            npz = p / "n.npz"
+            meta = p / "n.json"
+            eng1 = NeuralEngine(storage=None, npz_file=npz, meta_file=meta)
+            eng1._save()
+            # Mutate only meta_file with a newer mtime
+            eng1.meta["custom_tag"] = "fresh"
+            meta.write_text(__import__("json").dumps(eng1.meta), encoding="utf-8")
+            st = meta.stat()
+            __import__("os").utime(meta, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000))
+            eng2 = NeuralEngine(storage=None, npz_file=npz, meta_file=meta)
+            self.assertEqual(eng2.meta.get("custom_tag"), "fresh")
+
 
 if __name__ == "__main__":
     unittest.main()
