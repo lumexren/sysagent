@@ -73,8 +73,25 @@ class _LocalMindInteractions:
             self._last_user_input.pop(next(iter(self._last_user_input)), None)
         if tools:
             allowed = {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
+            low_u = user_text.lower()
+            if "switch_model" in allowed and any(
+                w in low_u for w in ("geç", "dön", "switch", "use model", "modelini kullan")
+            ):
+                for alias in ("neon", "argon", "hydrogen", "flash", "lite", "auto"):
+                    if alias in low_u:
+                        step = SimpleNamespace(
+                            type="function_call",
+                            id=f"local_call_{uuid.uuid4().hex[:6]}",
+                            name="switch_model",
+                            arguments={"model": alias},
+                        )
+                        return SimpleNamespace(id=new_id, steps=[step], output_text="")
+
+            from .local_mind import classify_task_role
+
+            min_score = 0.65 if classify_task_role(user_text) == "chat" else 0.50
             pred_tool, pred_args, score = self.mind.predict_tool(user_text, allowed_names=allowed)
-            if pred_tool and score >= 0.16:
+            if pred_tool and score >= min_score:
                 step = SimpleNamespace(
                     type="function_call",
                     id=f"local_call_{uuid.uuid4().hex[:6]}",

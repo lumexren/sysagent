@@ -153,12 +153,17 @@ def get_llama_cpp_model(gguf: Path) -> Any | None:
     if not _has_ram_for_gguf(gguf):
         return None
 
-    _LLAMA_CPP_INSTANCE = Llama(
-        model_path=model_key,
-        n_gpu_layers=-1,
-        n_ctx=2048,
-        use_mmap=True,
-        verbose=False,
-    )
+    try:
+        _LLAMA_CPP_INSTANCE = Llama(
+            model_path=model_key,
+            n_gpu_layers=-1,
+            n_ctx=2048,
+            use_mmap=True,
+            verbose=False,
+        )
+    except Exception:
+        _LLAMA_CPP_INSTANCE = None
+        _LLAMA_CPP_MODEL_PATH = None
+        return None
     _LLAMA_CPP_MODEL_PATH = model_key
     return _LLAMA_CPP_INSTANCE
