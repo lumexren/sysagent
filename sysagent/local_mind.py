@@ -256,16 +256,14 @@ def _dense_cosine(vec_a: list[float], vec_b: list[float]) -> float:
     return (dot / (na * nb)) if (na > 0.0 and nb > 0.0) else 0.0
 
 
-def unload_idle_servers(idle_sec: float = 120.0) -> bool:
-    """Terminate warm llama-server / in-process Llama if idle for > idle_sec to free RAM & GPU VRAM."""
+def _release_all_warm_models() -> bool:
+    """Immediately release any warm llama-server process and in-process Llama instance (strict single-slot RAM guard)."""
     global _LLAMA_SERVER_PROC, _LLAMA_SERVER_MODEL, _LLAMA_CPP_INSTANCE, _LLAMA_CPP_MODEL_PATH
-    if _LLAMA_SERVER_LAST_USED <= 0.0 or (time.monotonic() - _LLAMA_SERVER_LAST_USED) < idle_sec:
-        return False
     unloaded = False
     if _LLAMA_SERVER_PROC is not None and _LLAMA_SERVER_PROC.poll() is None:
         _LLAMA_SERVER_PROC.terminate()
         try:
-            _LLAMA_SERVER_PROC.wait(timeout=3)
+            _LLAMA_SERVER_PROC.wait(timeout=4)
         except Exception:
             _LLAMA_SERVER_PROC.kill()
         _LLAMA_SERVER_PROC = None
@@ -291,6 +289,27 @@ def unload_idle_servers(idle_sec: float = 120.0) -> bool:
         except Exception:
             pass
     return unloaded
+
+
+def _has_ram_for_gguf(gguf: Path, min_headroom_gb: float = 1.5) -> bool:
+    """Verify sufficient available RAM before loading a large GGUF model to avoid swap thrashing."""
+    try:
+        import psutil
+
+        avail_gb = psutil.virtual_memory().available / (1024**3)
+        file_gb = gguf.stat().st_size / (1024**3) if gguf.is_file() else 0.0
+        if file_gb <= 1.5:
+            return avail_gb >= 0.8
+        return avail_gb >= min_headroom_gb
+    except Exception:
+        return True
+
+
+def unload_idle_servers(idle_sec: float = 120.0) -> bool:
+    """Terminate warm llama-server / in-process Llama if idle for > idle_sec to free RAM & GPU VRAM."""
+    if _LLAMA_SERVER_LAST_USED <= 0.0 or (time.monotonic() - _LLAMA_SERVER_LAST_USED) < idle_sec:
+        return False
+    return _release_all_warm_models()
 
 
 def _tokenize(text: str) -> list[str]:
@@ -834,9 +853,13 @@ class LocalMind:
 
     def weakest_specialist_role(self) -> str:
         """Return the generative specialist role with the fewest training samples."""
+        return self.underrepresented_roles()[0]
+
+    def underrepresented_roles(self) -> list[str]:
+        """Return generative specialist roles sorted ascending by sample count."""
         rc = self.weights.get("role_counts") or {}
         gen_roles = ("coding", "general", "reasoning", "chat", "multimodal")
-        return min(gen_roles, key=lambda r: int(rc.get(r, 0)))
+        return sorted(gen_roles, key=lambda r: int(rc.get(r, 0)))
 
     def get_status(self) -> dict[str, Any]:
         gguf_list = find_all_gguf_models()
@@ -1041,7 +1064,16 @@ class LocalMind:
         harvested = 0
         teachers_used: list[str] = []
 
-        for teacher in TEACHER_MODELS:
+        weak_roles = self.underrepresented_roles()
+        role_guidance = {
+            "multimodal": "screenshot/image analysis, OCR, UI/visual inspection, or media file queries",
+            "reasoning": "step-by-step debugging, root-cause diagnosis, architecture trade-offs, or complex logic",
+            "coding": "Python/Bash code debugging, refactoring, git diff review, or test generation",
+            "general": "Linux system inspection, systemd services, disk/RAM/network diagnostics, or memory search",
+            "chat": "brief conversational greetings, status check-ins, or concise assistant Q&A",
+        }
+
+        for idx, teacher in enumerate(TEACHER_MODELS):
             prompt = (
                 "You are a Teacher Model generating high-quality training examples for a local Linux system assistant.\n"
                 f"Available tool names: {json.dumps(tool_names)}\n"
@@ -1053,7 +1085,7 @@ class LocalMind:
                     f"Solve these user queries and map each to the best tool + arguments and a clean plain-text reply: {json.dumps(batch_q, ensure_ascii=False)}\n"
                 )
             else:
-                focus_role = self.weakest_specialist_role()
+                focus_role = weak_roles[idx % len(weak_roles)]
                 user_examples = self.sample_user_utterances(limit=5)
                 lang_hint = (
                     f"Match the natural language(s) observed in the user's real history ({json.dumps(user_examples, ensure_ascii=False)}) as well as English"
@@ -1062,8 +1094,8 @@ class LocalMind:
                 )
                 prompt += (
                     f"Generate {count_per_teacher} diverse, realistic user commands specifically exercising the "
-                    f"'{focus_role}' specialist role ({lang_hint}) for Linux system inspection, "
-                    "file/code management, reasoning, or memory search.\n"
+                    f"'{focus_role}' specialist role ({lang_hint}), focusing on "
+                    f"{role_guidance.get(focus_role, 'Linux system assistance')}.\n"
                 )
             prompt += (
                 "Respond ONLY with a valid JSON object matching:\n"
@@ -1380,12 +1412,9 @@ class LocalMind:
         ):
             return base_url
 
-        if _LLAMA_SERVER_PROC is not None and _LLAMA_SERVER_PROC.poll() is None:
-            _LLAMA_SERVER_PROC.terminate()
-            try:
-                _LLAMA_SERVER_PROC.wait(timeout=4)
-            except Exception:
-                _LLAMA_SERVER_PROC.kill()
+        _release_all_warm_models()
+        if not _has_ram_for_gguf(gguf):
+            return None
 
         _LLAMA_SERVER_PROC = subprocess.Popen(
             [
@@ -1433,14 +1462,9 @@ class LocalMind:
         model_key = str(gguf)
         if _LLAMA_CPP_INSTANCE is not None and model_key == _LLAMA_CPP_MODEL_PATH:
             return _LLAMA_CPP_INSTANCE
-        if _LLAMA_CPP_INSTANCE is not None:
-            try:
-                if hasattr(_LLAMA_CPP_INSTANCE, "close"):
-                    _LLAMA_CPP_INSTANCE.close()
-            except Exception:
-                pass
-            _LLAMA_CPP_INSTANCE = None
-            _LLAMA_CPP_MODEL_PATH = None
+        _release_all_warm_models()
+        if not _has_ram_for_gguf(gguf):
+            return None
 
         _LLAMA_CPP_INSTANCE = Llama(
             model_path=model_key,
@@ -1604,6 +1628,7 @@ class LocalMind:
 
         role = classify_task_role(msg)
         pred_tool, _, _score = self.predict_tool(msg)
+        local_first = os.environ.get("SYSAGENT_LOCAL_FIRST", "1").strip().lower() not in {"0", "false", "no", "off"}
         neural_escalate = False
         try:
             from .neural import NeuralEngine
@@ -1612,7 +1637,13 @@ class LocalMind:
             if int(eng.meta.get("epochs_trained", 0)) > 0:
                 unc = eng.predict_with_uncertainty(msg)
                 r_probs = eng.predict_role_probs(msg)
-                if unc.get("uncertain") or (r_probs.get("coding", 0.0) + r_probs.get("reasoning", 0.0)) >= 0.45:
+                top_tool_prob = float(unc.get("tool_confidence", unc.get("confidence", 0.0)) or 0.0)
+                if top_tool_prob >= 0.55 and unc.get("tool") not in {None, "", "none"}:
+                    neural_escalate = True
+                elif not local_first and (
+                    unc.get("uncertain")
+                    or (r_probs.get("coding", 0.0) + r_probs.get("reasoning", 0.0)) >= 0.45
+                ):
                     neural_escalate = True
         except Exception:
             pass
@@ -1622,16 +1653,24 @@ class LocalMind:
             or any(v in low for v in dyn_action)
             or any(ch in msg for ch in ("/", "~", "@", "\n"))
         )
-        eligible = (
-            role == "chat"
-            and len(msg.split()) <= 8
-            and pred_tool is None
-            and not has_action
-        )
-        if not eligible:
+        word_count = len(msg.split())
+        if role == "chat":
+            specialist = find_gguf_model("chat") or models[0]
+            eligible = word_count <= 14 and pred_tool is None and not has_action
+        elif local_first and role in {"general", "coding", "reasoning"}:
+            specialist = find_gguf_model(role, strict=True)
+            eligible = (
+                specialist is not None
+                and word_count <= 24
+                and pred_tool is None
+                and not has_action
+            )
+        else:
+            specialist = None
+            eligible = False
+        if not eligible or specialist is None:
             return None
 
-        specialist = find_gguf_model("chat") or models[0]
         draft = self._run_single_gguf(specialist, msg, system_instruction)
         uncertain_markers = ("i don't know", "not sure", "cannot determine", "escalate_cloud")
         neural_uncertain = False
@@ -1649,7 +1688,7 @@ class LocalMind:
             and not any(u in draft.lower() for u in uncertain_markers)
         )
         if draft_ok:
-            return {"tier": "local:chat", "model": specialist.name, "reply": draft}
+            return {"tier": f"local:{role}", "model": specialist.name, "reply": draft}
 
         reasoner = find_gguf_model("reasoning", strict=True) or find_gguf_model("reasoning")
         if reasoner and reasoner != specialist:

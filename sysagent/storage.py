@@ -16,13 +16,27 @@ def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+_DB_LOCKS_GUARD = threading.Lock()
+_DB_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _get_db_lock(db_path: Path) -> threading.RLock:
+    key = str(db_path.resolve())
+    with _DB_LOCKS_GUARD:
+        lock = _DB_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _DB_LOCKS[key] = lock
+        return lock
+
+
 class Storage(_BrainStorageMixin):
     """Thread-safe SQLite storage for SysAgent."""
 
     def __init__(self, db_path: Path | None = None) -> None:
         self.db_path = db_path or (DATA_DIR / "sysagent.db")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = _get_db_lock(self.db_path)
         self._conn: sqlite3.Connection | None = None
         self._fts_enabled = False
         self._fts_dirty = True
@@ -30,10 +44,12 @@ class Storage(_BrainStorageMixin):
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn = sqlite3.connect(self.db_path, timeout=15.0, check_same_thread=False)
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=15000;")
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
             self._conn = conn
         return self._conn
 
@@ -992,18 +1008,22 @@ class Storage(_BrainStorageMixin):
         return 1
 
     def prune_and_checkpoint(self, stale_days: int = 30) -> int:
-        """Delete old routine ignore thoughts and truncate the SQLite WAL file."""
-        with self._lock, self._connect() as conn:
-            cur = conn.execute(
-                """
-                DELETE FROM brain_thoughts
-                WHERE decision = 'ignore'
-                  AND julianday('now', 'localtime') - julianday(created_at) >= ?
-                """,
-                (float(stale_days),),
-            )
-            deleted = cur.rowcount
-            if deleted > 0:
-                self._fts_dirty = True
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        """Delete old routine ignore thoughts and checkpoint the SQLite WAL file safely."""
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    DELETE FROM brain_thoughts
+                    WHERE decision = 'ignore'
+                      AND julianday('now', 'localtime') - julianday(created_at) >= ?
+                    """,
+                    (float(stale_days),),
+                )
+                deleted = cur.rowcount
+                if deleted > 0:
+                    self._fts_dirty = True
+            try:
+                self._connect().execute("PRAGMA wal_checkpoint(PASSIVE);")
+            except sqlite3.OperationalError:
+                pass
             return deleted
