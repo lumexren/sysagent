@@ -1532,6 +1532,100 @@ def _cmd_search(base_url: str, query: str, limit: int = 12, locale: str | None =
         sys.exit(1)
 
 
+def _cmd_rollback(
+    base_url: str,
+    target: str,
+    target_id: str | None,
+    list_only: bool,
+    locale_override: str | None = None,
+) -> None:
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+
+    loc = locale_override or get_settings().locale
+    hdrs = _auth_headers()
+    action = "list" if list_only else (target or "auto")
+    try:
+        if action == "list":
+            try:
+                resp = httpx.get(f"{base_url}/api/snapshots", headers=hdrs, timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                from .snapshots import unified_snapshots
+
+                data = unified_snapshots(Storage())
+
+            console = Console()
+            tbl = Table(title="Recent File / Audit Snapshots", box=box.ROUNDED, border_style="magenta")
+            tbl.add_column("ID", style="dim")
+            tbl.add_column("Action", style="cyan")
+            tbl.add_column("Target")
+            tbl.add_column("Batch")
+            tbl.add_column("State")
+            for row in (data.get("audit_log") or [])[:12]:
+                state = "undone" if row.get("undone") else "active"
+                tbl.add_row(
+                    str(row.get("id", "")),
+                    str(row.get("action", "")),
+                    str(row.get("target_path", ""))[:55],
+                    str(row.get("batch_id") or "-"),
+                    state,
+                )
+            console.print(tbl)
+
+            cfgs = data.get("config_snapshots") or []
+            if cfgs:
+                ctbl = Table(title="Config Snapshots", box=box.ROUNDED, border_style="cyan")
+                ctbl.add_column("Snapshot ID")
+                ctbl.add_column("Path")
+                ctbl.add_column("Created")
+                for c in cfgs[:8]:
+                    ctbl.add_row(str(c.get("id", "")), str(c.get("path", "")), str(c.get("created_at", "")))
+                console.print(ctbl)
+
+            props = data.get("evolve_proposals") or []
+            if props:
+                etbl = Table(title="Evolve Proposals", box=box.ROUNDED, border_style="green")
+                etbl.add_column("ID", style="dim")
+                etbl.add_column("Status", style="cyan")
+                etbl.add_column("Target")
+                etbl.add_column("Summary")
+                for p in props[:8]:
+                    etbl.add_row(
+                        str(p.get("id", "")),
+                        str(p.get("status", "")),
+                        str(p.get("target_file", "")),
+                        str(p.get("summary", p.get("title", "")))[:60],
+                    )
+                console.print(etbl)
+            return
+
+        try:
+            resp = httpx.post(
+                f"{base_url}/api/rollback",
+                json={"target": action, "id": target_id},
+                headers=hdrs,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            res = resp.json()
+        except Exception:
+            from .snapshots import perform_rollback
+
+            res = perform_rollback(action, target_id, Storage())
+
+        if res.get("ok"):
+            Console().print(f"[bold green]Rollback succeeded:[/] {json.dumps(res, ensure_ascii=False)}")
+        else:
+            print(f"{t('error_prefix', loc)}: {res.get('error', res)}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as exc:
+        print(f"{t('error_prefix', loc)}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     settings = get_settings()
     parser = argparse.ArgumentParser(
@@ -1578,6 +1672,13 @@ def main() -> None:
     exp_parser.add_argument("file", help="Target JSON file path")
     imp_parser = sub.add_parser("import", help="Import a backed-up brain JSON bundle")
     imp_parser.add_argument("file", help="Source JSON file path")
+    top_parser = sub.add_parser("top", help="Live terminal dashboard showing system & agent telemetry")
+    top_parser.add_argument("-n", "--interval", type=float, default=1.5, help="Refresh interval in seconds")
+    top_parser.add_argument("--once", action="store_true", help="Render one frame and exit")
+    rb_parser = sub.add_parser("rollback", help="List or restore file, config, or evolve snapshots")
+    rb_parser.add_argument("rollback_target", nargs="?", default="auto", choices=["auto", "list", "file", "evolve", "config"])
+    rb_parser.add_argument("rollback_id", nargs="?", default=None, help="Optional snapshot, batch, or evolve proposal ID")
+    rb_parser.add_argument("--list", action="store_true", dest="rollback_list", help="List available snapshots")
 
     locale_override: str | None = None
     raw_argv = sys.argv[1:]
@@ -1594,7 +1695,7 @@ def main() -> None:
             filtered_argv.append(raw_argv[i])
             i += 1
 
-    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "-h", "--help"}:
+    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "-h", "--help"}:
         args = parser.parse_args(filtered_argv)
         if args.subcommand == "serve":
             uvicorn.run(
@@ -1661,6 +1762,18 @@ def main() -> None:
             bundle = json.loads(Path(args.file).read_text(encoding="utf-8"))
             counts = import_brain_bundle(bundle, Storage())
             print(f"Imported brain bundle: {counts}")
+        elif args.subcommand == "top":
+            from .top import run_top
+
+            run_top(settings.base_url, _auth_headers(), interval=args.interval, once=args.once)
+        elif args.subcommand == "rollback":
+            _cmd_rollback(
+                settings.base_url,
+                args.rollback_target,
+                args.rollback_id,
+                args.rollback_list,
+                locale_override,
+            )
         return
 
     piped_text = ""

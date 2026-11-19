@@ -36,19 +36,9 @@ def _backup_critical_config(path: Path, old_content: str) -> None:
     )
     if not is_cfg:
         return
-    try:
-        from .config import DATA_DIR
+    from .snapshots import save_config_snapshot
 
-        bdir = DATA_DIR / "config_backups"
-        bdir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = path.name.replace("/", "_")
-        (bdir / f"{stamp}_{safe_name}.bak").write_text(old_content, encoding="utf-8")
-        old_baks = sorted(bdir.glob("*.bak"))
-        for stale in old_baks[:-30]:
-            stale.unlink(missing_ok=True)
-    except Exception:
-        pass
+    save_config_snapshot(path, old_content)
 
 
 def _resolve(path_str: str) -> Path:

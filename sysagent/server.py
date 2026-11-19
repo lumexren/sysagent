@@ -570,6 +570,30 @@ async def api_undo_batch(batch_id: str | None = None) -> dict[str, Any]:
     return json.loads(raw) if isinstance(raw, str) else {"result": raw}
 
 
+@app.get("/api/snapshots")
+async def api_snapshots(limit: int = 15) -> dict[str, Any]:
+    from .snapshots import unified_snapshots
+
+    return unified_snapshots(storage, limit=limit)
+
+
+@app.post("/api/rollback")
+async def api_rollback(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    from .snapshots import perform_rollback
+
+    payload = body or {}
+    target = str(payload.get("target", "auto"))
+    target_id = payload.get("id")
+    return perform_rollback(
+        target,
+        str(target_id) if target_id is not None else None,
+        storage,
+        watcher=watcher,
+        plugins=plugins,
+        evolver=evolver,
+    )
+
+
 @app.get("/api/search")
 async def api_search(q: str = "") -> dict[str, Any]:
     term = q.strip()
