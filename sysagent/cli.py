@@ -15,13 +15,13 @@ import sys
 import uuid
 from pathlib import Path
 
-import httpx
 import uvicorn
 import websockets
 
 from .auth import logout_oauth, run_oauth_login
 from .config import DATA_DIR, get_settings, persist_env_var
 from .i18n import t
+from .ipc import ipc_delete, ipc_get, ipc_post, ipc_ws_connect
 from .self_ops import export_brain_bundle, import_brain_bundle
 from .storage import Storage
 
@@ -209,7 +209,7 @@ async def _send_and_stream(
         pass
 
     try:
-        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=120, close_timeout=10) as ws:
+        async with ipc_ws_connect(ws_url, ping_interval=30, ping_timeout=120, close_timeout=10) as ws:
             if model_override:
                 await ws.send(json.dumps({"type": "set_model", "model": model_override}))
                 try:
@@ -653,7 +653,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                     if len(parts) < 2:
                         try:
                             resp_st = await asyncio.to_thread(
-                                httpx.get, f"{base_url}/api/status", headers=_auth_headers(), timeout=5
+                                ipc_get, f"{base_url}/api/status", headers=_auth_headers(), timeout=5
                             )
                             st = resp_st.json()
                             m_info = st.get("models") or {}
@@ -671,7 +671,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                         chosen = _MODEL_ALIASES.get(parts[1].lower(), parts[1].strip())
                         pinned_model = chosen
                         try:
-                            async with websockets.connect(_ws_url(base_url, session_id), open_timeout=5) as ws:
+                            async with ipc_ws_connect(_ws_url(base_url, session_id), open_timeout=5) as ws:
                                 await ws.send(json.dumps({"type": "set_model", "model": chosen}))
                                 reply_ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
                                 print(f"\033[90m{reply_ev.get('message', f'Model set to {chosen}')}\033[0m")
@@ -680,7 +680,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                 elif cmd == "/sessions":
                     try:
                         resp_s = await asyncio.to_thread(
-                            httpx.get, f"{base_url}/api/sessions", headers=_auth_headers(), timeout=5
+                            ipc_get, f"{base_url}/api/sessions", headers=_auth_headers(), timeout=5
                         )
                         data = resp_s.json()
                         for s in (data.get("sessions") or [])[:15]:
@@ -698,7 +698,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                     prefix = parts[1].strip()
                     try:
                         resp_sl = await asyncio.to_thread(
-                            httpx.get, f"{base_url}/api/sessions", headers=_auth_headers(), timeout=5
+                            ipc_get, f"{base_url}/api/sessions", headers=_auth_headers(), timeout=5
                         )
                         sessions = resp_sl.json().get("sessions") or []
                         match = next(
@@ -711,7 +711,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                         session_id = match
                         _save_last_session_id(session_id)
                         resp_m = await asyncio.to_thread(
-                            httpx.get, f"{base_url}/api/sessions/{session_id}/messages", headers=_auth_headers(), timeout=5
+                            ipc_get, f"{base_url}/api/sessions/{session_id}/messages", headers=_auth_headers(), timeout=5
                         )
                         msgs = resp_m.json().get("messages") or []
                         print(f"\033[1;36mResumed {session_id}\033[0m ({len(msgs)} messages):")
@@ -728,9 +728,9 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                     try:
                         hdrs = _auth_headers()
                         r_st, r_br, r_ev = await asyncio.gather(
-                            asyncio.to_thread(httpx.get, f"{base_url}/api/status", headers=hdrs, timeout=5),
-                            asyncio.to_thread(httpx.get, f"{base_url}/api/brain", headers=hdrs, timeout=5),
-                            asyncio.to_thread(httpx.get, f"{base_url}/api/evolve", headers=hdrs, timeout=5),
+                            asyncio.to_thread(ipc_get, f"{base_url}/api/status", headers=hdrs, timeout=5),
+                            asyncio.to_thread(ipc_get, f"{base_url}/api/brain", headers=hdrs, timeout=5),
+                            asyncio.to_thread(ipc_get, f"{base_url}/api/evolve", headers=hdrs, timeout=5),
                         )
                         st, br, ev = r_st.json(), r_br.json(), r_ev.json()
                         print(f"\033[1;36mDaemon:\033[0m {st.get('status')} | model={st.get('model')} | auth={st.get('auth_mode') or 'none'}")
@@ -773,7 +773,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                 elif cmd == "/undo":
                     try:
                         r = await asyncio.to_thread(
-                            httpx.post, f"{base_url}/api/undo-batch", headers=_auth_headers(), timeout=10
+                            ipc_post, f"{base_url}/api/undo-batch", headers=_auth_headers(), timeout=10
                         )
                         print(json.dumps(r.json(), indent=2, ensure_ascii=False))
                     except Exception as exc:
@@ -781,7 +781,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                 elif cmd == "/reset":
                     try:
                         await asyncio.to_thread(
-                            httpx.post, f"{base_url}/api/reset/{session_id}", headers=_auth_headers(), timeout=5
+                            ipc_post, f"{base_url}/api/reset/{session_id}", headers=_auth_headers(), timeout=5
                         )
                     except Exception:
                         pass
@@ -833,7 +833,7 @@ def _cmd_status(base_url: str, locale: str | None = None) -> None:
         from rich.table import Table
         from rich.text import Text
 
-        resp = httpx.get(f"{base_url}/api/status", headers=_auth_headers(), timeout=5)
+        resp = ipc_get(f"{base_url}/api/status", headers=_auth_headers(), timeout=5)
         resp.raise_for_status()
         data = resp.json()
         h = data["health"]
@@ -969,7 +969,7 @@ def _cmd_status(base_url: str, locale: str | None = None) -> None:
 def _cmd_events(base_url: str, limit: int, locale: str | None = None) -> None:
     loc = locale or get_settings().locale
     try:
-        resp = httpx.get(f"{base_url}/api/events", params={"limit": limit}, headers=_auth_headers(), timeout=5)
+        resp = ipc_get(f"{base_url}/api/events", params={"limit": limit}, headers=_auth_headers(), timeout=5)
         resp.raise_for_status()
         events = resp.json().get("events", [])
         if not events:
@@ -989,7 +989,7 @@ def _cmd_name(base_url: str, new_name: str, locale: str | None = None) -> None:
         print(t("cli_name_empty", loc), file=sys.stderr)
         sys.exit(1)
     try:
-        resp = httpx.post(f"{base_url}/api/name", json={"name": clean}, headers=_auth_headers(), timeout=5)
+        resp = ipc_post(f"{base_url}/api/name", json={"name": clean}, headers=_auth_headers(), timeout=5)
         resp.raise_for_status()
         print(t("cli_name_updated", loc, name=resp.json()["agent_name"]))
     except Exception:
@@ -1043,7 +1043,7 @@ async def _quick_launcher(base_url: str, locale: str | None = None) -> None:
     ws_url = _ws_url(base_url, f"quick-{uuid.uuid4().hex[:6]}")
     reply_text = ""
     try:
-        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=120, close_timeout=10) as ws:
+        async with ipc_ws_connect(ws_url, ping_interval=30, ping_timeout=120, close_timeout=10) as ws:
             payload: dict[str, object] = {"type": "message", "text": prompt}
             if locale:
                 payload["locale"] = locale
@@ -1134,16 +1134,16 @@ def _cmd_brain(base_url: str, action: str, locale: str | None = None) -> None:
     hdrs = _auth_headers()
     try:
         if action == "think":
-            resp = httpx.post(f"{base_url}/api/brain/think", headers=hdrs, timeout=30)
+            resp = ipc_post(f"{base_url}/api/brain/think", headers=hdrs, timeout=30)
             resp.raise_for_status()
             print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
             return
         if action == "digest":
-            resp = httpx.get(f"{base_url}/api/brain/digest", headers=hdrs, timeout=30)
+            resp = ipc_get(f"{base_url}/api/brain/digest", headers=hdrs, timeout=30)
             resp.raise_for_status()
             print(resp.json().get("digest", ""))
             return
-        resp = httpx.get(f"{base_url}/api/brain", headers=hdrs, timeout=5)
+        resp = ipc_get(f"{base_url}/api/brain", headers=hdrs, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         if action == "rules":
@@ -1177,7 +1177,7 @@ async def _stream_evolve(base_url: str) -> None:
     ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
     tok = get_settings().auth_token
     ws_url = f"{ws_url}/ws/evolve" + (f"?token={tok}" if tok else "")
-    async with websockets.connect(ws_url, open_timeout=10, close_timeout=10) as ws:
+    async with ipc_ws_connect(ws_url, open_timeout=10, close_timeout=10) as ws:
         in_thought = False
         while True:
             try:
@@ -1226,7 +1226,7 @@ def _cmd_evolve(base_url: str, action: str, locale: str | None = None) -> None:
         if action == "run":
             asyncio.run(_stream_evolve(base_url))
             return
-        resp = httpx.get(f"{base_url}/api/evolve", headers=hdrs, timeout=5)
+        resp = ipc_get(f"{base_url}/api/evolve", headers=hdrs, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         if action == "log":
@@ -1259,7 +1259,7 @@ def _cmd_prompts(base_url: str, action: str, key: str | None = None, locale: str
     hdrs = _auth_headers()
     try:
         if action == "evolve":
-            resp = httpx.post(f"{base_url}/api/prompts/evolve", headers=hdrs, timeout=120)
+            resp = ipc_post(f"{base_url}/api/prompts/evolve", headers=hdrs, timeout=120)
             resp.raise_for_status()
             print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
             return
@@ -1267,11 +1267,11 @@ def _cmd_prompts(base_url: str, action: str, key: str | None = None, locale: str
             if not key:
                 print(f"{t('error_prefix', loc)}: prompt key is required for rollback (e.g. agent_main)", file=sys.stderr)
                 sys.exit(1)
-            resp = httpx.post(f"{base_url}/api/prompts/{key}/rollback", headers=hdrs, timeout=10)
+            resp = ipc_post(f"{base_url}/api/prompts/{key}/rollback", headers=hdrs, timeout=10)
             resp.raise_for_status()
             print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
             return
-        resp = httpx.get(f"{base_url}/api/prompts", headers=hdrs, timeout=5)
+        resp = ipc_get(f"{base_url}/api/prompts", headers=hdrs, timeout=5)
         resp.raise_for_status()
         prompts = resp.json().get("prompts", [])
         for p in prompts:
@@ -1408,7 +1408,7 @@ def _cmd_local(base_url: str, action: str, query: str | None = None, locale: str
                 )
             return
         try:
-            resp = httpx.get(f"{base_url}/api/local", headers=hdrs, timeout=5)
+            resp = ipc_get(f"{base_url}/api/local", headers=hdrs, timeout=5)
             resp.raise_for_status()
             st = resp.json()
         except Exception:
@@ -1427,7 +1427,7 @@ def _cmd_neural(base_url: str, action: str, query: str | None = None, locale: st
     try:
         if action == "train":
             try:
-                resp = httpx.post(f"{base_url}/api/neural/train", headers=hdrs, timeout=30)
+                resp = ipc_post(f"{base_url}/api/neural/train", headers=hdrs, timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception:
@@ -1437,7 +1437,7 @@ def _cmd_neural(base_url: str, action: str, query: str | None = None, locale: st
         if action in {"pulse", "activate"}:
             q = (query or "check system status and ram usage").strip()
             try:
-                resp = httpx.post(f"{base_url}/api/neural/pulse", json={"query": q}, headers=hdrs, timeout=15)
+                resp = ipc_post(f"{base_url}/api/neural/pulse", json={"query": q}, headers=hdrs, timeout=15)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception:
@@ -1445,7 +1445,7 @@ def _cmd_neural(base_url: str, action: str, query: str | None = None, locale: st
             print(json.dumps(data, indent=2, ensure_ascii=False))
             return
         try:
-            resp = httpx.get(f"{base_url}/api/neural", headers=hdrs, timeout=5)
+            resp = ipc_get(f"{base_url}/api/neural", headers=hdrs, timeout=5)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
@@ -1464,7 +1464,7 @@ def _cmd_digest(base_url: str, locale: str | None = None) -> None:
         from rich.markdown import Markdown
         from rich.panel import Panel
 
-        resp = httpx.get(f"{base_url}/api/brain/digest", headers=_auth_headers(), timeout=30)
+        resp = ipc_get(f"{base_url}/api/brain/digest", headers=_auth_headers(), timeout=30)
         resp.raise_for_status()
         digest_txt = str(resp.json().get("digest") or "").strip() or "(no digest)"
         Console().print(
@@ -1489,7 +1489,7 @@ def _cmd_doctor(base_url: str) -> None:
 
     checks: list[tuple[str, str, str]] = []
     try:
-        r = httpx.get(f"{base_url}/api/status", headers=_auth_headers(), timeout=4)
+        r = ipc_get(f"{base_url}/api/status", headers=_auth_headers(), timeout=4)
         r.raise_for_status()
         st = r.json()
         checks.append(("Daemon API", "OK", f"running ({st.get('agent_name')}) | auth={st.get('auth_mode')}"))
@@ -1594,7 +1594,7 @@ def _cmd_search(base_url: str, query: str, limit: int = 12, locale: str | None =
         from rich.console import Console
         from rich.table import Table
 
-        resp = httpx.get(
+        resp = ipc_get(
             f"{base_url}/api/search",
             params={"q": query, "limit": limit},
             headers=_auth_headers(),
@@ -1633,7 +1633,7 @@ def _cmd_rollback(
     try:
         if action == "list":
             try:
-                resp = httpx.get(f"{base_url}/api/snapshots", headers=hdrs, timeout=5)
+                resp = ipc_get(f"{base_url}/api/snapshots", headers=hdrs, timeout=5)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception:
@@ -1687,7 +1687,7 @@ def _cmd_rollback(
             return
 
         try:
-            resp = httpx.post(
+            resp = ipc_post(
                 f"{base_url}/api/rollback",
                 json={"target": action, "id": target_id},
                 headers=hdrs,
@@ -1762,7 +1762,7 @@ def _cmd_schedule(
     try:
         if action == "list":
             try:
-                resp = httpx.get(f"{base_url}/api/automations", headers=hdrs, timeout=5)
+                resp = ipc_get(f"{base_url}/api/automations", headers=hdrs, timeout=5)
                 resp.raise_for_status()
                 items = resp.json().get("automations") or []
             except Exception:
@@ -1801,7 +1801,7 @@ def _cmd_schedule(
             prompt = " ".join(rest[2:]).strip()
             ttype, tval = _parse_schedule_spec(spec)
             try:
-                resp = httpx.post(
+                resp = ipc_post(
                     f"{base_url}/api/automations",
                     json={"name": name, "trigger_type": ttype, "trigger_value": tval, "prompt": prompt},
                     headers=hdrs,
@@ -1825,7 +1825,7 @@ def _cmd_schedule(
             aid = int(rest[0])
             if action == "delete":
                 try:
-                    resp = httpx.delete(f"{base_url}/api/automations/{aid}", headers=hdrs, timeout=5)
+                    resp = ipc_delete(f"{base_url}/api/automations/{aid}", headers=hdrs, timeout=5)
                     resp.raise_for_status()
                     ok = bool(resp.json().get("deleted"))
                 except Exception:
@@ -1834,7 +1834,7 @@ def _cmd_schedule(
                 print(f"Deleted automation #{aid}." if ok else f"Automation #{aid} not found.")
             else:
                 try:
-                    resp = httpx.post(f"{base_url}/api/automations/{aid}/toggle", headers=hdrs, timeout=5)
+                    resp = ipc_post(f"{base_url}/api/automations/{aid}/toggle", headers=hdrs, timeout=5)
                     resp.raise_for_status()
                     enabled = resp.json().get("enabled")
                 except Exception:
@@ -1879,7 +1879,7 @@ def _cmd_notifications(
             print(f"Sent test notification ({h.notif_id})." if h else "notify-send unavailable.")
             return
 
-        resp = httpx.get(
+        resp = ipc_get(
             f"{base_url}/api/notifications",
             params={"limit": limit},
             headers=hdrs,
@@ -1921,7 +1921,7 @@ def _cmd_cortex(
     try:
         if action == "dream":
             try:
-                resp = httpx.post(f"{base_url}/api/cortex/dream", headers=hdrs, timeout=30)
+                resp = ipc_post(f"{base_url}/api/cortex/dream", headers=hdrs, timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception:
@@ -1933,7 +1933,7 @@ def _cmd_cortex(
             return
         if action == "heal":
             try:
-                resp = httpx.post(f"{base_url}/api/cortex/heal", headers=hdrs, timeout=15)
+                resp = ipc_post(f"{base_url}/api/cortex/heal", headers=hdrs, timeout=15)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception:
@@ -1948,7 +1948,7 @@ def _cmd_cortex(
         if action == "flow" and arg is not None:
             mode = None if arg.strip().lower() in {"auto", "clear", "reset"} else arg.strip().lower()
             try:
-                resp = httpx.post(
+                resp = ipc_post(
                     f"{base_url}/api/cortex/flow", json={"mode": mode}, headers=hdrs, timeout=5
                 )
                 resp.raise_for_status()
@@ -1962,7 +1962,7 @@ def _cmd_cortex(
             return
 
         try:
-            resp = httpx.get(f"{base_url}/api/cortex", headers=hdrs, timeout=5)
+            resp = ipc_get(f"{base_url}/api/cortex", headers=hdrs, timeout=5)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
@@ -2064,10 +2064,12 @@ def main() -> None:
     if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "notifications", "cortex", "-h", "--help"}:
         args = parser.parse_args(filtered_argv)
         if args.subcommand == "serve":
+            sock = Path(settings.socket_path)
+            sock.parent.mkdir(parents=True, exist_ok=True)
+            sock.unlink(missing_ok=True)
             uvicorn.run(
                 "sysagent.server:app",
-                host=settings.host,
-                port=settings.port,
+                uds=str(sock),
                 log_level="info",
             )
         elif args.subcommand == "chat":
@@ -2107,7 +2109,7 @@ def main() -> None:
             try:
                 tok_path = run_oauth_login(settings, args.client_secret, args.project)
                 try:
-                    httpx.post(f"{settings.base_url}/api/auth/reload", headers=_auth_headers(), timeout=3)
+                    ipc_post(f"{settings.base_url}/api/auth/reload", headers=_auth_headers(), timeout=3)
                 except Exception:
                     pass
                 st = get_settings()

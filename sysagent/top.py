@@ -6,7 +6,6 @@ import time
 from datetime import datetime
 from typing import Any
 
-import httpx
 import psutil
 from rich.console import Console
 from rich.layout import Layout
@@ -33,16 +32,19 @@ def _fmt_uptime(sec: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+from .ipc import make_http_client
+
+
 def collect_top_state(base_url: str, headers: dict[str, str]) -> dict[str, Any]:
     """Fetch live daemon telemetry, falling back to local psutil/storage if offline."""
     try:
-        with httpx.Client(headers=headers, timeout=2.0) as client:
-            st = client.get(f"{base_url}/api/status")
+        with make_http_client(base_url, headers=headers, timeout=2.0) as client:
+            st = client.get("/api/status")
             st.raise_for_status()
             status_data = st.json()
-            ev = client.get(f"{base_url}/api/events", params={"limit": 6})
+            ev = client.get("/api/events", params={"limit": 6})
             events = ev.json().get("events", []) if ev.is_success else []
-            sn = client.get(f"{base_url}/api/snapshots", params={"limit": 5})
+            sn = client.get("/api/snapshots", params={"limit": 5})
             snapshots = sn.json() if sn.is_success else {}
             return {
                 "online": True,

@@ -64,11 +64,14 @@ class Settings:
     model: str = field(
         default_factory=lambda: os.environ.get("SYSAGENT_MODEL", "gemini-4-argon")
     )
-    host: str = field(
-        default_factory=lambda: os.environ.get("SYSAGENT_HOST", "127.0.0.1")
-    )
-    port: int = field(
-        default_factory=lambda: int(os.environ.get("SYSAGENT_PORT", "8765"))
+    socket_path: str = field(
+        default_factory=lambda: os.environ.get(
+            "SYSAGENT_SOCKET",
+            str(
+                Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/sysagent-{os.getuid()}")
+                / "sysagent.sock"
+            ),
+        )
     )
     approval_mode: str = field(
         default_factory=lambda: os.environ.get("SYSAGENT_APPROVAL_MODE", "smart")
@@ -142,7 +145,7 @@ class Settings:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return "http://sysagent.local"
 
 
 def get_settings() -> Settings:

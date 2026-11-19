@@ -76,6 +76,12 @@ async def lifespan(_app: FastAPI):
     brain.start()
     evolver.start()
     self_monitor.start()
+    sock = Path(settings.socket_path)
+    if sock.exists():
+        try:
+            sock.chmod(0o600)
+        except OSError:
+            pass
     try:
         yield
     finally:
