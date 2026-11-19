@@ -527,4 +527,27 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "name": "switch_model",
+        "description": (
+            "Switch the active AI model for the current chat session (and optionally persist as default). "
+            "Supported aliases: 'local' / 'local-mind' (local GGUF specialist ensemble), 'neon' (gemini-4-neon), "
+            "'argon' (gemini-4-argon), 'hydrogen' (gemini-4-hydrogen), 'flash' (gemini-3.8-flash), 'lite' (gemini-3.5-flash-lite), or 'auto'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "model": {
+                    "type": "string",
+                    "description": "Target model alias or ID (e.g. 'local', 'neon', 'argon', 'hydrogen', 'flash', 'auto').",
+                },
+                "persist": {
+                    "type": "boolean",
+                    "description": "If true, also save as the default model in ~/.config/sysagent/.env.",
+                },
+            },
+            "required": ["model"],
+        },
+    },
 ]

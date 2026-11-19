@@ -38,6 +38,7 @@ SAFE_TOOLS = frozenset(
         "kg_add_relation",
         "kg_query",
         "run_parallel_workers",
+        "switch_model",
         "record_lesson",
         "create_goal_plan",
         "update_goal_step",

@@ -141,6 +141,8 @@ def select_relevant_tools(
     if len(low.split()) > 28:
         return all_tools
     selected = set(CORE_TOOLS)
+    if any(k in low for k in ("model", "local", "neon", "argon", "hydrogen", "flash", "lite", "switch", "geç")):
+        selected.add("switch_model")
     if storage is not None:
         try:
             from .neural import NeuralEngine

@@ -32,6 +32,8 @@ _PASTE_START = "\x1b[200~"
 _PASTE_END = "\x1b[201~"
 
 _MODEL_ALIASES: dict[str, str] = {
+    "local": "local-mind",
+    "neon": "gemini-4-neon",
     "hydrogen": "gemini-4-hydrogen",
     "argon": "gemini-4-argon",
     "flash": "gemini-3.8-flash",
@@ -172,10 +174,11 @@ async def _send_and_stream(
     base_url: str,
     locale: str | None = None,
     model_override: str | None = None,
-) -> None:
+) -> str | None:
     ws_url = _ws_url(base_url, session_id)
     loc = locale or get_settings().locale
     spin_label = ["thinking..."]
+    changed_model: str | None = None
 
     async def _spinner(stop_ev: asyncio.Event) -> None:
         frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -227,7 +230,7 @@ async def _send_and_stream(
             spin_task = asyncio.create_task(_spinner(stop_spin))
 
             async def _pump_events() -> None:
-                nonlocal stop_spin, spin_task, handled_final
+                nonlocal stop_spin, spin_task, handled_final, changed_model
                 import select
                 import threading
                 from collections import deque
@@ -317,6 +320,9 @@ async def _send_and_stream(
                         spin_task = asyncio.create_task(_spinner(stop_spin))
                     elif etype == "approval_resolved":
                         pass
+                    elif etype == "model_changed":
+                        changed_model = str(event.get("model") or "") or None
+                        print(f"\033[36m  -> Active model switched to: {changed_model}\033[0m")
                     elif etype == "tool_result":
                         status_lbl = t("cli_ok", loc) if event.get("approved") else t("cli_denied", loc)
                         summary = _format_tool_preview(event.get("result_preview"))
@@ -374,6 +380,7 @@ async def _send_and_stream(
                 loop.remove_signal_handler(signal.SIGINT)
             except Exception:
                 pass
+    return changed_model
 
 
 def _load_last_session_id() -> str:
@@ -796,7 +803,11 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
             if attached:
                 print(f"\033[90m  [attached: {', '.join(attached)}]\033[0m")
             final_prompt = expanded_prompt if cwd == Path.home() else f"[cwd: {cwd}] {expanded_prompt}"
-            await _send_and_stream(final_prompt, session_id, base_url, locale, model_override=pinned_model)
+            new_m = await _send_and_stream(
+                final_prompt, session_id, base_url, locale, model_override=pinned_model
+            )
+            if new_m is not None:
+                pinned_model = None if new_m == "auto" else new_m
     finally:
         if sys.stdin.isatty():
             try:

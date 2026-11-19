@@ -26,6 +26,7 @@ AGY_MODEL_MAP: dict[str, str] = {
     "gemini-3.8-flash": "gemini-3.8-flash-low",
     "gemini-4-argon": "gemini-4-argon-low",
     "gemini-4-hydrogen": "gemini-4-hydrogen-low",
+    "gemini-4-neon": "gemini-4-neon-low",
 }
 
 

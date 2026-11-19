@@ -350,6 +350,12 @@ class AgentManager:
         """Call Gemini Interactions API with key rotation, light_model fallback, and offline LocalMind fallback."""
         client = self._get_client()
         model = str(kwargs["model"])
+        if model in {"local", "local-mind", "local_mind"}:
+            from .local_mind import LocalMindClient
+
+            local_client = LocalMindClient(self.storage)
+            self.storage.record_model_request("local-mind")
+            return await asyncio.to_thread(local_client.interactions.create, **kwargs)
         try:
             self.storage.record_model_request(model)
             return await self._create_safe(client, kwargs)
@@ -687,7 +693,47 @@ class AgentManager:
                                 }
                             )
 
-                if approved:
+                if approved and call.name == "switch_model":
+                    raw_m = str(args.get("model") or "").strip()
+                    alias_map = {
+                        "local": "local-mind",
+                        "local-mind": "local-mind",
+                        "local_mind": "local-mind",
+                        "localmind": "local-mind",
+                        "offline": "local-mind",
+                        "gguf": "local-mind",
+                        "neon": "gemini-4-neon",
+                        "argon": "gemini-4-argon",
+                        "hydrogen": "gemini-4-hydrogen",
+                        "flash": "gemini-3.8-flash",
+                        "lite": "gemini-3.5-flash-lite",
+                        "auto": "auto",
+                    }
+                    resolved = alias_map.get(raw_m.lower(), raw_m)
+                    if not resolved:
+                        result_payload = json.dumps({"error": "model name is required"})
+                    else:
+                        if resolved == "auto":
+                            self._pinned_models.pop(session_id, None)
+                            self._session_models.pop(session_id, None)
+                        else:
+                            self._pinned_models[session_id] = resolved
+                            self._session_models[session_id] = resolved
+                        self.sessions.pop(session_id, None)
+                        self.storage.upsert_session(session_id, None)
+                        persisted = False
+                        if args.get("persist") and resolved != "auto":
+                            from .config import persist_env_var
+
+                            self.settings.model = resolved
+                            persist_env_var("SYSAGENT_MODEL", resolved)
+                            persisted = True
+                        await _emit({"type": "model_changed", "model": resolved})
+                        result_payload = json.dumps(
+                            {"status": "ok", "model": resolved, "persisted": persisted},
+                            ensure_ascii=False,
+                        )
+                elif approved:
                     cached = self._tool_cache.get(call.name, args)
                     if cached is not None:
                         result_payload = cached
