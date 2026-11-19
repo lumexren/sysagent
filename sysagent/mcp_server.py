@@ -60,6 +60,11 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "description": "List scheduled SysAgent automations.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "sysagent_cortex_status",
+        "description": "Get live NeuralBrainCortex status (Flow Guardian mode, predictive health, dream cycle, habit suggestions).",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
 ]
 
 
@@ -97,6 +102,11 @@ def _execute_mcp_tool(name: str, args: dict[str, Any], storage: Storage) -> dict
         return perform_rollback(target, tid, storage)
     if name == "sysagent_schedule_list":
         return {"automations": storage.list_automations()}
+    if name == "sysagent_cortex_status":
+        from .config import get_settings
+        from .cortex import NeuralBrainCortex
+
+        return NeuralBrainCortex(get_settings(), storage).get_status()
     raise ValueError(f"Unknown MCP tool: {name}")
 
 

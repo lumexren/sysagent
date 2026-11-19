@@ -58,6 +58,8 @@ class CognitiveBrain:
         from .cortex import NeuralBrainCortex
 
         self.cortex = NeuralBrainCortex(settings, storage, watcher=watcher, brain=self)
+        if getattr(watcher, "notifier", None) is not None:
+            watcher.notifier.flow_provider = lambda: self.cortex.last_flow
 
     def start(self) -> None:
         if self._running or not self.settings.brain_enabled:

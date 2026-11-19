@@ -393,6 +393,11 @@ class SelfEvolver:
         """Inspect the codebase and propose/apply an optimization, bugfix, or feature."""
         if self._evolve_lock.locked():
             return {"status": "skipped", "reason": "evolve_already_running"}
+        cortex = getattr(self, "cortex", None)
+        if not force and cortex is not None:
+            flow = getattr(cortex, "last_flow", None) or {}
+            if flow.get("suppress_low_priority"):
+                return {"status": "deferred", "reason": f"cortex_flow:{flow.get('mode', 'focus')}"}
         async with self._evolve_lock:
             prev_hash = self._last_codebase_hash
             try:
@@ -1063,6 +1068,11 @@ class SelfEvolver:
         """Inspect user style memories, lessons, and thoughts to refine a registered prompt."""
         if self._evolve_lock.locked():
             return {"status": "skipped", "reason": "evolve_already_running"}
+        cortex = getattr(self, "cortex", None)
+        if not force and cortex is not None:
+            flow = getattr(cortex, "last_flow", None) or {}
+            if flow.get("suppress_low_priority"):
+                return {"status": "deferred", "reason": f"cortex_flow:{flow.get('mode', 'focus')}"}
         if time.monotonic() < self._cooldown_until:
             return {"status": "skipped", "reason": "quota_cooldown"}
         if not self.agent.auth.is_configured:

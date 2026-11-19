@@ -476,6 +476,14 @@ class AgentManager:
             workflows=workflows,
             recent_history=recent_history,
         )
+        cortex = getattr(self, "cortex", None)
+        if cortex is not None:
+            flow = getattr(cortex, "last_flow", None) or {}
+            heal = getattr(cortex, "last_heal", None)
+            cortex_line = f"\nLive Cortex state: flow={flow.get('mode', 'normal')}"
+            if isinstance(heal, dict) and heal.get("summary"):
+                cortex_line += f" | predictive_health={heal['summary']}"
+            system_instruction += cortex_line
         self.storage.upsert_session(session_id, prev_id, title=user_message[:60])
         self.storage.add_message(session_id, "user", user_message)
         self.storage.record_activity("prompt", user_message[:80])

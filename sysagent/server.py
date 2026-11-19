@@ -37,6 +37,8 @@ watcher = SystemWatcher(settings, storage=storage)
 agent = AgentManager(settings, watcher, storage, plugins=plugins, auth=auth)
 brain = CognitiveBrain(settings, watcher, storage, agent)
 evolver = SelfEvolver(settings, watcher, storage, agent)
+agent.cortex = brain.cortex
+evolver.cortex = brain.cortex
 self_monitor = SelfMonitor(storage, watcher, plugins=plugins, agent=agent, evolver=evolver)
 
 
@@ -145,6 +147,7 @@ def _build_status_payload() -> dict[str, Any]:
         "evolve_proposals": len(storage.list_evolve_proposals(limit=50)),
         "memories": len(storage.list_memories()),
         "lessons": len(storage.list_lessons()),
+        "cortex": brain.cortex.last_flow,
         "uptime_sec": int(time.monotonic() - _BOOT_TIME),
     }
 

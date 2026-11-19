@@ -46,6 +46,7 @@ class NotificationCenter:
     def __init__(self, settings: Settings, storage: Storage | None = None) -> None:
         self.settings = settings
         self.storage = storage
+        self.flow_provider: Callable[[], dict[str, Any]] | None = None
         self._lock = threading.Lock()
         self._recent_keys: dict[str, float] = {}
         self._history: deque[dict[str, Any]] = deque(maxlen=60)
@@ -80,6 +81,14 @@ class NotificationCenter:
 
         if category in {"info", "health"} and self._is_quiet_hours():
             return "brain_quiet_hours"
+
+        if category == "info" and self.flow_provider is not None:
+            try:
+                flow = self.flow_provider() or {}
+                if flow.get("suppress_low_priority"):
+                    return "cortex_flow_focus"
+            except Exception:
+                pass
 
         if self.storage is not None:
             try:

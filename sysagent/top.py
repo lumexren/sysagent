@@ -123,11 +123,13 @@ def build_dashboard(state: dict[str, Any]) -> Layout:
     brain_tbl.add_column(style="dim")
     brain_tbl.add_column(justify="right", style="bold")
     evolve_info = st.get("evolve") or {}
+    cortex_info = st.get("cortex") or {}
     brain_tbl.add_row("Brain Rules", str(st.get("brain_rules", 0)))
     brain_tbl.add_row("Memories / Lessons", f"{st.get('memories', 0)} / {st.get('lessons', 0)}")
     brain_tbl.add_row("Pending Questions", str(st.get("pending_brain_questions", 0)))
     brain_tbl.add_row("Evolve Proposals", str(st.get("evolve_proposals", 0)))
     brain_tbl.add_row("Evolve Mode", str(evolve_info.get("auto_apply", evolve_info.get("enabled", "-"))))
+    brain_tbl.add_row("Cortex Flow", str(cortex_info.get("mode", "normal")))
 
     ev_tbl = Table(show_header=True, header_style="bold dim", box=None, expand=True)
     ev_tbl.add_column("Time", width=8, style="dim")

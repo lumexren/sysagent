@@ -91,6 +91,39 @@ class CortexTests(unittest.TestCase):
                     self.assertEqual(sugs[0]["trigger_value"], "09:00")
                     self.assertGreater(sugs[0]["confidence"], 0.8)
 
+    def test_cortex_deep_integrations(self) -> None:
+        import asyncio
+        import json
+
+        from sysagent.evolve import SelfEvolver
+        from sysagent.mcp_server import handle_mcp_request
+        from sysagent.notification import NotificationCenter
+
+        with tempfile.TemporaryDirectory() as td, Storage(db_path=Path(td) / "c4.db") as st:
+            nc = NotificationCenter(self._settings(), st)
+            nc.flow_provider = lambda: {"mode": "deep_focus", "suppress_low_priority": True}
+            self.assertIsNone(nc.send("Low info", "routine", category="info"))
+            self.assertEqual(nc.list_recent(1)[0]["status"], "suppressed:cortex_flow_focus")
+
+            ev = SelfEvolver.__new__(SelfEvolver)
+            ev._evolve_lock = asyncio.Lock()
+            ev.cortex = SimpleNamespace(last_flow={"mode": "deep_focus", "suppress_low_priority": True})
+            res = asyncio.run(ev.evolve_once(force=False))
+            self.assertEqual(res["status"], "deferred")
+
+            mcp_resp = handle_mcp_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {"name": "sysagent_cortex_status", "arguments": {}},
+                },
+                st,
+            )
+            self.assertFalse(mcp_resp["result"]["isError"])
+            data = json.loads(mcp_resp["result"]["content"][0]["text"])
+            self.assertIn("flow", data)
+
 
 if __name__ == "__main__":
     unittest.main()
