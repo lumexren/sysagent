@@ -197,10 +197,11 @@ def _cmd_local(base_url: str, action: str, query: str | None = None, locale: str
             print(json.dumps(st, indent=2, ensure_ascii=False))
             return
         if action == "distill":
-            mind = LocalMind(Storage())
-            cnt = int(query) if (query and query.isdigit()) else 2
-            print(f"Running Multi-Teacher Knowledge Distillation ({cnt} samples per teacher)...")
-            res = mind.distill_from_teachers(count_per_teacher=cnt)
+            with Storage() as st_db:
+                mind = LocalMind(st_db)
+                cnt = int(query) if (query and query.isdigit()) else 2
+                print(f"Running Multi-Teacher Knowledge Distillation ({cnt} samples per teacher)...")
+                res = mind.distill_from_teachers(count_per_teacher=cnt)
             print(json.dumps(res, indent=2, ensure_ascii=False))
             return
         if action == "download":

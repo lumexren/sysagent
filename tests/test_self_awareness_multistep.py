@@ -416,6 +416,161 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             self.assertTrue(gguf_kw.get("prefer_warm"))
             self.assertTrue(gguf_kw.get("extra_system"))
 
+    def test_curriculum_validation_and_multi_teacher_distillation(self) -> None:
+        from sysagent.neural import NeuralEngine
+
+        with Storage(db_path=self.root / "distill.db") as st:
+            st.add_lesson("_internal:hidden", "secret", "ignore")
+            st.add_lesson("User correction (list_directory)", "Attempted on: promptlar ne durumda", "Use inspect_self_component")
+            lm = LocalMind(st)
+
+            # 1) underrepresented_tools & build_distillation_curriculum
+            weak_tools = lm.underrepresented_tools(limit=8)
+            self.assertEqual(len(weak_tools), 8)
+            curr = lm.build_distillation_curriculum(tool_limit=8)
+            self.assertEqual(len(curr["recent_lessons"]), 1)
+            self.assertIn("inspect_self_component", [s["tool"] for s in curr["tool_signatures"]])
+            insp_sig = next(s for s in curr["tool_signatures"] if s["tool"] == "inspect_self_component")
+            self.assertIn("prompts", insp_sig["params"]["component"]["enum"])
+
+            # 2) _validate_distilled_sample schema normalization, arg remapping, enum fuzzy fix, and dedup
+            schema_map = lm._build_tool_schema_map()
+            seen_q: set[str] = set()
+            v_single = lm._validate_distilled_sample(
+                {
+                    "user": "prompt şablonları ne durumda kontrol et",
+                    "tool": "inspect_self_component",
+                    "args": {"component": "promptları", "bogus_key": 123},
+                    "reply": "Prompt şablonları incelendi.",
+                    "role": "reasoning",
+                },
+                schema_map,
+                seen_q,
+            )
+            self.assertIsNotNone(v_single)
+            assert v_single is not None
+            self.assertEqual(v_single["tool_calls"][0]["arguments"], {"component": "prompts"})
+            self.assertEqual(v_single["role"], "reasoning")
+
+            # Duplicate query rejected
+            self.assertIsNone(
+                lm._validate_distilled_sample(
+                    {
+                        "user": "Prompt  şablonları ne durumda kontrol et",
+                        "tool": "inspect_self_component",
+                        "args": {"component": "prompts"},
+                        "reply": "Tekrar.",
+                    },
+                    schema_map,
+                    seen_q,
+                )
+            )
+
+            # Single required arg key remap ('filepath' -> 'path' for read_file) & multi-step chain
+            v_chain = lm._validate_distilled_sample(
+                {
+                    "user": "etc altındaki hosts dosyasını listele ve oku",
+                    "tool_calls": [
+                        {"name": "list_directory", "arguments": {"folder": "/etc"}},
+                        {"name": "read_file", "arguments": {"filepath": "/etc/hosts"}},
+                    ],
+                    "reply": "/etc/hosts okundu.",
+                },
+                schema_map,
+                seen_q,
+            )
+            self.assertIsNotNone(v_chain)
+            assert v_chain is not None
+            self.assertEqual(len(v_chain["tool_calls"]), 2)
+            self.assertEqual(v_chain["tool_calls"][0]["arguments"], {"path": "/etc"})
+            self.assertEqual(v_chain["tool_calls"][1]["arguments"], {"path": "/etc/hosts"})
+
+            # Unknown tool rejected when tool was expected
+            self.assertIsNone(
+                lm._validate_distilled_sample(
+                    {"user": "do something invalid now", "tool": "nonexistent_tool_xyz", "args": {}, "reply": "ok done"},
+                    schema_map,
+                    seen_q,
+                )
+            )
+
+            # 3) distill_from_teachers harvests single + multi-step samples, updates workflows & safe_plans, prunes uncertain
+            unc_file = self.root / "dataset" / "uncertain_queries.jsonl"
+            unc_file.write_text(
+                json.dumps({"query": "sistem sağlık durumu ve süreçler", "score": 0.12}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            teacher_payload = json.dumps(
+                {
+                    "samples": [
+                        {
+                            "user": "sistem sağlık durumu ve süreçler",
+                            "role": "general",
+                            "tool_calls": [
+                                {"name": "system_status", "arguments": {}},
+                                {"name": "list_processes", "arguments": {"sort_by": "memory", "limit": 10}},
+                            ],
+                            "reply": "Sistem durumu ve en çok RAM kullanan süreçler listelendi.",
+                        },
+                        {
+                            "user": "kendi prompt versiyonlarını detaylı incele",
+                            "role": "reasoning",
+                            "tool": "inspect_self_component",
+                            "args": {"component": "prompts"},
+                            "reply": "PromptRegistry aktif versiyonları incelendi.",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
+            with patch("sysagent.auth._find_agy_cli", return_value="/usr/bin/agy"), patch(
+                "sysagent.local_mind.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout=teacher_payload, stderr=""),
+            ):
+                res = lm.distill_from_teachers(count_per_teacher=2, allow_local_fallback=False)
+
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(res["harvested_samples"], 2)
+            self.assertEqual(res["multi_step_chains"], 1)
+            self.assertEqual(res["resolved_uncertain_count"], 1)
+            self.assertFalse(unc_file.exists())
+            self.assertGreaterEqual(res["post_verify_accuracy"], 0.5)
+            wfs = st.list_workflows(limit=10)
+            self.assertTrue(any("system_status -> list_processes" in str(w.get("signature")) for w in wfs))
+            matched_sp = NeuralEngine(st).match_safe_plan("kendi prompt versiyonlarını detaylı incele", min_sim=0.85)
+            self.assertIsNotNone(matched_sp)
+            assert matched_sp is not None
+            self.assertEqual(matched_sp["tool"], "inspect_self_component")
+
+            # 4) Fallback to local peer GGUF when agy CLI and cloud SDK are unavailable
+            fake_gguf = self.mods / "OmniCoder-9B.Q4_K_M.gguf"
+            fake_gguf.write_bytes(b"GGUF" + b"\x00" * 64)
+            local_peer_payload = json.dumps(
+                {
+                    "samples": [
+                        {
+                            "user": "pano içeriğini oku clipboard",
+                            "role": "general",
+                            "tool": "read_clipboard",
+                            "args": {},
+                            "reply": "Pano okundu.",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+            fake_auth = MagicMock(is_configured=False)
+            with (
+                patch("sysagent.auth._find_agy_cli", return_value=None),
+                patch("sysagent.auth.AuthManager", return_value=fake_auth),
+                patch.object(lm, "run_gguf_inference", return_value=local_peer_payload) as peer_spy,
+            ):
+                res_peer = lm.distill_from_teachers(count_per_teacher=1, allow_local_fallback=True)
+            self.assertEqual(res_peer["status"], "ok")
+            self.assertEqual(res_peer["harvested_samples"], 1)
+            self.assertEqual(res_peer["teachers_used"], ["local-peer"])
+            peer_spy.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

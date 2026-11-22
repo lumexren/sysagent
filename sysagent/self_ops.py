@@ -405,6 +405,7 @@ class SelfMonitor:
         self._cycle_count: int = 0
         self.last_prune: dict[str, int] = {}
         self.last_prompt_evolve: dict[str, Any] = {}
+        self.last_distill: dict[str, Any] = {}
 
     def start(self) -> None:
         if self._running:
@@ -484,9 +485,21 @@ class SelfMonitor:
         mind = LocalMind(self.storage)
         sched = compute_adaptive_schedule(self.watcher, self.storage)
         cpu_idle = sched.get("cpu_percent", 0) <= 50.0
+        uncertain_cnt = int(mind.get_status().get("uncertain_queue_count", 0) or 0)
         batch_resolved = None
-        if cpu_idle and mind.get_status().get("uncertain_queue_count", 0) >= 8:
+        if cpu_idle and (uncertain_cnt >= 4 or (uncertain_cnt >= 1 and self._cycle_count % 3 == 0)):
             batch_resolved = mind.resolve_uncertain_batch(max_items=8)
+        auto_distill = None
+        if (
+            cpu_idle
+            and sched.get("self_play_allowed")
+            and (
+                self._cycle_count % 6 == 2
+                or (len(mind.underrepresented_tools(limit=6)) >= 4 and self._cycle_count == 1)
+            )
+        ):
+            auto_distill = mind.distill_from_teachers(count_per_teacher=2)
+            self.last_distill = auto_distill
         self_play = None
         if sched.get("self_play_allowed") and self._cycle_count % 2 == 1:
             self_play = run_local_self_play(self.storage, max_rounds=1)
@@ -550,6 +563,7 @@ class SelfMonitor:
             "assoc_synced": assoc_synced,
             "pruned_synapses": pruned_synapses,
             "batch_resolved": batch_resolved,
+            "auto_distill": auto_distill,
             "self_play": self_play,
             "injected_skills": injected_skills,
             "hygiene": hygiene,

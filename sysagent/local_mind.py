@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import math
 import os
@@ -668,6 +669,7 @@ class LocalMind:
         user_message: str,
         tool_calls: list[dict[str, Any]],
         assistant_reply: str,
+        role: str | None = None,
     ) -> None:
         """Harvest a successful online turn into the local distillation dataset and incrementally update weights."""
         u_clean = (user_message or "").strip()
@@ -678,9 +680,14 @@ class LocalMind:
             or u_clean.startswith(("[Automation ", "A background system alert was triggered", "Regarding this situation:"))
         ):
             return
+        resolved_role = (
+            role
+            if role in {"coding", "general", "reasoning", "chat", "multimodal"}
+            else classify_task_role(u_clean, tool_calls)
+        )
         entry = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "role": classify_task_role(u_clean, tool_calls),
+            "role": resolved_role,
             "user": u_clean[:1000],
             "tool_calls": tool_calls[:4],
             "reply": a_clean[:2000],
@@ -1033,6 +1040,293 @@ class LocalMind:
         gen_roles = ("coding", "general", "reasoning", "chat", "multimodal")
         return sorted(gen_roles, key=lambda r: int(rc.get(r, 0)))
 
+    def underrepresented_tools(self, limit: int = 8) -> list[str]:
+        """Return declared tools sorted ascending by current training sample & centroid support."""
+        from .tools import TOOL_DECLARATIONS
+
+        centroids: dict[str, dict[str, float]] = self.weights.get("tool_centroids") or {}
+        sample_counts: Counter[str] = Counter()
+        for entry in self._load_distilled_entries(limit=1500):
+            for tc in entry.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("name"):
+                    sample_counts[str(tc["name"])] += 1
+        all_tools = [str(d["name"]) for d in TOOL_DECLARATIONS if d.get("name")]
+        ranked = sorted(
+            all_tools,
+            key=lambda t: (int(sample_counts.get(t, 0)), len(centroids.get(t) or {}), t),
+        )
+        return ranked[: max(1, limit)]
+
+    @staticmethod
+    def _build_tool_schema_map() -> dict[str, dict[str, Any]]:
+        """Build a compact parameter & enum lookup table from TOOL_DECLARATIONS."""
+        from .tools import TOOL_DECLARATIONS
+
+        schema_map: dict[str, dict[str, Any]] = {}
+        for d in TOOL_DECLARATIONS:
+            tname = str(d.get("name") or "").strip()
+            if not tname:
+                continue
+            params = d.get("parameters") or {}
+            props = dict(params.get("properties") or {}) if isinstance(params, dict) else {}
+            req = list(params.get("required") or []) if isinstance(params, dict) else []
+            schema_map[tname] = {
+                "description": str(d.get("description") or "")[:140],
+                "properties": props,
+                "required": req,
+            }
+        return schema_map
+
+    @staticmethod
+    def _format_tool_signatures(
+        schema_map: dict[str, dict[str, Any]], tool_names: list[str]
+    ) -> list[dict[str, Any]]:
+        """Format compact parameter and enum signatures for teacher prompts."""
+        sigs: list[dict[str, Any]] = []
+        for tname in tool_names:
+            spec = schema_map.get(tname)
+            if not spec:
+                continue
+            props = spec.get("properties") or {}
+            req = set(spec.get("required") or [])
+            param_summary: dict[str, Any] = {}
+            for pname, pdef in props.items():
+                if not isinstance(pdef, dict):
+                    continue
+                ptype = str(pdef.get("type") or "string")
+                tag = f"{ptype} (required)" if pname in req else ptype
+                if isinstance(pdef.get("enum"), list) and pdef["enum"]:
+                    param_summary[pname] = {"type": tag, "enum": list(pdef["enum"])}
+                else:
+                    param_summary[pname] = tag
+            sigs.append(
+                {
+                    "tool": tname,
+                    "description": spec.get("description", ""),
+                    "params": param_summary,
+                }
+            )
+        return sigs
+
+    def build_distillation_curriculum(self, tool_limit: int = 10) -> dict[str, Any]:
+        """Synthesize a targeted distillation curriculum from coverage gaps, lessons, and user language."""
+        schema_map = self._build_tool_schema_map()
+        weak_roles = self.underrepresented_roles()
+        weak_tools = self.underrepresented_tools(limit=tool_limit)
+        recent_lessons: list[dict[str, str]] = []
+        if self.storage is not None:
+            try:
+                for les in self.storage.list_lessons(limit=12):
+                    ctx = str(les.get("context") or les.get("topic") or "")
+                    if ctx.startswith("_internal:"):
+                        continue
+                    recent_lessons.append(
+                        {
+                            "context": ctx[:80],
+                            "insight": str(les.get("insight") or les.get("mistake") or "")[:120],
+                            "resolution": str(les.get("resolution") or les.get("lesson") or "")[:140],
+                        }
+                    )
+                    if len(recent_lessons) >= 5:
+                        break
+            except Exception:
+                pass
+        core_tools = [
+            "inspect_self_component",
+            "system_status",
+            "list_directory",
+            "read_file",
+            "search_files",
+            "run_command",
+        ]
+        featured = list(dict.fromkeys([*weak_tools, *core_tools]))
+        return {
+            "weak_roles": weak_roles,
+            "underrepresented_tools": weak_tools,
+            "recent_lessons": recent_lessons,
+            "user_examples": self.sample_user_utterances(limit=5),
+            "tool_signatures": self._format_tool_signatures(schema_map, featured),
+        }
+
+    def _validate_distilled_sample(
+        self,
+        smp: dict[str, Any],
+        schema_map: dict[str, dict[str, Any]],
+        seen_queries: set[str],
+    ) -> dict[str, Any] | None:
+        """Validate, normalize, and deduplicate a teacher-generated sample against tool schemas."""
+        if not isinstance(smp, dict):
+            return None
+        user = str(smp.get("user") or "").strip()
+        reply = str(smp.get("reply") or "").strip()
+        if len(user) < 5 or len(reply) < 4:
+            return None
+        u_key = " ".join(user.lower().split())
+        if u_key in seen_queries:
+            return None
+
+        raw_chain = smp.get("tool_calls")
+        raw_single_tool = smp.get("tool")
+        expecting_tool = False
+        candidate_calls: list[tuple[str, dict[str, Any]]] = []
+        if isinstance(raw_chain, list) and raw_chain:
+            expecting_tool = True
+            for item in raw_chain[:4]:
+                if not isinstance(item, dict):
+                    continue
+                cname = str(item.get("name") or item.get("tool") or "").strip()
+                cargs = item.get("arguments")
+                if not isinstance(cargs, dict):
+                    cargs = item.get("args") if isinstance(item.get("args"), dict) else {}
+                if cname:
+                    candidate_calls.append((cname, dict(cargs)))
+        elif raw_single_tool is not None:
+            t_str = str(raw_single_tool).strip()
+            if t_str and t_str.lower() not in {"null", "none", "__chat__"}:
+                expecting_tool = True
+                raw_args = smp.get("args")
+                if not isinstance(raw_args, dict):
+                    raw_args = smp.get("arguments") if isinstance(smp.get("arguments"), dict) else {}
+                candidate_calls.append((t_str, dict(raw_args)))
+
+        valid_tcalls: list[dict[str, Any]] = []
+        for tname, raw_args in candidate_calls:
+            spec = schema_map.get(tname)
+            if spec is None:
+                continue
+            props: dict[str, Any] = spec.get("properties") or {}
+            req: list[str] = spec.get("required") or []
+            norm_args: dict[str, Any] = {k: v for k, v in raw_args.items() if k in props}
+
+            if len(req) == 1 and req[0] not in norm_args:
+                unknown_vals = [
+                    v for k, v in raw_args.items() if k not in props and v is not None and str(v).strip() != ""
+                ]
+                if len(unknown_vals) == 1:
+                    norm_args[req[0]] = unknown_vals[0]
+
+            for k, val in list(norm_args.items()):
+                pdef = props.get(k)
+                if not isinstance(pdef, dict):
+                    continue
+                enum_vals = pdef.get("enum")
+                if isinstance(enum_vals, list) and enum_vals and val not in enum_vals:
+                    if isinstance(val, str):
+                        enum_map = {str(e).lower(): e for e in enum_vals}
+                        v_low = val.strip().lower()
+                        if v_low in enum_map:
+                            norm_args[k] = enum_map[v_low]
+                        else:
+                            close = difflib.get_close_matches(v_low, list(enum_map.keys()), n=1, cutoff=0.6)
+                            if close:
+                                norm_args[k] = enum_map[close[0]]
+                            else:
+                                norm_args.pop(k, None)
+                    else:
+                        norm_args.pop(k, None)
+
+            if any(rk not in norm_args or norm_args[rk] in {None, ""} for rk in req):
+                continue
+            valid_tcalls.append({"name": tname, "arguments": norm_args})
+
+        if expecting_tool and not valid_tcalls:
+            return None
+
+        raw_role = str(smp.get("role") or "").strip().lower()
+        valid_roles = {"coding", "general", "reasoning", "chat", "multimodal"}
+        role = (
+            raw_role
+            if raw_role in valid_roles
+            else classify_task_role(user, valid_tcalls, storage=self.storage)
+        )
+        seen_queries.add(u_key)
+        return {
+            "user": user,
+            "tool_calls": valid_tcalls,
+            "reply": reply,
+            "role": role,
+        }
+
+    def _call_teacher_model(
+        self,
+        teacher: str,
+        prompt: str,
+        caller: str = "distill",
+        allow_local_fallback: bool = True,
+    ) -> tuple[str | None, str]:
+        """Invoke a teacher model via agy CLI, AuthManager SDK client, or local 9B specialist peer fallback."""
+        from .auth import AuthManager, _find_agy_cli
+        from .self_resilience import get_quota_governor
+
+        gov = get_quota_governor()
+        recorded_bg = False
+        agy_bin = _find_agy_cli()
+        if agy_bin:
+            try:
+                gov.record_background_call(caller, teacher)
+                recorded_bg = True
+                proc = subprocess.run(
+                    [
+                        agy_bin,
+                        "-p",
+                        prompt,
+                        "--model",
+                        teacher,
+                        "--disable-slash-commands",
+                        "--output-format",
+                        "text",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    cwd="/tmp",
+                )
+                if proc.returncode == 0 and "{" in proc.stdout:
+                    return proc.stdout.strip(), teacher
+                err_txt = f"{proc.stderr} {proc.stdout}".lower()
+                if any(k in err_txt for k in ("429", "quota", "resource_exhausted")):
+                    gov.record_rate_limit(teacher)
+                    return None, teacher
+            except Exception:
+                pass
+
+        try:
+            auth = AuthManager()
+            if auth.is_configured:
+                client = auth.get_client()
+                if type(client).__name__ not in {"LocalMindClient", "AgyCliClient"}:
+                    if not recorded_bg:
+                        gov.record_background_call(caller, teacher)
+                        recorded_bg = True
+                    resp = client.interactions.create(model=teacher, input=prompt, store=False)
+                    out_txt = getattr(resp, "output_text", None)
+                    if isinstance(out_txt, str) and "{" in out_txt:
+                        return out_txt.strip(), teacher
+        except Exception as exc:
+            err_low = str(exc).lower()
+            if any(k in err_low for k in ("429", "quota", "resource_exhausted")):
+                gov.record_rate_limit(teacher)
+                return None, teacher
+
+        if allow_local_fallback:
+            models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
+            if models:
+                try:
+                    local_out = self.run_gguf_inference(
+                        prompt,
+                        extra_system=(
+                            "You are a Teacher Model generating training data for a Linux system assistant. "
+                            "Respond ONLY with valid JSON matching the requested schema."
+                        ),
+                        max_tokens=600,
+                        prefer_warm=True,
+                    )
+                    if isinstance(local_out, str) and "{" in local_out:
+                        return local_out.strip(), "local-peer"
+                except Exception:
+                    pass
+        return None, teacher
+
     def get_status(self) -> dict[str, Any]:
         gguf_list = find_all_gguf_models()
         gen_list = [p for p in gguf_list if classify_gguf_role(p) != "embedding"]
@@ -1173,11 +1467,13 @@ class LocalMind:
         except Exception:
             pass
 
-    def resolve_uncertain_batch(self, max_items: int = 8) -> dict[str, Any]:
-        """Resolve up to max_items queued uncertain queries in ONE batch cloud call and update weights."""
-        from .auth import _find_agy_cli
+    def resolve_uncertain_batch(
+        self, max_items: int = 8, allow_local_fallback: bool = True
+    ) -> dict[str, Any]:
+        """Resolve up to max_items queued uncertain queries in ONE batch teacher call and update weights."""
+        from .auth import AuthManager, _find_agy_cli
+        from .safety import SAFE_TOOLS
         from .self_resilience import get_quota_governor
-        from .tools import TOOL_DECLARATIONS
 
         gov = get_quota_governor()
         allowed_q, q_reason = gov.allow_background("resolve_uncertain")
@@ -1221,33 +1517,43 @@ class LocalMind:
                 pass
             return {"status": "skipped", "resolved": 0, "remaining": 0}
 
-        agy_bin = _find_agy_cli()
-        if not agy_bin:
+        has_local = allow_local_fallback and any(
+            classify_gguf_role(m) != "embedding" for m in find_all_gguf_models()
+        )
+        has_sdk = False
+        try:
+            auth = AuthManager()
+            has_sdk = bool(
+                auth.is_configured
+                and type(auth.get_client()).__name__ not in {"LocalMindClient", "AgyCliClient"}
+            )
+        except Exception:
+            pass
+        if not _find_agy_cli() and not has_sdk and not has_local:
             return {"status": "skipped", "resolved": 0, "remaining": len(raw_lines)}
 
-        tool_names = [d["name"] for d in TOOL_DECLARATIONS]
+        schema_map = self._build_tool_schema_map()
+        tool_sigs = self._format_tool_signatures(schema_map, list(schema_map.keys()))
         prompt = (
-            "Map each user query below to the best tool + arguments and a concise plain-text reply.\n"
-            f"Available tool names: {json.dumps(tool_names)}\n"
+            "Map each user query below to the best tool(s) + schema-valid arguments and a concise plain-text reply.\n"
+            f"Tool schemas: {json.dumps(tool_sigs, ensure_ascii=False)}\n"
             f"Queries: {json.dumps(batch_queries, ensure_ascii=False)}\n"
-            'Respond ONLY with JSON: {"samples": [{"user": "...", "tool": "tool_or_null", "args": {}, "reply": "..."}]}'
+            "Respond ONLY with JSON:\n"
+            '{"samples": [{"user": "...", "role": "general|coding|reasoning|chat|multimodal", '
+            '"tool": "tool_or_null", "args": {}, '
+            '"tool_calls": [{"name": "tool_name", "arguments": {}}], "reply": "..."}]}'
         )
         resolved = 0
+        seen_existing: set[str] = set()
+        out, used_teacher = self._call_teacher_model(
+            TEACHER_MODELS[0],
+            prompt,
+            caller="resolve_uncertain",
+            allow_local_fallback=allow_local_fallback,
+        )
+        if not out:
+            return {"status": "error", "resolved": 0, "remaining": len(raw_lines)}
         try:
-            gov.record_background_call("resolve_uncertain", TEACHER_MODELS[0])
-            proc = subprocess.run(
-                [agy_bin, "-p", prompt, "--model", TEACHER_MODELS[0], "--disable-slash-commands", "--output-format", "text"],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                cwd="/tmp",
-            )
-            if proc.returncode != 0:
-                err_txt = f"{proc.stderr} {proc.stdout}".lower()
-                if any(k in err_txt for k in ("429", "quota", "resource_exhausted")):
-                    gov.record_rate_limit(TEACHER_MODELS[0])
-                return {"status": "error", "resolved": 0, "remaining": len(raw_lines)}
-            out = proc.stdout.strip()
             j_idx = out.find("{")
             if j_idx == -1:
                 return {"status": "error", "resolved": 0, "remaining": len(raw_lines)}
@@ -1256,15 +1562,32 @@ class LocalMind:
             if not isinstance(samples, list):
                 return {"status": "error", "resolved": 0, "remaining": len(raw_lines)}
             for smp in samples:
-                if not isinstance(smp, dict) or not smp.get("user") or not smp.get("reply"):
+                validated = self._validate_distilled_sample(smp, schema_map, seen_existing)
+                if validated is None:
                     continue
-                tname = smp.get("tool")
-                tcalls = (
-                    [{"name": str(tname), "arguments": dict(smp.get("args") or {})}]
-                    if tname and str(tname) in tool_names
-                    else []
+                tcalls = validated["tool_calls"]
+                self.record_and_learn(
+                    validated["user"],
+                    tcalls,
+                    validated["reply"],
+                    role=validated["role"],
                 )
-                self.record_and_learn(str(smp["user"]), tcalls, str(smp["reply"]))
+                if len(tcalls) >= 2 and self.storage is not None:
+                    try:
+                        self.storage.record_workflow(validated["user"][:140], tcalls)
+                    except Exception:
+                        pass
+                elif len(tcalls) == 1 and tcalls[0]["name"] in SAFE_TOOLS:
+                    try:
+                        from .neural import NeuralEngine
+
+                        NeuralEngine(self.storage).record_safe_plan(
+                            validated["user"],
+                            tcalls[0]["name"],
+                            dict(tcalls[0].get("arguments") or {}),
+                        )
+                    except Exception:
+                        pass
                 resolved += 1
         except Exception:
             return {"status": "error", "resolved": 0, "remaining": len(raw_lines)}
@@ -1278,21 +1601,39 @@ class LocalMind:
             pass
         if resolved:
             self.train()
-        return {"status": "ok", "resolved": resolved, "remaining": len(remaining_lines)}
+        return {
+            "status": "ok",
+            "resolved": resolved,
+            "remaining": len(remaining_lines),
+            "teacher": used_teacher,
+        }
 
-    def distill_from_teachers(self, count_per_teacher: int = 2) -> dict[str, Any]:
-        """Multi-Teacher Knowledge Distillation: query diverse cloud teachers via `agy` to feed LocalMind."""
-        from .auth import _find_agy_cli
+    def distill_from_teachers(
+        self, count_per_teacher: int = 2, allow_local_fallback: bool = True
+    ) -> dict[str, Any]:
+        """Curriculum-Driven Multi-Teacher Knowledge Distillation with schema validation & active verification."""
+        from .auth import AuthManager, _find_agy_cli
+        from .safety import SAFE_TOOLS
         from .self_resilience import get_quota_governor
-        from .tools import TOOL_DECLARATIONS
 
         gov = get_quota_governor()
         allowed_q, q_reason = gov.allow_background("distill")
         if not allowed_q:
             return {"status": "deferred", "reason": q_reason}
 
-        agy_bin = _find_agy_cli()
-        if not agy_bin:
+        has_local = allow_local_fallback and any(
+            classify_gguf_role(m) != "embedding" for m in find_all_gguf_models()
+        )
+        has_sdk = False
+        try:
+            auth = AuthManager()
+            has_sdk = bool(
+                auth.is_configured
+                and type(auth.get_client()).__name__ not in {"LocalMindClient", "AgyCliClient"}
+            )
+        except Exception:
+            pass
+        if not _find_agy_cli() and not has_sdk and not has_local:
             return {"status": "skipped", "reason": "agy_cli_not_found"}
 
         uncertain_queries: list[str] = []
@@ -1310,16 +1651,30 @@ class LocalMind:
                 pass
         resolved_uncertain: set[str] = set()
 
-        tool_names = [d["name"] for d in TOOL_DECLARATIONS]
-        harvested = 0
-        teachers_used: list[str] = []
+        schema_map = self._build_tool_schema_map()
+        curriculum = self.build_distillation_curriculum(tool_limit=12)
+        weak_roles: list[str] = curriculum["weak_roles"]
+        weak_tools: list[str] = curriculum["underrepresented_tools"]
+        recent_lessons: list[dict[str, str]] = curriculum["recent_lessons"]
+        user_examples: list[str] = curriculum["user_examples"]
 
-        weak_roles = self.underrepresented_roles()
+        seen_queries: set[str] = {
+            " ".join(str(e.get("user") or "").lower().split())
+            for e in self._load_distilled_entries(limit=1500)
+            if e.get("user")
+        }
+
+        harvested = 0
+        rejected = 0
+        multi_step_chains = 0
+        teachers_used: list[str] = []
+        harvested_records: list[dict[str, Any]] = []
+
         role_guidance = {
             "multimodal": "screenshot/image analysis, OCR, UI/visual inspection, or media file queries",
-            "reasoning": "step-by-step debugging, root-cause diagnosis, architecture trade-offs, or complex logic",
-            "coding": "Python/Bash code debugging, refactoring, git diff review, or test generation",
-            "general": "Linux system inspection, systemd services, disk/RAM/network diagnostics, or memory search",
+            "reasoning": "step-by-step debugging, self-component introspection, root-cause diagnosis, or architecture analysis",
+            "coding": "Python/Bash code debugging, file search -> read -> edit workflows, git diff review, or test execution",
+            "general": "Linux system inspection, systemd services, process/RAM/disk diagnostics, or memory search",
             "chat": "brief conversational greetings, status check-ins, or concise assistant Q&A",
         }
 
@@ -1327,58 +1682,65 @@ class LocalMind:
             ok_q, _ = gov.allow_background("distill")
             if not ok_q:
                 break
+            focus_role = weak_roles[t_idx % len(weak_roles)]
+            focus_tools = weak_tools[t_idx :: len(TEACHER_MODELS)][:4] or weak_tools[:4]
+            core_slice = ["inspect_self_component", "list_directory", "read_file", "search_files", "system_status"]
+            teacher_tool_names = list(dict.fromkeys([*focus_tools, *core_slice]))
+            teacher_sigs = self._format_tool_signatures(schema_map, teacher_tool_names)
+
             prompt = (
                 "You are a Teacher Model generating high-quality training examples for a local Linux system assistant.\n"
-                f"Available tool names: {json.dumps(tool_names)}\n"
+                f"Priority tool schemas (use exact tool names, required params, and enum values): {json.dumps(teacher_sigs, ensure_ascii=False)}\n"
+                f"All valid tool names: {json.dumps(list(schema_map.keys()))}\n"
             )
+            if recent_lessons:
+                prompt += (
+                    f"Recent mistakes/corrections to avoid and teach against: {json.dumps(recent_lessons, ensure_ascii=False)}\n"
+                )
             batch_q: list[str] = []
             if uncertain_queries:
                 batch_q = uncertain_queries[:count_per_teacher]
                 uncertain_queries = uncertain_queries[count_per_teacher:]
                 prompt += (
-                    f"Solve these user queries and map each to the best tool + arguments and a clean plain-text reply: {json.dumps(batch_q, ensure_ascii=False)}\n"
+                    f"Solve these real uncertain user queries with accurate tool calls and concise replies: "
+                    f"{json.dumps(batch_q, ensure_ascii=False)}\n"
                 )
             else:
-                focus_role = weak_roles[t_idx % len(weak_roles)]
-                user_examples = self.sample_user_utterances(limit=5)
                 lang_hint = (
                     f"Match the natural language(s) observed in the user's real history ({json.dumps(user_examples, ensure_ascii=False)}) as well as English"
                     if user_examples
-                    else "in the user's preferred language and English"
+                    else "in Turkish and English"
+                )
+                chain_hint = (
+                    "Include at least 1 multi-step workflow sample with 2 ordered calls in `tool_calls` "
+                    "(e.g. list_directory -> read_file, search_files -> read_file, or system_status -> list_processes).\n"
+                    if count_per_teacher >= 2 and focus_role != "chat"
+                    else ""
                 )
                 prompt += (
                     f"Generate {count_per_teacher} diverse, realistic user commands specifically exercising the "
                     f"'{focus_role}' specialist role ({lang_hint}), focusing on "
-                    f"{role_guidance.get(focus_role, 'Linux system assistance')}.\n"
+                    f"{role_guidance.get(focus_role, 'Linux system assistance')} and priority tools {json.dumps(focus_tools)}.\n"
+                    f"{chain_hint}"
                 )
             prompt += (
                 "Respond ONLY with a valid JSON object matching:\n"
-                '{"samples": [{"user": "user request", "tool": "tool_name_or_null", "args": {}, "reply": "concise plain text answer without backticks"}]}'
+                '{"samples": [{"user": "user request", "role": "'
+                + focus_role
+                + '", "tool": "primary_tool_or_null", "args": {}, '
+                '"tool_calls": [{"name": "tool_name", "arguments": {}}], '
+                '"reply": "concise plain text answer without backticks"}]}'
             )
+
+            out, used_teacher = self._call_teacher_model(
+                teacher,
+                prompt,
+                caller="distill",
+                allow_local_fallback=allow_local_fallback,
+            )
+            if not out:
+                continue
             try:
-                gov.record_background_call("distill", teacher)
-                proc = subprocess.run(
-                    [
-                        agy_bin,
-                        "-p",
-                        prompt,
-                        "--model",
-                        teacher,
-                        "--disable-slash-commands",
-                        "--output-format",
-                        "text",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=90,
-                    cwd="/tmp",
-                )
-                if proc.returncode != 0:
-                    err_txt = f"{proc.stderr} {proc.stdout}".lower()
-                    if any(k in err_txt for k in ("429", "quota", "resource_exhausted")):
-                        gov.record_rate_limit(teacher)
-                    continue
-                out = proc.stdout.strip()
                 idx = out.find("{")
                 if idx == -1:
                     continue
@@ -1386,21 +1748,45 @@ class LocalMind:
                 samples = parsed.get("samples") if isinstance(parsed, dict) else None
                 if not isinstance(samples, list):
                     continue
-                teachers_used.append(teacher)
+                if used_teacher not in teachers_used:
+                    teachers_used.append(used_teacher)
                 resolved_uncertain.update(batch_q)
                 for smp in samples:
-                    if not isinstance(smp, dict) or not smp.get("user") or not smp.get("reply"):
+                    validated = self._validate_distilled_sample(smp, schema_map, seen_queries)
+                    if validated is None:
+                        rejected += 1
                         continue
-                    tname = smp.get("tool")
-                    tcalls = (
-                        [{"name": str(tname), "arguments": dict(smp.get("args") or {})}]
-                        if tname and str(tname) in tool_names
-                        else []
+                    tcalls = validated["tool_calls"]
+                    self.record_and_learn(
+                        validated["user"],
+                        tcalls,
+                        validated["reply"],
+                        role=validated["role"],
                     )
-                    self.record_and_learn(str(smp["user"]), tcalls, str(smp["reply"]))
+                    if len(tcalls) >= 2:
+                        multi_step_chains += 1
+                        if self.storage is not None:
+                            try:
+                                self.storage.record_workflow(validated["user"][:140], tcalls)
+                            except Exception:
+                                pass
+                    elif len(tcalls) == 1 and tcalls[0]["name"] in SAFE_TOOLS:
+                        try:
+                            from .neural import NeuralEngine
+
+                            NeuralEngine(self.storage).record_safe_plan(
+                                validated["user"],
+                                tcalls[0]["name"],
+                                dict(tcalls[0].get("arguments") or {}),
+                            )
+                        except Exception:
+                            pass
                     harvested += 1
+                    harvested_records.append(validated)
             except Exception:
                 continue
+            if used_teacher == "local-peer":
+                break
 
         if raw_uncertain_lines and resolved_uncertain:
             remaining: list[str] = []
@@ -1411,16 +1797,51 @@ class LocalMind:
                     continue
                 if q_val and q_val not in resolved_uncertain:
                     remaining.append(ln)
-            if remaining:
-                UNCERTAIN_FILE.write_text("\n".join(remaining) + "\n", encoding="utf-8")
-            else:
-                UNCERTAIN_FILE.unlink(missing_ok=True)
+            try:
+                if remaining:
+                    UNCERTAIN_FILE.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+                else:
+                    UNCERTAIN_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         status = self.train()
+
+        tool_records = [r for r in harvested_records if r.get("tool_calls")]
+        verified_hits = 0
+        for rec in tool_records:
+            expected_tool = str(rec["tool_calls"][0]["name"])
+            pred_tool, _, _ = self.predict_tool(rec["user"], record_uncertain=False)
+            if pred_tool == expected_tool:
+                verified_hits += 1
+            else:
+                self._update_weights_incremental(rec)
+                try:
+                    from .neural import NeuralEngine
+
+                    NeuralEngine(self.storage).online_step(rec["user"], expected_tool, reward=1.5)
+                except Exception:
+                    pass
+                pred_after, _, _ = self.predict_tool(rec["user"], record_uncertain=False)
+                if pred_after == expected_tool:
+                    verified_hits += 1
+
+        post_verify_acc = (
+            round(verified_hits / len(tool_records), 4) if tool_records else 1.0
+        )
         return {
             "status": "ok",
             "harvested_samples": harvested,
+            "rejected_samples": rejected,
+            "multi_step_chains": multi_step_chains,
+            "resolved_uncertain_count": len(resolved_uncertain),
             "teachers_used": teachers_used,
+            "curriculum_focus": {
+                "weak_roles": weak_roles[:3],
+                "underrepresented_tools": weak_tools[:6],
+                "lessons_targeted": len(recent_lessons),
+            },
+            "post_verify_accuracy": post_verify_acc,
             "model_status": status,
         }
 
