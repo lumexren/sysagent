@@ -65,6 +65,45 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "description": "Get live NeuralBrainCortex status (Flow Guardian mode, predictive health, dream cycle, habit suggestions).",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "sysagent_digital_twin",
+        "description": "Run the Causal Digital Twin & OOM/memory-leak trajectory simulator plus root-cause hypothesis investigator.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "sysagent_blast_radius",
+        "description": "Compute AST call-graph blast radius, direct/transitive callers, and covering unit tests for a symbol or module.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Function/method symbol or module filename", "default": "execute_tool"},
+            },
+        },
+    },
+    {
+        "name": "sysagent_dpo_audit",
+        "description": "Audit and optionally auto-repair DPO contrastive preference consistency across LocalMind and NeuralEngine.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "auto_repair": {"type": "boolean", "default": True},
+            },
+        },
+    },
+    {
+        "name": "sysagent_inspect_self",
+        "description": "Inspect SysAgent internal self-components (prompts, checkpoints, codebase, local_mind, neural, evolve, guard).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "component": {
+                    "type": "string",
+                    "enum": ["all", "local_mind", "neural", "evolve", "guard", "prompts", "checkpoints", "codebase"],
+                    "default": "all",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -107,6 +146,32 @@ def _execute_mcp_tool(name: str, args: dict[str, Any], storage: Storage) -> dict
         from .cortex import NeuralBrainCortex
 
         return NeuralBrainCortex(get_settings(), storage).get_status()
+    if name == "sysagent_digital_twin":
+        from .self_learn import analyze_causal_digital_twin, investigate_root_cause
+
+        twin = analyze_causal_digital_twin(storage)
+        diag = investigate_root_cause(storage)
+        return {**twin, "root_cause": diag}
+    if name == "sysagent_blast_radius":
+        from .evolve_ast import analyze_symbol_blast_radius
+
+        target = str(args.get("target") or "execute_tool").strip()
+        return analyze_symbol_blast_radius(target, storage=storage)
+    if name == "sysagent_dpo_audit":
+        from .config import get_settings
+        from .self_guard import SelfGuard
+
+        auto_rep = bool(args.get("auto_repair", True))
+        return SelfGuard(get_settings(), storage).audit_dpo_preferences(auto_repair=auto_rep)
+    if name == "sysagent_inspect_self":
+        from .config import get_settings
+        from .tools import execute_tool
+        from .watcher import SystemWatcher
+
+        comp = str(args.get("component") or "all").strip()
+        w = SystemWatcher(get_settings(), storage=storage)
+        raw = execute_tool("inspect_self_component", {"component": comp}, watcher=w, storage=storage)
+        return json.loads(raw) if isinstance(raw, str) else {"result": raw}
     raise ValueError(f"Unknown MCP tool: {name}")
 
 

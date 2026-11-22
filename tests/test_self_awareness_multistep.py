@@ -1187,6 +1187,102 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             self.assertIsNotNone(rec_err["instant_fix"])
             self.assertIn("pytest -q", rec_err["instant_fix"]["lesson"])
 
+    def test_five_diagnostic_compression_kg_mcp_and_top_features(self) -> None:
+        from sysagent.mcp_server import MCP_TOOLS, handle_mcp_request
+        from sysagent.self_learn import investigate_root_cause, learn_status_summary
+        from sysagent.tools import compress_tool_output
+        from sysagent.top import build_dashboard
+
+        with Storage(db_path=self.root / "diag_five.db") as st:
+            # 1) Feature 1: Autonomous Hypothesis-Driven Root-Cause Investigator
+            diag = investigate_root_cause(
+                st,
+                events=[
+                    {
+                        "category": "systemd",
+                        "severity": "critical",
+                        "message": "Unit redis-cache.service entered failed state with exit-code",
+                    }
+                ],
+                health={"cpu_percent": 15.0, "ram_percent": 42.0, "disk_percent": 30.0},
+            )
+            self.assertFalse(diag["healthy"])
+            self.assertIsNotNone(diag["top_hypothesis"])
+            self.assertEqual(diag["top_hypothesis"]["kind"], "service_failure")
+            self.assertEqual(diag["top_hypothesis"]["target"], "redis-cache.service")
+            self.assertEqual(diag["top_hypothesis"]["suggested_action"], "restart_service:redis-cache.service")
+
+            # 2) Feature 2: Smart Semantic Output Compressor
+            noisy_lines = (
+                [f"INFO boot step {i}" for i in range(25)]
+                + ["DEBUG heartbeat ok"] * 30
+                + [f"INFO routine worker tick {i}" for i in range(80)]
+                + ["ERROR: fatal database connection timeout on port 5432"]
+                + [f"INFO post tick {i}" for i in range(60)]
+                + [" Tail summary line"]
+            )
+            compressed = compress_tool_output("\n".join(noisy_lines), max_chars=1200)
+            self.assertLessEqual(len(compressed), 1200)
+            self.assertIn("[repeated 30x]", compressed)
+            self.assertIn("ERROR: fatal database connection timeout on port 5432", compressed)
+            self.assertIn("Tail summary line", compressed)
+
+            # 3) Feature 3: Knowledge Graph Contradiction Resolver & Dead-Ref Pruning
+            st.add_kg_edge("host", "runs_os", "Arch Linux old")
+            st.add_kg_edge("host", "runs_os", "Arch Linux rolling")
+            st.add_kg_edge("leak:dead_proc:9999999", "causes", "oom_risk_in_5m")
+            st.add_kg_edge("project:demo", "config_path", str(self.root / "nonexistent_ghost_file.yaml"))
+            kg_res = st.consolidate_knowledge_graph()
+            self.assertGreaterEqual(kg_res["contradictions_resolved"], 1)
+            self.assertGreaterEqual(kg_res["dead_refs_pruned"], 2)
+            host_edges = [e for e in st.query_kg("host") if e["relation"] == "runs_os"]
+            self.assertEqual(len(host_edges), 1)
+            self.assertEqual(host_edges[0]["object"], "Arch Linux rolling")
+
+            # 4) Feature 4: MCP Server Auto-Exposure for Next-Gen Engines
+            tool_names = {t["name"] for t in MCP_TOOLS}
+            for expected_mcp in (
+                "sysagent_digital_twin",
+                "sysagent_blast_radius",
+                "sysagent_dpo_audit",
+                "sysagent_inspect_self",
+            ):
+                self.assertIn(expected_mcp, tool_names)
+            mcp_blast = handle_mcp_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "tools/call",
+                    "params": {"name": "sysagent_blast_radius", "arguments": {"target": "execute_tool"}},
+                },
+                st,
+            )
+            assert mcp_blast is not None
+            blast_payload = json.loads(mcp_blast["result"]["content"][0]["text"])
+            self.assertEqual(blast_payload["target"], "execute_tool")
+            self.assertIn("agent.py", blast_payload["affected_modules"])
+
+            # 5) Feature 5: Live TUI (`sysagent top` & `learn_status_summary`) DPO, Twin, and Dual-Slot Telemetry
+            l_sum = learn_status_summary(st)
+            self.assertIn("dpo", l_sum)
+            self.assertIn("digital_twin", l_sum)
+            self.assertIn("aux_warm_model", l_sum["local_model"])
+            layout = build_dashboard(
+                {
+                    "online": True,
+                    "status": {
+                        "agent_name": "SysAgent",
+                        "model": "local-mind",
+                        "uptime_sec": 120,
+                        "health": {"cpu_percent": 12.0, "ram_percent": 40.0, "disk_percent": 50.0},
+                        "learn": l_sum,
+                    },
+                    "events": [],
+                    "snapshots": {},
+                }
+            )
+            self.assertIsNotNone(layout)
+
 
 if __name__ == "__main__":
     unittest.main()

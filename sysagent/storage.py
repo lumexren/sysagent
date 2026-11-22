@@ -1100,6 +1100,88 @@ class Storage(_BrainStorageMixin):
             "lessons_merged": lessons_merged,
         }
 
+    def consolidate_knowledge_graph(self, stale_days: int = 45) -> dict[str, int]:
+        """Resolve single-valued KG contradictions, prune dead PID/path edges, and decay stale transient edges."""
+        import psutil
+
+        singleton_relations = frozenset(
+            {
+                "runs_os",
+                "has_cpu",
+                "has_desktop",
+                "has_gpu",
+                "diagnosed_root_cause",
+                "active_branch",
+                "default_model",
+                "status",
+                "state",
+            }
+        )
+        contradictions_resolved = 0
+        dead_refs_pruned = 0
+        stale_decayed = 0
+
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, subject, relation, object, updated_at FROM kg_edges ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+
+            seen_singleton: set[tuple[str, str]] = set()
+            drop_ids: list[int] = []
+            for r in rows:
+                eid = int(r["id"])
+                subj = str(r["subject"] or "").strip()
+                rel = str(r["relation"] or "").strip()
+                obj = str(r["object"] or "").strip()
+
+                if (subj, rel) in seen_singleton:
+                    drop_ids.append(eid)
+                    contradictions_resolved += 1
+                    continue
+                if rel in singleton_relations:
+                    seen_singleton.add((subj, rel))
+
+                if subj.startswith("leak:"):
+                    parts = subj.split(":")
+                    if len(parts) >= 3 and parts[-1].isdigit():
+                        pid = int(parts[-1])
+                        if not psutil.pid_exists(pid):
+                            drop_ids.append(eid)
+                            dead_refs_pruned += 1
+                            continue
+
+                if (
+                    obj.startswith("/")
+                    and len(obj) > 4
+                    and "\n" not in obj
+                    and " " not in obj
+                    and not Path(obj).exists()
+                ):
+                    drop_ids.append(eid)
+                    dead_refs_pruned += 1
+                    continue
+
+            if drop_ids:
+                conn.executemany("DELETE FROM kg_edges WHERE id = ?", [(i,) for i in drop_ids])
+
+            cur = conn.execute(
+                """
+                DELETE FROM kg_edges
+                WHERE (subject LIKE 'anomaly:%' OR subject LIKE 'leak:%' OR relation = 'caused_alert')
+                  AND julianday('now', 'localtime') - julianday(updated_at) >= ?
+                """,
+                (float(stale_days),),
+            )
+            stale_decayed = max(0, int(cur.rowcount or 0))
+            if drop_ids or stale_decayed > 0:
+                self._fts_dirty = True
+
+        return {
+            "contradictions_resolved": contradictions_resolved,
+            "dead_refs_pruned": dead_refs_pruned,
+            "stale_decayed": stale_decayed,
+        }
+
 
     @staticmethod
     def _normalize_feedback_key(text: str) -> str:

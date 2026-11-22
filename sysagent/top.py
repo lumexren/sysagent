@@ -126,12 +126,20 @@ def build_dashboard(state: dict[str, Any]) -> Layout:
     brain_tbl.add_column(justify="right", style="bold")
     evolve_info = st.get("evolve") or {}
     cortex_info = st.get("cortex") or {}
+    learn_info = st.get("learn") or {}
+    lm_info = learn_info.get("local_model") or {}
+    dpo_info = learn_info.get("dpo") or {}
+    twin_info = learn_info.get("digital_twin") or {}
+    prim_slot = lm_info.get("warm_model") or "idle"
+    aux_slot = lm_info.get("aux_warm_model") or "idle"
+    dpo_pct = int(float(dpo_info.get("consistency_score", 1.0) or 1.0) * 100)
+    twin_lbl = "nominal" if twin_info.get("healthy", True) else f"{twin_info.get('leaks_count', 0)} leak!"
     brain_tbl.add_row("Brain Rules", str(st.get("brain_rules", 0)))
     brain_tbl.add_row("Memories / Lessons", f"{st.get('memories', 0)} / {st.get('lessons', 0)}")
     brain_tbl.add_row("Pending Questions", str(st.get("pending_brain_questions", 0)))
-    brain_tbl.add_row("Evolve Proposals", str(st.get("evolve_proposals", 0)))
-    brain_tbl.add_row("Evolve Mode", str(evolve_info.get("auto_apply", evolve_info.get("enabled", "-"))))
-    brain_tbl.add_row("Cortex Flow", str(cortex_info.get("mode", "normal")))
+    brain_tbl.add_row("Evolve Proposals", f"{st.get('evolve_proposals', 0)} (auto={evolve_info.get('auto_apply', '-')})")
+    brain_tbl.add_row("GGUF Slots", f"P:{str(prim_slot)[:10]} | A:{str(aux_slot)[:10]}")
+    brain_tbl.add_row("DPO / Twin / Flow", f"{dpo_pct}% | {twin_lbl} | {cortex_info.get('mode', 'normal')}")
 
     ev_tbl = Table(show_header=True, header_style="bold dim", box=None, expand=True)
     ev_tbl.add_column("Time", width=8, style="dim")

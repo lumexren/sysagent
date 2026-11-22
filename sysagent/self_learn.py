@@ -326,6 +326,15 @@ def learn_status_summary(storage: Storage) -> dict[str, Any]:
     for v in patch_outcomes(storage).values():
         outcome_counts[v] = outcome_counts.get(v, 0) + 1
     top = workflows[0] if workflows else None
+    try:
+        from .local_inference import get_runtime_memory_status
+
+        rt_mem = get_runtime_memory_status()
+    except Exception:
+        rt_mem = {}
+    cal_raw = _load_json_memory(storage, "_internal:self_calibration", {})
+    dpo_audit = (cal_raw.get("dpo_audit") if isinstance(cal_raw, dict) else None) or {}
+    twin_snap = analyze_causal_digital_twin(storage)
     return {
         "local_model": {
             "samples": lm.get("samples_trained", 0),
@@ -336,9 +345,20 @@ def learn_status_summary(storage: Storage) -> dict[str, Any]:
             "updated_at": lm.get("updated_at"),
             "uncertain_queue": lm.get("uncertain_queue_count", 0),
             "ensemble": bool(lm.get("ensemble_active")),
-            "warm_model": lm.get("warm_model"),
+            "warm_model": lm.get("warm_model") or rt_mem.get("warm_model"),
+            "aux_warm_model": rt_mem.get("aux_warm_model"),
+            "vram": rt_mem.get("vram", {}),
             "weakest_role": lm.get("weakest_role"),
             "specialist_roles": lm.get("specialist_roles", {}),
+        },
+        "dpo": {
+            "total_pairs": int(dpo_audit.get("total_pairs", 0) or 0),
+            "consistency_score": float(dpo_audit.get("consistency_score", 1.0) or 1.0),
+        },
+        "digital_twin": {
+            "healthy": bool(twin_snap.get("healthy", True)),
+            "leaks_count": len(twin_snap.get("memory_leaks") or []),
+            "snapshots_count": int(twin_snap.get("snapshots_count", 0) or 0),
         },
         "lessons": len(storage.list_lessons(limit=1000)),
         "style_prefs": sum(1 for m in memories if str(m.get("key", "")).startswith("style:")),
@@ -1642,7 +1662,13 @@ def heal_runtime_anomalies(storage: Storage, plugins: Any = None) -> dict[str, A
     if tuned_tools:
         _save_json_memory(storage, _RUNTIME_TUNING_KEY, tuning)
 
-    return {"quarantined": quarantined, "pruned_macros": pruned_macros, "tuned_tools": tuned_tools}
+    kg_cleanup = storage.consolidate_knowledge_graph()
+    return {
+        "quarantined": quarantined,
+        "pruned_macros": pruned_macros,
+        "tuned_tools": tuned_tools,
+        "kg_cleanup": kg_cleanup,
+    }
 
 
 def build_self_roadmap(storage: Storage) -> list[dict[str, Any]]:
@@ -1962,4 +1988,161 @@ def analyze_causal_digital_twin(
         "memory_leaks": leaks[:5],
         "causal_chains": causal_chains[:6],
         "healthy": len(leaks) == 0,
+    }
+
+
+def investigate_root_cause(
+    storage: Storage,
+    watcher: Any = None,
+    events: list[dict[str, Any]] | None = None,
+    health: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run a 0-token read-only diagnostic chain across Causal Digital Twin, processes, systemd units, and KG."""
+    raw_events = (
+        list(events)
+        if events is not None
+        else (watcher.get_events(limit=12) if watcher is not None and hasattr(watcher, "get_events") else [])
+    )
+    h_snap: dict[str, Any] = (
+        dict(health)
+        if isinstance(health, dict)
+        else (
+            watcher.get_health_snapshot()
+            if watcher is not None and hasattr(watcher, "get_health_snapshot")
+            else {}
+        )
+    )
+    if not h_snap:
+        try:
+            vm = psutil.virtual_memory()
+            du = psutil.disk_usage("/")
+            h_snap = {
+                "cpu_percent": round(psutil.cpu_percent(interval=None), 1),
+                "ram_percent": round(vm.percent, 1),
+                "disk_percent": round(du.percent, 1),
+            }
+        except Exception:
+            h_snap = {}
+
+    hypotheses: list[dict[str, Any]] = []
+    twin = analyze_causal_digital_twin(storage, watcher)
+    for lk in twin.get("memory_leaks") or []:
+        pid = int(lk.get("pid") or 0)
+        pname = str(lk.get("name") or "process")
+        slope = float(lk.get("slope_mb_per_min") or 0.0)
+        eta = lk.get("oom_eta_min")
+        conf = min(98, int(75 + min(20.0, slope / 2.0)))
+        hypotheses.append(
+            {
+                "kind": "memory_leak",
+                "target": f"{pname}:{pid}",
+                "confidence": conf,
+                "evidence": f"Process {pname} (PID {pid}) growing at +{slope} MB/min (OOM ETA ~{eta} min).",
+                "suggested_action": f"kill_leak:{pid}",
+            }
+        )
+
+    for ev in raw_events:
+        if not isinstance(ev, dict):
+            continue
+        cat = str(ev.get("category") or "").lower()
+        msg = str(ev.get("message") or "")
+        sev = str(ev.get("severity") or "info").lower()
+        if cat == "systemd" or "service" in msg.lower() or "failed" in msg.lower():
+            m_unit = re.search(r"([a-zA-Z0-9_.@-]+\.service)", msg)
+            unit_name = m_unit.group(1) if m_unit else ""
+            if unit_name:
+                tail_err = msg[:160]
+                if shutil.which("journalctl"):
+                    try:
+                        proc = subprocess.run(
+                            ["journalctl", "-u", unit_name, "-n", "12", "--no-pager"],
+                            capture_output=True,
+                            text=True,
+                            timeout=2.0,
+                        )
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            err_lines = [
+                                ln.strip()
+                                for ln in proc.stdout.splitlines()
+                                if any(k in ln.lower() for k in ("error", "fail", "fatal", "exception", "exit"))
+                            ]
+                            if err_lines:
+                                tail_err = err_lines[-1][:180]
+                    except Exception:
+                        pass
+                hypotheses.append(
+                    {
+                        "kind": "service_failure",
+                        "target": unit_name,
+                        "confidence": 90 if sev == "critical" else 82,
+                        "evidence": f"Service `{unit_name}` reported anomaly: {tail_err}",
+                        "suggested_action": f"restart_service:{unit_name}",
+                    }
+                )
+
+    cpu_pct = float(h_snap.get("cpu_percent") or 0.0)
+    ram_pct = float(h_snap.get("ram_percent") or 0.0)
+    if (cpu_pct >= 85.0 or ram_pct >= 85.0) and not any(h["kind"] == "memory_leak" for h in hypotheses):
+        top_hog: dict[str, Any] | None = None
+        try:
+            procs: list[dict[str, Any]] = []
+            for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
+                procs.append(dict(p.info))
+            sort_k = "memory_percent" if ram_pct >= cpu_pct else "cpu_percent"
+            procs.sort(key=lambda r: float(r.get(sort_k) or 0.0), reverse=True)
+            if procs:
+                top_hog = procs[0]
+        except Exception:
+            top_hog = None
+        if top_hog and int(top_hog.get("pid") or 0) > 0:
+            h_pid = int(top_hog["pid"])
+            h_name = str(top_hog.get("name") or "process")
+            hypotheses.append(
+                {
+                    "kind": "resource_hog",
+                    "target": f"{h_name}:{h_pid}",
+                    "confidence": 80,
+                    "evidence": (
+                        f"Host load high (CPU {cpu_pct}%, RAM {ram_pct}%); top consumer is "
+                        f"{h_name} (PID {h_pid}, CPU={top_hog.get('cpu_percent')}%, MEM={round(float(top_hog.get('memory_percent') or 0.0), 1)}%)."
+                    ),
+                    "suggested_action": f"inspect_pid:{h_pid}",
+                }
+            )
+
+    for ch in twin.get("causal_chains") or []:
+        rc = str(ch.get("root_cause") or "")
+        if rc and not rc.startswith("memory_leak:"):
+            hypotheses.append(
+                {
+                    "kind": "recent_mutation_regression",
+                    "target": rc,
+                    "confidence": 78,
+                    "evidence": f"Causal timeline correlated recent action `{ ch.get('chain') }` ({ch.get('rate')}).",
+                    "suggested_action": str(ch.get("remediation") or f"Review `{rc}`"),
+                }
+            )
+
+    hypotheses.sort(key=lambda h: int(h.get("confidence") or 0), reverse=True)
+    top_h = hypotheses[0] if hypotheses else None
+    if top_h is not None:
+        try:
+            storage.add_kg_edge(
+                f"anomaly:{top_h['kind']}",
+                "diagnosed_root_cause",
+                str(top_h["target"]),
+            )
+        except Exception:
+            pass
+    summary = (
+        f"[{top_h['kind']} | {top_h['confidence']}%] {top_h['evidence']} -> {top_h['suggested_action']}"
+        if top_h
+        else "No active root-cause anomaly detected; system telemetry nominal."
+    )
+    return {
+        "healthy": len(hypotheses) == 0,
+        "top_hypothesis": top_h,
+        "hypotheses": hypotheses[:5],
+        "summary": summary,
     }

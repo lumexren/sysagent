@@ -198,10 +198,14 @@ class CognitiveBrain:
         except Exception:
             pass
         causal_links: list[dict[str, str]] = []
+        root_cause_report: dict[str, Any] = {}
         try:
-            from .self_learn import build_causal_timeline
+            from .self_learn import build_causal_timeline, investigate_root_cause
 
             causal_links = build_causal_timeline(self.storage, self.watcher)
+            root_cause_report = investigate_root_cause(
+                self.storage, self.watcher, events=notable, health=health
+            )
         except Exception:
             pass
 
@@ -216,6 +220,7 @@ class CognitiveBrain:
                 "world_forecast": world_forecast,
                 "associative_context": assoc_ctx,
                 "causal_links": causal_links,
+                "root_cause_diagnosis": root_cause_report,
             },
             ensure_ascii=False,
         )

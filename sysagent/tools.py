@@ -46,6 +46,77 @@ def _resolve(path_str: str) -> Path:
     return Path(path_str).expanduser().resolve()
 
 
+_IMPORTANT_LOG_TOKENS = (
+    "error",
+    "exception",
+    "traceback",
+    "failed",
+    "fatal",
+    "critical",
+    "panic",
+    "denied",
+    "warning",
+    "sigsegv",
+    "oom",
+)
+
+
+def compress_tool_output(text: str, max_chars: int = 4000) -> str:
+    """Fold consecutive duplicate lines and preserve head, high-signal error lines, and tail within budget."""
+    raw = text or ""
+    if not raw:
+        return ""
+    lines = raw.splitlines()
+    folded: list[str] = []
+    idx = 0
+    n = len(lines)
+    while idx < n:
+        cur = lines[idx]
+        run_len = 1
+        while idx + run_len < n and lines[idx + run_len].strip() == cur.strip() and cur.strip():
+            run_len += 1
+        if run_len >= 3:
+            folded.append(f"{cur}  [repeated {run_len}x]")
+        else:
+            for k in range(run_len):
+                folded.append(lines[idx + k])
+        idx += run_len
+
+    joined = "\n".join(folded)
+    if len(joined) <= max_chars:
+        return joined
+
+    if len(folded) <= 36:
+        half = max(200, (max_chars - 60) // 2)
+        omitted_c = len(joined) - (half * 2)
+        return f"{joined[:half]}\n... [{omitted_c} chars compressed] ...\n{joined[-half:]}"
+
+    head = folded[:12]
+    tail = folded[-18:]
+    mid = folded[12:-18]
+    important: list[str] = []
+    seen_imp: set[str] = set()
+    for ln in mid:
+        low = ln.lower()
+        if "[repeated " in low or any(tok in low for tok in _IMPORTANT_LOG_TOKENS):
+            norm = ln.strip()[:160]
+            if norm not in seen_imp:
+                seen_imp.add(norm)
+                important.append(ln[:260])
+                if len(important) >= 18:
+                    break
+
+    omitted_lines = max(0, len(mid) - len(important))
+    marker = f"... [{omitted_lines} routine lines compressed; {len(important)} high-signal lines retained] ..."
+    parts = [*head, marker, *important, *tail]
+    out = "\n".join(parts)
+    if len(out) > max_chars:
+        head_budget = min(1100, max_chars // 3)
+        tail_budget = max(500, max_chars - head_budget - 80)
+        out = f"{out[:head_budget]}\n... [compressed to fit {max_chars} chars] ...\n{out[-tail_budget:]}"
+    return out
+
+
 def execute_tool(
     name: str,
     arguments: dict[str, Any],
@@ -99,8 +170,8 @@ def execute_tool(
             return json.dumps(
                 {
                     "exit_code": proc.returncode,
-                    "stdout": proc.stdout[-4000:],
-                    "stderr": proc.stderr[-2000:],
+                    "stdout": compress_tool_output(proc.stdout, max_chars=4000),
+                    "stderr": compress_tool_output(proc.stderr, max_chars=2000),
                 },
                 ensure_ascii=False,
             )
@@ -375,7 +446,11 @@ def execute_tool(
                 cmd.extend(["-u", str(arguments["unit"])])
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             return json.dumps(
-                {"exit_code": proc.returncode, "logs": proc.stdout[-5000:], "stderr": proc.stderr[-1000:]},
+                {
+                    "exit_code": proc.returncode,
+                    "logs": compress_tool_output(proc.stdout, max_chars=5000),
+                    "stderr": compress_tool_output(proc.stderr, max_chars=1000),
+                },
                 ensure_ascii=False,
             )
 
