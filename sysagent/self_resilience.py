@@ -27,9 +27,15 @@ _PACKAGE_DIR = Path(__file__).resolve().parent
 class CircuitBreakerRegistry:
     """Thread-safe circuit breaker (closed -> open -> half_open) for tools, plugins, and models."""
 
-    def __init__(self, failure_threshold: int = 3, cooldown_sec: float = 300.0) -> None:
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        cooldown_sec: float = 300.0,
+        probe_timeout_sec: float = 120.0,
+    ) -> None:
         self.failure_threshold = max(1, int(failure_threshold))
         self.cooldown_sec = max(1.0, float(cooldown_sec))
+        self.probe_timeout_sec = max(1.0, float(probe_timeout_sec))
         self._lock = threading.RLock()
         self._entries: dict[str, dict[str, Any]] = {}
 
@@ -44,13 +50,24 @@ class CircuitBreakerRegistry:
                 if now >= float(entry["opened_until"]):
                     entry["state"] = "half_open"
                     entry["probe_in_flight"] = True
+                    entry["probe_started_at"] = now
                     return True
                 return False
-            # Allow one probe at a time in half_open state.
-            if entry["state"] == "half_open" and not entry.get("probe_in_flight"):
+            if entry["state"] == "half_open" and (
+                not entry.get("probe_in_flight")
+                or (now - float(entry.get("probe_started_at") or 0.0) >= self.probe_timeout_sec)
+            ):
                 entry["probe_in_flight"] = True
+                entry["probe_started_at"] = now
                 return True
             return False
+
+    def release_probe(self, key: str) -> None:
+        """Release an in-flight half-open probe lock when a call aborts without a breaker verdict."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry and entry.get("state") == "half_open":
+                entry["probe_in_flight"] = False
 
     def is_open(self, key: str) -> bool:
         """Return True when `key` is actively cooling down in the open state."""
@@ -163,14 +180,20 @@ def evaluate_self_gate(mind: Any, storage: Storage | None = None) -> dict[str, A
     for case in GOLDEN_EVAL_CASES:
         kind = case["kind"]
         if kind == "route":
-            pred, _, score = mind.predict_tool(case["prompt"])
+            try:
+                pred, _, score = mind.predict_tool(case["prompt"], record_uncertain=False)
+            except TypeError:
+                pred, _, score = mind.predict_tool(case["prompt"])
             ok = pred == case["expected_tool"] and float(score) > 0.15
             if ok:
                 passed += 1
             else:
                 failures.append({"kind": kind, "prompt": case["prompt"], "expected": case["expected_tool"], "got": pred})
         elif kind == "chat":
-            pred, _, score = mind.predict_tool(case["prompt"])
+            try:
+                pred, _, score = mind.predict_tool(case["prompt"], record_uncertain=False)
+            except TypeError:
+                pred, _, score = mind.predict_tool(case["prompt"])
             ok = pred is None or float(score) < tool_thresh
             if ok:
                 passed += 1
@@ -269,8 +292,10 @@ def build_recovery_hint(
         rc = 1
         try:
             parsed = json.loads(raw_result)
-            if isinstance(parsed, dict) and parsed.get("returncode") is not None:
-                rc = int(parsed["returncode"])
+            if isinstance(parsed, dict):
+                raw_rc = parsed.get("exit_code") if parsed.get("exit_code") is not None else parsed.get("returncode")
+                if raw_rc is not None:
+                    rc = int(raw_rc)
         except Exception:
             pass
         hit = match_cached_fix(storage, cmd, rc)
@@ -282,13 +307,16 @@ def build_recovery_hint(
         if arguments.get(k):
             q_parts.append(str(arguments[k])[:60])
     try:
-        hits = storage.search_knowledge(" ".join(q_parts), limit=2)
+        hits = storage.search_knowledge(" ".join(q_parts), limit=5)
     except Exception:
         return None
     for h in hits:
+        title = str(h.get("title") or "")
+        if title.startswith("_internal:"):
+            continue
         detail = str(h.get("detail") or "").strip()
         if detail and h.get("type") in {"lesson", "memory"}:
-            return f"[Self-Recovery Hint] {h.get('title', tool_name)}: {detail[:200]}"
+            return f"[Self-Recovery Hint] {title or tool_name}: {detail[:200]}"
     return None
 
 
@@ -327,11 +355,14 @@ class ContextBudgeter:
             summary_parts.append("Prior requests: " + " | ".join(goals))
         if paths:
             summary_parts.append("Files referenced: " + ", ".join(paths[:8]))
-        summary_msg = {"role": "assistant", "content": " ; ".join(summary_parts)[:600]}
+        summary_msg = {"role": "system", "content": " ; ".join(summary_parts)[:600]}
 
         compacted = [summary_msg, *recent]
-        while len(compacted) > 2 and sum(len(str(t.get("content") or "")) for t in compacted) > max_chars:
-            compacted.pop(1)
+        while len(compacted) > 3 and sum(len(str(t.get("content") or "")) for t in compacted) > max_chars:
+            if len(compacted) >= 4 and compacted[1].get("role") == "user" and compacted[2].get("role") == "assistant":
+                del compacted[1:3]
+            else:
+                compacted.pop(1)
         return compacted
 
     @staticmethod
@@ -441,16 +472,27 @@ def get_quota_governor() -> QuotaGovernor:
 
 def record_boot_module_hashes(pkg_dir: Path | None = None) -> dict[str, str]:
     """Snapshot SHA-256 hashes of loaded Python modules at daemon startup for drift detection."""
-    target = pkg_dir or _PACKAGE_DIR
+    target = (pkg_dir or _PACKAGE_DIR).resolve()
     hashes: dict[str, str] = {}
     for pyf in sorted(target.glob("*.py")):
         try:
-            hashes[pyf.name] = hashlib.sha256(pyf.read_bytes()).hexdigest()[:16]
+            hashes[str(pyf.resolve())] = hashlib.sha256(pyf.read_bytes()).hexdigest()[:16]
         except Exception:
             pass
-    _BOOT_MODULE_HASHES.clear()
     _BOOT_MODULE_HASHES.update(hashes)
     return dict(hashes)
+
+
+def refresh_boot_module_hash(path: Path) -> None:
+    """Update the in-memory module hash baseline after an intentional hot-reload."""
+    if not _BOOT_MODULE_HASHES:
+        return
+    try:
+        resolved = path.resolve()
+        if resolved.is_file():
+            _BOOT_MODULE_HASHES[str(resolved)] = hashlib.sha256(resolved.read_bytes()).hexdigest()[:16]
+    except Exception:
+        pass
 
 
 def run_integrity_and_drift_audit(
@@ -459,7 +501,7 @@ def run_integrity_and_drift_audit(
     repo_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Verify package syntax, stale daemon modules vs disk, SQLite quick_check + WAL size, and git drift."""
-    target = pkg_dir or _PACKAGE_DIR
+    target = (pkg_dir or _PACKAGE_DIR).resolve()
     root_dir = repo_dir or target.parent
     stale_modules: list[str] = []
     syntax_errors: list[dict[str, str]] = []
@@ -468,7 +510,7 @@ def run_integrity_and_drift_audit(
         try:
             raw_bytes = pyf.read_bytes()
             cur_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
-            boot_h = _BOOT_MODULE_HASHES.get(pyf.name)
+            boot_h = _BOOT_MODULE_HASHES.get(str(pyf.resolve()))
             if boot_h and cur_hash != boot_h:
                 stale_modules.append(pyf.name)
             compile(raw_bytes.decode("utf-8", errors="replace"), str(pyf), "exec")

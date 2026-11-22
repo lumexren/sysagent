@@ -291,3 +291,15 @@ class NotificationCenter:
 
         threading.Thread(target=_worker, daemon=True).start()
         return handle
+
+    def get_status(self) -> dict[str, Any]:
+        """Return notification delivery, suppression, and dedup counters plus recent history."""
+        with self._lock:
+            items = list(self._history)
+        return {
+            "total": len(items),
+            "sent": sum(1 for x in items if x.get("outcome") in {"sent", "action"}),
+            "suppressed": sum(1 for x in items if str(x.get("outcome", "")).startswith("suppressed")),
+            "deduped": sum(1 for x in items if x.get("outcome") == "suppressed:dedup"),
+            "recent": items[-5:],
+        }

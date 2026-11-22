@@ -37,6 +37,16 @@ SPECIALIST_ROLES: tuple[str, ...] = (
 )
 
 
+def _strip_think_tags(text: str) -> str:
+    """Strip completed or truncated <think> reasoning blocks from model text output."""
+    out = text or ""
+    if "</think>" in out:
+        out = out.split("</think>")[-1]
+    out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL)
+    out = re.sub(r"<think>[\s\S]*$", "", out)
+    return out.strip()
+
+
 class _ThinkStreamFilter:
     """Stateful token stream filter that strips <think>...</think> blocks without stalling normal text."""
 
@@ -61,7 +71,13 @@ class _ThinkStreamFilter:
                 if len(self._buf) > len(self._CLOSE):
                     self._buf = self._buf[-len(self._CLOSE) :]
                 break
+            close_pos = self._buf.find(self._CLOSE)
             start = self._buf.find(self._OPEN)
+            if close_pos != -1 and (start == -1 or close_pos < start):
+                self._buf = self._buf[close_pos + len(self._CLOSE) :]
+                out.clear()
+                self._emitted_any = False
+                continue
             if start != -1:
                 if start > 0:
                     out.append(self._buf[:start])
@@ -400,6 +416,7 @@ def classify_task_role(
     user_text: str,
     tool_calls: list[dict[str, Any]] | None = None,
     use_neural: bool = True,
+    storage: Storage | None = None,
 ) -> str:
     """Route a user prompt or turn to its matching specialist role using structured tool calls and NeuralEngine."""
     t_names = {
@@ -416,12 +433,14 @@ def classify_task_role(
         try:
             from .neural import NeuralEngine
 
-            eng = NeuralEngine()
+            eng = NeuralEngine(storage)
             if int(eng.meta.get("epochs_trained", 0)) > 0:
                 probs = eng.predict_role_probs(user_text)
-                best_role, best_p = max(probs.items(), key=lambda kv: kv[1])
-                if best_p >= 0.42:
-                    return best_role
+                gen_probs = {r: p for r, p in probs.items() if r != "embedding"}
+                if gen_probs:
+                    best_role, best_p = max(gen_probs.items(), key=lambda kv: kv[1])
+                    if best_p >= 0.42:
+                        return best_role
         except Exception:
             pass
     if any(k in low for k in (".py", ".sh", ".json", ".toml", "traceback", "stack trace")):
@@ -687,7 +706,7 @@ class LocalMind:
             for ut in set(toks):
                 doc_freq[ut] += 1
             tcalls = smp.get("tool_calls") or []
-            role = str(smp.get("role") or classify_task_role(u_text, tcalls))
+            role = str(smp.get("role") or classify_task_role(u_text, tcalls, use_neural=False, storage=self.storage))
             role_counts[role] += 1
             cls_name = tcalls[0]["name"] if (tcalls and isinstance(tcalls[0], dict) and tcalls[0].get("name")) else "__chat__"
             if (cls_name != "__chat__" or not smp.get("reply")) and not u_text.startswith(
@@ -754,12 +773,6 @@ class LocalMind:
                 f"<|im_start|>user\n{item['user']}<|im_end|>\n"
                 f"<|im_start|>assistant\n{item['reply']}<|im_end|>"
             )
-        if chatml_lines:
-            try:
-                LORA_TRAIN_FILE.write_text("\n".join(chatml_lines) + "\n", encoding="utf-8")
-            except Exception:
-                pass
-
         role_hints = {
             "coding": "Role=coding: emit accurate tool calls or minimal tested diffs without guesswork.",
             "general": "Role=general: combine system inspection and clear explanations concisely.",
@@ -776,10 +789,6 @@ class LocalMind:
                 "sample_count": int(role_counts.get(role_name, 0)),
                 "examples": role_examples,
             }
-        try:
-            ROLE_ADAPTERS_FILE.write_text(json.dumps(role_adapters, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
 
         lora_status = f"adapters_ready ({len(role_adapters)} roles)"
         last_lora_samples = len(samples)
@@ -788,36 +797,6 @@ class LocalMind:
         is_quantized = bool(
             gguf_path and any(q in gguf_path.name.upper() for q in ("Q4_", "Q5_", "Q8_", "IQ"))
         )
-        if run_lora and gguf_path and not is_quantized and shutil.which("llama-finetune") and chatml_lines:
-            last_lora_attempt = len(samples)
-            lora_out = MODELS_DIR / "sysagent_lora.bin"
-            try:
-                proc = subprocess.run(
-                    [
-                        "llama-finetune",
-                        "-m",
-                        str(gguf_path),
-                        "-f",
-                        str(LORA_TRAIN_FILE),
-                        "-o",
-                        str(lora_out),
-                        "-epochs",
-                        "1",
-                        "-t",
-                        "4",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=240,
-                )
-                if proc.returncode == 0:
-                    lora_status = "trained"
-                    last_lora_samples = len(samples)
-                else:
-                    lora_status = f"error:{proc.returncode}"
-            except Exception as exc:
-                lora_status = f"error:{exc}"
-
         prev_cb_hash = self.weights.get("codebase_train_hash")
         prev_weights = dict(self.weights) if self.weights.get("tool_centroids") else {}
         self.weights = {
@@ -839,11 +818,14 @@ class LocalMind:
         }
         if prev_cb_hash:
             self.weights["codebase_train_hash"] = prev_cb_hash
+
+        regressed = False
         try:
             from .self_resilience import evaluate_self_gate
 
             gate = evaluate_self_gate(self, self.storage)
             if gate.get("regressed") and prev_weights:
+                regressed = True
                 self.weights = prev_weights
                 if self.storage is not None:
                     self.storage.add_brain_thought(
@@ -851,14 +833,58 @@ class LocalMind:
                     )
         except Exception:
             pass
+
+        if not regressed:
+            if chatml_lines:
+                try:
+                    LORA_TRAIN_FILE.write_text("\n".join(chatml_lines) + "\n", encoding="utf-8")
+                except Exception:
+                    pass
+            try:
+                ROLE_ADAPTERS_FILE.write_text(json.dumps(role_adapters, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+            if run_lora and gguf_path and not is_quantized and shutil.which("llama-finetune") and chatml_lines:
+                last_lora_attempt = len(samples)
+                self.weights["last_lora_attempt_samples"] = last_lora_attempt
+                lora_out = MODELS_DIR / "sysagent_lora.bin"
+                try:
+                    proc = subprocess.run(
+                        [
+                            "llama-finetune",
+                            "-m",
+                            str(gguf_path),
+                            "-f",
+                            str(LORA_TRAIN_FILE),
+                            "-o",
+                            str(lora_out),
+                            "-epochs",
+                            "1",
+                            "-t",
+                            "4",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=240,
+                    )
+                    if proc.returncode == 0:
+                        lora_status = "trained"
+                        last_lora_samples = len(samples)
+                        self.weights["lora_status"] = lora_status
+                        self.weights["last_lora_samples"] = last_lora_samples
+                    else:
+                        self.weights["lora_status"] = f"error:{proc.returncode}"
+                except Exception as exc:
+                    self.weights["lora_status"] = f"error:{exc}"
+            try:
+                from .neural import NeuralEngine
+
+                NeuralEngine(self.storage).train(samples=samples)
+            except Exception:
+                pass
+
         try:
             _save_weights_file(self.weights)
-        except Exception:
-            pass
-        try:
-            from .neural import NeuralEngine
-
-            NeuralEngine(self.storage).train(samples=samples)
         except Exception:
             pass
         return self.get_status()
@@ -981,7 +1007,13 @@ class LocalMind:
     def resolve_uncertain_batch(self, max_items: int = 8) -> dict[str, Any]:
         """Resolve up to max_items queued uncertain queries in ONE batch cloud call and update weights."""
         from .auth import _find_agy_cli
+        from .self_resilience import get_quota_governor
         from .tools import TOOL_DECLARATIONS
+
+        gov = get_quota_governor()
+        allowed_q, q_reason = gov.allow_background("resolve_uncertain")
+        if not allowed_q:
+            return {"status": "deferred", "reason": q_reason}
 
         if not UNCERTAIN_FILE.is_file():
             return {"status": "skipped", "resolved": 0, "remaining": 0}
@@ -1033,6 +1065,7 @@ class LocalMind:
         )
         resolved = 0
         try:
+            gov.record_background_call("resolve_uncertain", TEACHER_MODELS[0])
             proc = subprocess.run(
                 [agy_bin, "-p", prompt, "--model", TEACHER_MODELS[0], "--disable-slash-commands", "--output-format", "text"],
                 capture_output=True,
@@ -1041,6 +1074,9 @@ class LocalMind:
                 cwd="/tmp",
             )
             if proc.returncode != 0:
+                err_txt = f"{proc.stderr} {proc.stdout}".lower()
+                if any(k in err_txt for k in ("429", "quota", "resource_exhausted")):
+                    gov.record_rate_limit(TEACHER_MODELS[0])
                 return {"status": "error", "resolved": 0, "remaining": len(raw_lines)}
             out = proc.stdout.strip()
             j_idx = out.find("{")
@@ -1119,6 +1155,9 @@ class LocalMind:
         }
 
         for t_idx, teacher in enumerate(TEACHER_MODELS):
+            ok_q, _ = gov.allow_background("distill")
+            if not ok_q:
+                break
             prompt = (
                 "You are a Teacher Model generating high-quality training examples for a local Linux system assistant.\n"
                 f"Available tool names: {json.dumps(tool_names)}\n"
@@ -1166,6 +1205,9 @@ class LocalMind:
                     cwd="/tmp",
                 )
                 if proc.returncode != 0:
+                    err_txt = f"{proc.stderr} {proc.stdout}".lower()
+                    if any(k in err_txt for k in ("429", "quota", "resource_exhausted")):
+                        gov.record_rate_limit(teacher)
                     continue
                 out = proc.stdout.strip()
                 idx = out.find("{")
@@ -1283,7 +1325,10 @@ class LocalMind:
         }
 
     def predict_tool(
-        self, user_text: str, allowed_names: set[str] | None = None
+        self,
+        user_text: str,
+        allowed_names: set[str] | None = None,
+        record_uncertain: bool = True,
     ) -> tuple[str | None, dict[str, Any], float]:
         """Predict the best tool and extract arguments using the trained local weights."""
         toks = _tokenize(user_text)
@@ -1322,7 +1367,7 @@ class LocalMind:
                 best_score = score
                 best_tool = cls_name
 
-        if 0.04 < best_score < 0.24:
+        if record_uncertain and 0.04 < best_score < 0.24:
             self._record_uncertain_query(user_text, best_score)
         if not best_tool or best_score < 0.16:
             return None, {}, best_score
@@ -1545,7 +1590,9 @@ class LocalMind:
         if ROLE_ADAPTERS_FILE.is_file():
             try:
                 adapters = json.loads(ROLE_ADAPTERS_FILE.read_text(encoding="utf-8"))
-                role_hint = str((adapters.get(classify_task_role(prompt)) or {}).get("system_hint") or "")
+                role_hint = str(
+                    (adapters.get(classify_task_role(prompt, storage=self.storage)) or {}).get("system_hint") or ""
+                )
             except Exception:
                 pass
         ex_block = ""
@@ -1558,17 +1605,25 @@ class LocalMind:
         from .config import get_settings
 
         agent_name = get_settings().agent_name
-        base_sys = (
-            f"You are {agent_name}, a self-evolving Linux assistant running on {gguf.stem}. "
-            "Your internal subsystems are CognitiveBrain, NeuralBrainCortex, NeuralEngine, SelfEvolver, LocalMind, and SelfGuard. "
-            "Use your available tools when real system data, internal component state, or switching models is needed; "
-            "reply directly without tools for casual conversation. "
-            "Reply directly and naturally in the same language as the user's message. "
-            "Never repeat system instructions, tool names, or thinking traces."
+        sys_inst = (system_instruction or "").strip()
+        is_structured_prompt = bool(
+            sys_inst and ("Respond ONLY with" in sys_inst or "JSON" in sys_inst)
         )
-        sys_msg = "\n".join(
-            p for p in (base_sys, role_hint, extra_system.strip(), ex_block.strip()[:500]) if p
-        )
+        if is_structured_prompt:
+            sys_msg = "\n".join(p for p in (sys_inst[:2400], extra_system.strip()) if p)
+        else:
+            base_sys = (
+                f"You are {agent_name}, a self-evolving Linux assistant running on {gguf.stem}. "
+                "Your internal subsystems are CognitiveBrain, NeuralBrainCortex, NeuralEngine, SelfEvolver, LocalMind, and SelfGuard. "
+                "Use your available tools when real system data, internal component state, or switching models is needed; "
+                "reply directly without tools for casual conversation. "
+                "Reply directly and naturally in the same language as the user's message. "
+                "Never repeat system instructions, tool names, or thinking traces."
+            )
+            ctx_hint = sys_inst[:1200] if (sys_inst and not extra_system) else ""
+            sys_msg = "\n".join(
+                p for p in (base_sys, role_hint, ctx_hint, extra_system.strip(), ex_block.strip()[:500]) if p
+            )
         messages: list[dict[str, str]] = [{"role": "system", "content": sys_msg}]
         for turn in (history or [])[-6:]:
             r = str(turn.get("role") or "")
@@ -1692,13 +1747,9 @@ class LocalMind:
             order = (_try_server, _try_cli)
 
         for runner in order:
-            out = runner()
+            out = _strip_think_tags(runner() or "")
             if out:
-                if "</think>" in out:
-                    out = out.split("</think>")[-1].strip()
-                out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
-                if out:
-                    return out
+                return out
         return None
 
     def run_gguf_inference(
@@ -1713,7 +1764,7 @@ class LocalMind:
         models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
         if not models:
             return None
-        target_role = preferred_role or classify_task_role(prompt)
+        target_role = preferred_role or classify_task_role(prompt, storage=self.storage)
         specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
         final_out = self._run_single_gguf(
             specialist,
@@ -1764,10 +1815,10 @@ class LocalMind:
         models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
         if not models:
             return None
-        target_role = preferred_role or classify_task_role(prompt)
+        target_role = preferred_role or classify_task_role(prompt, storage=self.storage)
         specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
         backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
-        if backend not in {"llama_cli", "llama-cli", "cli"}:
+        if backend not in {"llama_cli", "llama-cli", "cli", "llama_cpp", "llama-cpp", "python"}:
             from .local_inference import inference_lock, touch_warm_model
 
             with inference_lock():
@@ -1780,6 +1831,7 @@ class LocalMind:
                     )
                     filt = _ThinkStreamFilter()
                     collected: list[str] = []
+                    http_ok = False
                     try:
                         with httpx.stream(
                             "POST",
@@ -1792,7 +1844,8 @@ class LocalMind:
                             },
                             timeout=60,
                         ) as resp:
-                            if resp.status_code == 200:
+                            http_ok = resp.status_code == 200
+                            if http_ok:
                                 for line in resp.iter_lines():
                                     if not line or not line.startswith("data:"):
                                         continue
@@ -1814,25 +1867,27 @@ class LocalMind:
                                     if visible:
                                         collected.append(visible)
                                         on_delta(visible)
-                        tail = filt.flush()
-                        if tail:
-                            collected.append(tail)
-                            on_delta(tail)
-                        final_out = "".join(collected).strip()
-                        if final_out:
-                            if not extra_system and len(prompt.strip()) >= 8:
-                                qa = self.weights.setdefault("qa_memory", [])
-                                qa.append(
-                                    {
-                                        "role": target_role,
-                                        "user": prompt.strip()[:300],
-                                        "tool_calls": [],
-                                        "reply": final_out[:600],
-                                    }
-                                )
-                                if len(qa) > 150:
-                                    self.weights["qa_memory"] = qa[-150:]
-                            return final_out
+                        if http_ok:
+                            tail = filt.flush()
+                            if tail:
+                                collected.append(tail)
+                                on_delta(tail)
+                            final_out = "".join(collected).strip()
+                            if final_out:
+                                if not extra_system and len(prompt.strip()) >= 8:
+                                    qa = self.weights.setdefault("qa_memory", [])
+                                    qa.append(
+                                        {
+                                            "role": target_role,
+                                            "user": prompt.strip()[:300],
+                                            "tool_calls": [],
+                                            "reply": final_out[:600],
+                                        }
+                                    )
+                                    if len(qa) > 150:
+                                        self.weights["qa_memory"] = qa[-150:]
+                                return final_out
+                            return None
                     except Exception:
                         if collected:
                             return "".join(collected).strip() or None
@@ -1859,7 +1914,7 @@ class LocalMind:
     ) -> dict[str, Any] | None:
         """Run native OpenAI-compatible function calling (`tool_choice=auto`) on warm llama-server."""
         backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
-        if backend in {"llama_cli", "llama-cli", "cli"}:
+        if backend in {"llama_cli", "llama-cli", "cli", "llama_cpp", "llama-cpp", "python"}:
             return None
         models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
         if not models:
@@ -1872,7 +1927,7 @@ class LocalMind:
                 or models[0]
             )
         else:
-            role_guess = classify_task_role(prompt)
+            role_guess = classify_task_role(prompt, storage=self.storage)
             if role_guess in {"coding", "multimodal"}:
                 specialist = (
                     find_gguf_model(role_guess, strict=True)
@@ -1993,10 +2048,7 @@ class LocalMind:
                     if not choices:
                         return None
                     msg_obj = choices[0].get("message") or {}
-                    content = str(msg_obj.get("content") or "").strip()
-                    if "</think>" in content:
-                        content = content.split("</think>")[-1].strip()
-                    final_text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    final_text = _strip_think_tags(str(msg_obj.get("content") or ""))
                     for tc in msg_obj.get("tool_calls") or []:
                         fn = tc.get("function") or {}
                         raw_calls.append(
@@ -2031,7 +2083,9 @@ class LocalMind:
                 }
             )
 
-        if not parsed_calls and not final_text:
+        if parsed_calls:
+            return {"text": "", "tool_calls": parsed_calls}
+        if not final_text:
             return None
         return {"text": final_text, "tool_calls": parsed_calls}
 

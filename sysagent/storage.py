@@ -740,9 +740,12 @@ class Storage(_BrainStorageMixin):
                 try:
                     if self._fts_dirty:
                         conn.execute("DELETE FROM knowledge_fts")
+                        now_iso = _now_iso()
                         conn.execute(
                             "INSERT INTO knowledge_fts(source_type, source_id, title, body) "
-                            "SELECT 'memory', key, key, value FROM memories"
+                            "SELECT 'memory', key, key, value FROM memories "
+                            "WHERE key NOT LIKE '_internal:%' AND (expires_at IS NULL OR expires_at > ?)",
+                            (now_iso,),
                         )
                         conn.execute(
                             "INSERT INTO knowledge_fts(source_type, source_id, title, body) "
@@ -787,10 +790,11 @@ class Storage(_BrainStorageMixin):
                     pass
 
             like_pat = f"%{q_clean}%"
+            now_iso = _now_iso()
             results: list[dict[str, Any]] = []
             for r in conn.execute(
-                "SELECT key, value FROM memories WHERE key LIKE ? OR value LIKE ? LIMIT ?",
-                (like_pat, like_pat, limit),
+                "SELECT key, value FROM memories WHERE key NOT LIKE '_internal:%' AND (expires_at IS NULL OR expires_at > ?) AND (key LIKE ? OR value LIKE ?) LIMIT ?",
+                (now_iso, like_pat, like_pat, limit),
             ).fetchall():
                 results.append({"type": "memory", "id": r["key"], "title": r["key"], "detail": r["value"]})
             for r in conn.execute(

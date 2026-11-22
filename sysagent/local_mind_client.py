@@ -57,10 +57,17 @@ class _LocalMindInteractions:
                 pass
         try:
             pred_name, _, pred_score = self.mind.predict_tool(
-                user_text, allowed_names=set(scores)
+                user_text, allowed_names=set(scores), record_uncertain=False
             )
             if pred_name and pred_name in scores:
                 scores[pred_name] += float(pred_score) * 8.0
+        except TypeError:
+            try:
+                pred_name, _, pred_score = self.mind.predict_tool(user_text, allowed_names=set(scores))
+                if pred_name and pred_name in scores:
+                    scores[pred_name] += float(pred_score) * 8.0
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -271,12 +278,6 @@ class _LocalMindInteractions:
 
             def _guarded_delta(chunk: str) -> None:
                 if stream_mode[0] == "suppress":
-                    return
-                if allowed and "{" in chunk:
-                    before = chunk.split("{", 1)[0]
-                    if stream_mode[0] == "live" and before:
-                        on_delta(before)
-                    stream_mode[0] = "suppress"
                     return
                 if stream_mode[0] == "pending":
                     stripped = chunk.lstrip()

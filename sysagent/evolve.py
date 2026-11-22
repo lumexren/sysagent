@@ -316,6 +316,7 @@ class SelfEvolver:
             env["PYTHONPATH"] = str(staging_root)
             env["SYSAGENT_BRAIN_ENABLED"] = "false"
             env["SYSAGENT_EVOLVE_ENABLED"] = "false"
+            env["SYSAGENT_TESTING"] = "1"
             proc = subprocess.run(
                 [sys.executable, "-c", test_script],
                 capture_output=True,
@@ -742,32 +743,56 @@ class SelfEvolver:
             await _log(f"[fail] {blast_msg}")
             return {"status": "skipped", "reason": "blast_radius_exceeded", "file": target_file.name}
 
-        companion_files: dict[str, str] = {}
-        readme_companion: tuple[str, str] | None = None
-        for comp in parsed.get("companion_edits") or []:
-            if not isinstance(comp, dict):
-                continue
-            cname = str(comp.get("file") or "")
-            if cname == "README.md":
-                readme_p = PACKAGE_DIR.parent / "README.md"
-                if readme_p.is_file():
-                    r_orig = readme_p.read_text(encoding="utf-8")
-                    r_new = _apply_patch_text(r_orig, comp.get("target"), comp.get("replacement"))
-                    if r_new and r_new != r_orig:
-                        readme_companion = (r_orig, r_new)
-            elif cname in codebase and cname != target_file.name:
-                c_new = _apply_patch_text(codebase[cname], comp.get("target"), comp.get("replacement"))
-                if c_new and c_new != codebase[cname]:
-                    companion_files[cname] = c_new
+        def _extract_companions(
+            src_parsed: dict[str, Any],
+        ) -> tuple[dict[str, str], tuple[str, str] | None]:
+            c_files: dict[str, str] = {}
+            r_pair: tuple[str, str] | None = None
+            for comp in src_parsed.get("companion_edits") or []:
+                if not isinstance(comp, dict):
+                    continue
+                cname = str(comp.get("file") or "")
+                if cname == "README.md":
+                    readme_p = PACKAGE_DIR.parent / "README.md"
+                    if readme_p.is_file():
+                        r_orig = readme_p.read_text(encoding="utf-8")
+                        r_new = _apply_patch_text(r_orig, comp.get("target"), comp.get("replacement"))
+                        if r_new and r_new != r_orig:
+                            r_pair = (r_orig, r_new)
+                elif cname in codebase and cname != target_file.name:
+                    c_new = _apply_patch_text(codebase[cname], comp.get("target"), comp.get("replacement"))
+                    if c_new and c_new != codebase[cname]:
+                        c_ok, _ = self._check_blast_radius(cname, codebase[cname], c_new)
+                        if c_ok:
+                            c_files[cname] = c_new
+            return c_files, r_pair
 
-        diff_text = "".join(
-            difflib.unified_diff(
-                original_content.splitlines(keepends=True),
-                new_content.splitlines(keepends=True),
-                fromfile=f"a/{target_file.name}",
-                tofile=f"b/{target_file.name}",
-            )
-        )
+        def _build_combined_diff(cand_content: str, c_files: dict[str, str]) -> str:
+            parts = [
+                "".join(
+                    difflib.unified_diff(
+                        original_content.splitlines(keepends=True),
+                        cand_content.splitlines(keepends=True),
+                        fromfile=f"a/{target_file.name}",
+                        tofile=f"b/{target_file.name}",
+                    )
+                )
+            ]
+            for cname, c_src in c_files.items():
+                parts.append(
+                    "".join(
+                        difflib.unified_diff(
+                            codebase[cname].splitlines(keepends=True),
+                            c_src.splitlines(keepends=True),
+                            fromfile=f"a/{cname}",
+                            tofile=f"b/{cname}",
+                        )
+                    )
+                )
+            return "".join(parts)
+
+        companion_files, readme_companion = _extract_companions(parsed)
+        diff_text = _build_combined_diff(new_content, companion_files)
 
         await _log(f"[2/5] Proposed {decision} in {target_file.name}: {title}")
         if emit_event:
@@ -804,19 +829,19 @@ class SelfEvolver:
                 rep_parsed.get("end_line"),
             )
             if rep_content and rep_content != original_content:
-                new_content = rep_content
-                test_code = rep_parsed.get("test_code") or test_code
-                diff_text = "".join(
-                    difflib.unified_diff(
-                        original_content.splitlines(keepends=True),
-                        new_content.splitlines(keepends=True),
-                        fromfile=f"a/{target_file.name}",
-                        tofile=f"b/{target_file.name}",
+                rep_ok, _ = self._check_blast_radius(target_file.name, original_content, rep_content)
+                if rep_ok:
+                    if rep_parsed.get("companion_edits") is not None:
+                        companion_files, readme_companion = _extract_companions(rep_parsed)
+                    new_content = rep_content
+                    parsed = rep_parsed or parsed
+                    title = str(rep_parsed.get("title") or title)
+                    reason = str(rep_parsed.get("reason") or reason)
+                    test_code = rep_parsed.get("test_code") or test_code
+                    diff_text = _build_combined_diff(new_content, companion_files)
+                    passed, test_out = await asyncio.to_thread(
+                        self._run_staging_tests, target_file.name, new_content, test_code, companion_files
                     )
-                )
-                passed, test_out = await asyncio.to_thread(
-                    self._run_staging_tests, target_file.name, new_content, test_code
-                )
         if not passed:
             await _log("[fail] Staging tests failed.")
             if emit_event and test_out:
@@ -862,25 +887,27 @@ class SelfEvolver:
                 rev_parsed.get("end_line"),
             )
             if rev_content and rev_content != original_content:
-                rev_diff = "".join(
-                    difflib.unified_diff(
-                        original_content.splitlines(keepends=True),
-                        rev_content.splitlines(keepends=True),
-                        fromfile=f"a/{target_file.name}",
-                        tofile=f"b/{target_file.name}",
+                rev_ok, _ = self._check_blast_radius(target_file.name, original_content, rev_content)
+                if rev_ok:
+                    rev_companions, rev_readme = (
+                        _extract_companions(rev_parsed)
+                        if rev_parsed.get("companion_edits") is not None
+                        else (companion_files, readme_companion)
                     )
-                )
-                rev_test_code = rev_parsed.get("test_code") or test_code
-                rev_passed, _ = await asyncio.to_thread(
-                    self._run_staging_tests, target_file.name, rev_content, rev_test_code
-                )
-                if rev_passed:
-                    new_content = rev_content
-                    diff_text = rev_diff
-                    test_code = rev_test_code
-                    title = str(rev_parsed.get("title") or title)
-                    reason = str(rev_parsed.get("reason") or reason)
-                    critic_ok, critique = await self._run_critic(title, reason, diff_text)
+                    rev_diff = _build_combined_diff(rev_content, rev_companions)
+                    rev_test_code = rev_parsed.get("test_code") or test_code
+                    rev_passed, _ = await asyncio.to_thread(
+                        self._run_staging_tests, target_file.name, rev_content, rev_test_code, rev_companions
+                    )
+                    if rev_passed:
+                        new_content = rev_content
+                        companion_files = rev_companions
+                        readme_companion = rev_readme
+                        diff_text = rev_diff
+                        test_code = rev_test_code
+                        title = str(rev_parsed.get("title") or title)
+                        reason = str(rev_parsed.get("reason") or reason)
+                        critic_ok, critique = await self._run_critic(title, reason, diff_text)
         if not critic_ok:
             await _log(f"[reject] Critic rejected: {critique}")
             self._inspected_hashes[target_file.name] = file_hashes[target_file.name]
@@ -926,12 +953,19 @@ class SelfEvolver:
                 except Exception:
                     pass
                 return {"status": "rolled_back", "proposal_id": pid}
+            from .self_resilience import refresh_boot_module_hash
+
             self._inspected_hashes[target_file.name] = hashlib.sha256(
                 new_content.encode("utf-8")
             ).hexdigest()
             hot_ok = _hot_reload_module(target_file.name)
+            refresh_boot_module_hash(target_file)
             for cname in companion_files:
+                self._inspected_hashes[cname] = hashlib.sha256(
+                    companion_files[cname].encode("utf-8")
+                ).hexdigest()
                 _hot_reload_module(cname)
+                refresh_boot_module_hash(PACKAGE_DIR / cname)
             ab_info = self._last_ab_benchmark
             if ab_info and ab_info.get("file") == target_file.name:
                 self.storage.add_lesson(
@@ -1054,10 +1088,15 @@ class SelfEvolver:
             return False
         self.storage.update_evolve_status(proposal_id, "applied")
         _hot_reload_module(path.name)
+        from .self_resilience import refresh_boot_module_hash
+
+        refresh_boot_module_hash(path)
         return True
 
     def rollback_last_evolve(self, proposal_id: int | None = None) -> bool:
         """Auto-rollback latest audit backup (or full multi-file batch), or surgically revert an older commit."""
+        from .self_resilience import refresh_boot_module_hash
+
         if proposal_id is not None:
             batch_items = self.storage.get_undoable_batch(f"evolve:{proposal_id}")
             if batch_items:
@@ -1068,6 +1107,7 @@ class SelfEvolver:
                     self.storage.mark_undone(it["id"])
                     if t.suffix == ".py":
                         _hot_reload_module(t.name)
+                        refresh_boot_module_hash(t)
                 self.storage.update_evolve_status(proposal_id, "rolled_back")
                 self.storage.add_brain_thought(
                     "act", 100, f"Auto-rolled back evolve batch #{proposal_id} ({len(batch_items)} files)"
@@ -1084,6 +1124,7 @@ class SelfEvolver:
                         "act", 100, f"Surgical git rollback for evolve #{proposal_id} ({prop_file})"
                     )
                     _hot_reload_module(prop_file)
+                    refresh_boot_module_hash(PACKAGE_DIR / prop_file)
                     return True
                 return False
         if not item:
@@ -1094,6 +1135,7 @@ class SelfEvolver:
         self.storage.mark_undone(item["id"])
         if target.suffix == ".py":
             _hot_reload_module(target.name)
+            refresh_boot_module_hash(target)
         if proposal_id is not None:
             self.storage.update_evolve_status(proposal_id, "rolled_back")
         self.storage.add_brain_thought("act", 100, f"Auto-rolled back evolve on {target.name}")
@@ -1110,6 +1152,11 @@ class SelfEvolver:
                 return {"status": "deferred", "reason": f"cortex_flow:{flow.get('mode', 'focus')}"}
         if time.monotonic() < self._cooldown_until:
             return {"status": "skipped", "reason": "quota_cooldown"}
+        from .self_resilience import get_quota_governor
+
+        allowed_q, q_reason = get_quota_governor().allow_background("evolve_prompts")
+        if not allowed_q:
+            return {"status": "deferred", "reason": q_reason}
         if not self.agent.auth.is_configured:
             return {"status": "skipped", "reason": "missing_credentials"}
         async with self._evolve_lock:

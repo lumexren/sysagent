@@ -130,12 +130,40 @@ class SelfGuard:
         self.last_eval: dict[str, Any] | None = None
         self.last_drift: dict[str, Any] | None = None
 
+    @staticmethod
+    def _is_pid_alive(pid: int) -> bool:
+        """Return True when a positive OS PID currently exists."""
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def _read_marker_pid(self) -> int | None:
+        """Extract the PID stored inside the daemon running marker file."""
+        try:
+            data = json.loads(self.marker_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("pid") is not None:
+                return int(data["pid"])
+        except Exception:
+            pass
+        return None
+
     def on_startup(self) -> dict[str, Any]:
         """Run crash autopsy if the previous daemon run exited uncleanly, then write the boot marker."""
         from .self_resilience import record_boot_module_hashes
 
         record_boot_module_hashes()
-        crashed = self.marker_file.is_file()
+        crashed = False
+        if self.marker_file.is_file():
+            prev_pid = self._read_marker_pid()
+            if prev_pid is not None and prev_pid != os.getpid() and self._is_pid_alive(prev_pid):
+                return {"crashed": False, "live_owner_pid": prev_pid}
+            crashed = True
         autopsy = self.run_crash_autopsy() if crashed else {"crashed": False}
         self.marker_file.parent.mkdir(parents=True, exist_ok=True)
         self.marker_file.write_text(
@@ -145,10 +173,14 @@ class SelfGuard:
         return autopsy
 
     def mark_clean_shutdown(self) -> None:
-        """Remove the running marker on graceful shutdown."""
-        self.marker_file.unlink(missing_ok=True)
+        """Remove the running marker on graceful shutdown unless another live process owns it."""
+        if not self.marker_file.is_file():
+            return
+        owner_pid = self._read_marker_pid()
+        if owner_pid is None or owner_pid == os.getpid() or not self._is_pid_alive(owner_pid):
+            self.marker_file.unlink(missing_ok=True)
 
-    def run_crash_autopsy(self, journal_text: str | None = None) -> dict[str, Any]:
+    def run_crash_autopsy(self, journal_text: str | None = None, record: bool = True) -> dict[str, Any]:
         """Inspect recent daemon logs after an unclean shutdown and auto-rollback faulty evolve patches."""
         raw_log = journal_text
         if raw_log is None:
@@ -170,7 +202,7 @@ class SelfGuard:
                 break
 
         rolled_back = False
-        if self.evolver is not None and sig in {"SyntaxError", "ImportError", "NameError", "UnboundLocalError"}:
+        if record and self.evolver is not None and sig in {"SyntaxError", "ImportError", "NameError", "UnboundLocalError"}:
             try:
                 props = self.storage.list_evolve_proposals(limit=3)
                 latest_applied = next((p for p in props if p.get("status") == "applied"), None)
@@ -183,27 +215,29 @@ class SelfGuard:
                 rolled_back = False
 
         summary = f"Crash autopsy detected {sig} (auto_rollback={rolled_back})."
-        self.storage.add_brain_thought("warn", 95, summary)
-        try:
-            self.storage.add_lesson("self_autopsy", summary, "runtime")
-        except Exception:
-            pass
+        if record:
+            self.storage.add_brain_thought("warn", 95, summary)
+            try:
+                self.storage.add_lesson("self_autopsy", summary, "runtime")
+            except Exception:
+                pass
 
         result = {
-            "crashed": True,
+            "crashed": True if record else sig != "unclean_shutdown",
             "signature": sig,
             "rolled_back": rolled_back,
             "summary": summary,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
-        self.last_autopsy = result
-        if self.watcher is not None and hasattr(self.watcher, "_send_desktop_notification"):
-            self.watcher._send_desktop_notification(
-                f"{self.settings.agent_name} — Crash Autopsy",
-                summary,
-                urgency="normal",
-                category="health",
-            )
+        if record:
+            self.last_autopsy = result
+            if self.watcher is not None and hasattr(self.watcher, "_send_desktop_notification"):
+                self.watcher._send_desktop_notification(
+                    f"{self.settings.agent_name} — Crash Autopsy",
+                    summary,
+                    urgency="normal",
+                    category="health",
+                )
         return result
 
     def calibrate_thresholds(self) -> dict[str, Any]:

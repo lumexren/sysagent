@@ -367,6 +367,9 @@ class AgentManager:
             out = await self._create_safe(client, kwargs)
             cb.record_success(f"model:{model}")
             return out
+        except asyncio.CancelledError:
+            cb.release_probe(f"model:{model}")
+            raise
         except Exception as exc:
             msg = str(exc).lower()
             is_quota = any(k in msg for k in ("429", "resource_exhausted", "quota", "403", "billing"))
@@ -384,12 +387,13 @@ class AgentManager:
                 )
             ) or isinstance(exc, (OSError, TimeoutError, asyncio.TimeoutError))
             if not is_quota_or_net:
+                cb.release_probe(f"model:{model}")
                 raise
             if is_quota:
                 gov.record_rate_limit(model)
             if "circuit open" not in msg:
                 cb.record_failure(f"model:{model}", str(exc)[:120])
-            if self.auth.rotate_key():
+            if "circuit open" not in msg and self.auth.rotate_key():
                 try:
                     client = self._get_client()
                     self.storage.record_model_request(model)
@@ -398,17 +402,22 @@ class AgentManager:
                     return out
                 except Exception:
                     pass
-            if model != self.settings.light_model and cb.allow(f"model:{self.settings.light_model}"):
-                try:
-                    fallback = self.settings.light_model
-                    self._session_models[session_id] = fallback
-                    kwargs["model"] = fallback
-                    self.storage.record_model_request(fallback)
-                    out = await self._create_safe(client, kwargs)
-                    cb.record_success(f"model:{fallback}")
-                    return out
-                except Exception as fb_exc:
-                    cb.record_failure(f"model:{self.settings.light_model}", str(fb_exc)[:120])
+            if model != self.settings.light_model:
+                fallback = self.settings.light_model
+                if cb.allow(f"model:{fallback}"):
+                    try:
+                        fb_kwargs = dict(kwargs)
+                        fb_kwargs["model"] = fallback
+                        self.storage.record_model_request(fallback)
+                        out = await self._create_safe(client, fb_kwargs)
+                        cb.record_success(f"model:{fallback}")
+                        self._session_models[session_id] = fallback
+                        return out
+                    except asyncio.CancelledError:
+                        cb.release_probe(f"model:{fallback}")
+                        raise
+                    except Exception as fb_exc:
+                        cb.record_failure(f"model:{fallback}", str(fb_exc)[:120])
             local_client = getattr(self, "_local_client", None)
             if local_client is None:
                 from .local_mind import LocalMindClient
@@ -597,43 +606,6 @@ class AgentManager:
         if prev_id:
             kwargs["previous_interaction_id"] = prev_id
 
-        loop = asyncio.get_running_loop()
-        live_streamed = False
-        delta_q: asyncio.Queue[str | None] = asyncio.Queue()
-
-        async def _drain_deltas() -> None:
-            while True:
-                item = await delta_q.get()
-                try:
-                    if item is None:
-                        return
-                    await _emit({"type": "text_delta", "text": item})
-                finally:
-                    delta_q.task_done()
-
-        delta_consumer: asyncio.Task[None] | None = (
-            asyncio.create_task(_drain_deltas()) if interactive else None
-        )
-
-        def _local_on_delta(chunk: str) -> None:
-            nonlocal live_streamed
-            if chunk:
-                live_streamed = True
-                loop.call_soon_threadsafe(delta_q.put_nowait, chunk)
-
-        async def _flush_deltas() -> None:
-            if delta_consumer is not None:
-                await delta_q.join()
-
-        if interactive:
-            kwargs["on_delta"] = _local_on_delta
-
-        await _emit({"type": "status", "message": "analyzing request..."})
-        interaction = await self._call_model_with_failover(session_id, **kwargs)
-        selected_model = self._session_models.get(session_id, selected_model)
-        self.sessions[session_id] = interaction.id
-        self.storage.upsert_session(session_id, interaction.id)
-
         async def _run_single_tool(call: Any) -> dict[str, Any]:
             nonlocal had_failure
             import traceback
@@ -818,12 +790,17 @@ class AgentManager:
                             batch_id,
                         )
                         elapsed_ms = (time.monotonic() - t0) * 1000.0
-                        is_err = isinstance(result_payload, str) and '"error":' in result_payload
+                        parsed_res: Any = None
+                        if isinstance(result_payload, str) and result_payload.lstrip().startswith("{"):
+                            try:
+                                parsed_res = json.loads(result_payload)
+                            except Exception:
+                                parsed_res = None
+                        is_err = isinstance(parsed_res, dict) and bool(parsed_res.get("error"))
                         cmd_nonzero = (
                             call.name == "run_command"
-                            and isinstance(result_payload, str)
-                            and '"returncode":' in result_payload
-                            and '"returncode": 0' not in result_payload
+                            and isinstance(parsed_res, dict)
+                            and parsed_res.get("exit_code") not in (None, 0)
                         )
                         if is_err:
                             cb.record_failure(f"tool:{call.name}", str(result_payload)[:120])
@@ -887,6 +864,7 @@ class AgentManager:
                     )
             except Exception as exc:
                 had_failure = True
+                get_circuit_breaker().record_failure(f"tool:{call.name}", str(exc)[:120])
                 tb_lines = traceback.format_exc().strip().splitlines()
                 loc_hint = next((ln.strip() for ln in reversed(tb_lines) if ln.strip().startswith("File ")), "")
                 self.storage.record_tool_metric(call.name, 0.0, True)
@@ -941,215 +919,286 @@ class AgentManager:
                         return True
             return False
 
-        nudge_count = 0
-        step_count = 0
-        max_steps = 80
-        read_nudged = False
-        dyn_cues = self.storage.get_learned_cues()
-        stall_cues = dyn_cues.get("stall_reply") or []
-        action_req_cues = dyn_cues.get("action_req") or []
-        user_low = user_message.lower()
-        user_wants_action = bool(action_req_cues and any(c in user_low for c in action_req_cues))
-        while True:
-            function_calls = [
-                step for step in (interaction.steps or []) if step.type == "function_call"
-            ]
-            if function_calls and step_count >= max_steps:
-                text = (
-                    f"Completed {step_count} tool steps (step limit {max_steps} reached). "
-                    f"Executed tools: {', '.join(str(tc.get('name')) for tc in recorded_tool_calls[-8:])}."
-                )
-                self.storage.add_message(session_id, "assistant", text)
-                await _emit({"type": "assistant_message", "text": text})
-                return text
+        loop = asyncio.get_running_loop()
+        live_streamed = False
+        turn_closed = False
+        delta_q: asyncio.Queue[str | None] = asyncio.Queue()
 
-            if function_calls and step_count >= 12 and not read_nudged and not _is_real_mutation(recorded_tool_calls):
-                read_nudged = True
-                await _emit({"type": "status", "message": "reminding model to start applying edits..."})
-
-            if not function_calls:
-                text = interaction.output_text or "(No response generated.)"
-                low_txt = text.lower()
-                leaked_tool_json = "__tool_calls__" in low_txt or '"tool_calls"' in low_txt
-                has_mutated = _is_real_mutation(recorded_tool_calls)
-                read_only_stalled = (
-                    not has_mutated
-                    and user_wants_action
-                    and len(recorded_tool_calls) >= 1
-                )
-                neural_stall = False
+        async def _drain_deltas() -> None:
+            while True:
+                item = await delta_q.get()
                 try:
-                    from .neural import NeuralEngine
+                    if item is None:
+                        return
+                    await _emit({"type": "text_delta", "text": item})
+                finally:
+                    delta_q.task_done()
 
-                    neural_stall = NeuralEngine(self.storage).score_reply_stall(text) >= 0.72
-                except Exception:
+        delta_consumer: asyncio.Task[None] | None = (
+            asyncio.create_task(_drain_deltas()) if interactive else None
+        )
+
+        def _enqueue_delta(chunk_text: str) -> None:
+            if not turn_closed:
+                delta_q.put_nowait(chunk_text)
+
+        def _local_on_delta(chunk: str) -> None:
+            nonlocal live_streamed
+            if chunk and not turn_closed:
+                live_streamed = True
+                try:
+                    loop.call_soon_threadsafe(_enqueue_delta, chunk)
+                except RuntimeError:
                     pass
-                broken_py_err = ""
-                if has_mutated and nudge_count < 3:
-                    from pathlib import Path as _Path
 
-                    for tc in reversed(recorded_tool_calls):
-                        if tc.get("name") in {"write_file", "edit_file"}:
-                            fp_str = str((tc.get("arguments") or {}).get("path") or "")
-                            if fp_str.endswith(".py"):
-                                fp = _Path(fp_str).expanduser()
-                                if fp.is_file():
-                                    try:
-                                        compile(fp.read_text(encoding="utf-8", errors="replace"), str(fp), "exec")
-                                    except SyntaxError as exc:
-                                        broken_py_err = f"{fp.name}: {exc}"
-                                        break
-                should_nudge = (
-                    nudge_count < 3
-                    and (
-                        leaked_tool_json
-                        or read_only_stalled
-                        or neural_stall
-                        or bool(broken_py_err)
-                        or any(cue in low_txt for cue in stall_cues)
-                    )
-                )
-                if should_nudge:
-                    nudge_count += 1
-                    if leaked_tool_json:
-                        nudge_msg = (
-                            "[System]: Your previous reply contained raw `__tool_calls__` JSON instead of valid function calls. "
-                            "Emit ONLY clean, valid tool calls right now."
-                        )
-                    elif broken_py_err:
-                        nudge_msg = (
-                            f"[System]: SyntaxError detected in modified file ({broken_py_err}). "
-                            "Fix this syntax error right now before finishing."
-                        )
-                    else:
-                        nudge_msg = (
-                            "[System]: Do NOT stop halfway to announce, check, or ask to continue. "
-                            "Invoke the required edit_file / write_file / run_command / inspection tool calls RIGHT NOW, "
-                            "and only send your final plain-text answer after the work and verification are completely done."
-                        )
-                    await _emit({"type": "status", "message": f"continuing task (nudge {nudge_count})..."})
-                    live_streamed = False
-                    interaction = await self._call_model_with_failover(
-                        session_id,
-                        model=selected_model,
-                        input=nudge_msg,
-                        previous_interaction_id=interaction.id,
-                        tools=pruned_tools,
-                        system_instruction=system_instruction,
-                    )
-                    selected_model = self._session_models.get(session_id, selected_model)
-                    self.sessions[session_id] = interaction.id
-                    self.storage.upsert_session(session_id, interaction.id)
-                    continue
-                self.storage.add_message(session_id, "assistant", text)
-                if not had_failure:
-                    PromptRegistry(self.storage).record_outcome("agent_main", True)
-                    if not text.startswith("[Local Offline Mode]"):
-                        from .local_mind import LocalMind
+        async def _flush_deltas() -> None:
+            if delta_consumer is not None and not delta_consumer.done():
+                await delta_q.join()
 
-                        LocalMind(self.storage).record_and_learn(
-                            user_message, recorded_tool_calls, text
-                        )
-                        _FAST_PATH_READONLY = {
-                            "system_status", "list_processes", "list_systemd_units", "list_directory",
-                            "read_file", "search_files", "list_memories", "list_automations",
-                            "list_audit_log", "get_app_usage", "read_journal",
-                        }
-                        if (
-                            len(recorded_tool_calls) == 1
-                            and recorded_tool_calls[0].get("name") in _FAST_PATH_READONLY
-                        ):
-                            try:
-                                from .neural import NeuralEngine
+        async def _close_deltas() -> None:
+            await _flush_deltas()
+            if delta_consumer is not None and not delta_consumer.done():
+                delta_q.put_nowait(None)
+                await delta_consumer
 
-                                NeuralEngine(self.storage).record_safe_plan(
-                                    user_message,
-                                    str(recorded_tool_calls[0]["name"]),
-                                    dict(recorded_tool_calls[0].get("arguments") or {}),
-                                )
-                            except Exception:
-                                pass
-                await _flush_deltas()
-                if delta_consumer is not None and not delta_consumer.done():
-                    delta_q.put_nowait(None)
-                    await delta_consumer
-                if interactive and text and not live_streamed:
-                    chunk_size = 64
-                    for idx in range(0, len(text), chunk_size):
-                        await _emit({"type": "text_delta", "text": text[idx : idx + chunk_size]})
-                await _emit({"type": "assistant_message", "text": text})
-                prev_turn = self._last_turn_info.get(session_id)
-                self._last_turn_info[session_id] = (user_message, recorded_tool_calls)
-                if not session_id.startswith(("brain-", "auto-", "inspect-")):
-                    bg_task = asyncio.create_task(
-                        self._post_turn_learn(
-                            session_id,
-                            user_message,
-                            text,
-                            recorded_tool_calls,
-                            had_failure,
-                            prev_turn,
-                        )
-                    )
-                    self._bg_learning_tasks.add(bg_task)
-                    bg_task.add_done_callback(self._bg_learning_tasks.discard)
-                return text
+        try:
+            if interactive:
+                kwargs["on_delta"] = _local_on_delta
 
-            step_count += 1
-            all_parallel_safe = len(function_calls) > 1 and all(
-                c.name in SAFE_TOOLS
-                and not assess_tool_call(
-                    c.name,
-                    dict(c.arguments or {}),
-                    mode=self.settings.approval_mode,
-                    plugin_safe=(self.plugins.is_safe(c.name) if self.plugins else None),
-                ).requires_approval
-                for c in function_calls
-            )
-            if all_parallel_safe:
-                function_results = list(
-                    await asyncio.gather(*(_run_single_tool(c) for c in function_calls))
-                )
-            else:
-                function_results = []
-                for call in function_calls:
-                    function_results.append(await _run_single_tool(call))
-
-            if len(function_calls) == 1 and function_calls[0].name == "switch_model":
-                try:
-                    sw = json.loads(str(function_results[0].get("result") or "{}"))
-                except Exception:
-                    sw = {}
-                if sw.get("status") == "ok":
-                    if delta_consumer is not None and not delta_consumer.done():
-                        delta_q.put_nowait(None)
-                        await delta_consumer
-                    m_name = str(sw.get("model") or "auto")
-                    loc_code = (locale or self.settings.locale or "en").lower()
-                    reply = (
-                        f"Aktif model {m_name} olarak değiştirildi."
-                        if loc_code.startswith("tr")
-                        else f"Active model switched to {m_name}."
-                    )
-                    self.storage.add_message(session_id, "assistant", reply)
-                    await _emit({"type": "assistant_message", "text": reply})
-                    return reply
-
-            switched_in_step = any(c.name == "switch_model" for c in function_calls)
-            if switched_in_step:
-                selected_model = self._session_models.get(session_id, selected_model)
-            await _emit({"type": "status", "message": f"step {step_count}: processing tool results..."})
-            live_streamed = False
-            next_kwargs: dict[str, Any] = {
-                "model": selected_model,
-                "input": function_results,
-                "tools": pruned_tools,
-                "system_instruction": system_instruction,
-                "on_delta": (_local_on_delta if interactive else None),
-            }
-            if not switched_in_step:
-                next_kwargs["previous_interaction_id"] = interaction.id
-            interaction = await self._call_model_with_failover(session_id, **next_kwargs)
+            await _emit({"type": "status", "message": "analyzing request..."})
+            interaction = await self._call_model_with_failover(session_id, **kwargs)
             selected_model = self._session_models.get(session_id, selected_model)
             self.sessions[session_id] = interaction.id
             self.storage.upsert_session(session_id, interaction.id)
+
+            nudge_count = 0
+            step_count = 0
+            max_steps = 80
+            read_nudged = False
+            dyn_cues = self.storage.get_learned_cues()
+            stall_cues = dyn_cues.get("stall_reply") or []
+            action_req_cues = dyn_cues.get("action_req") or []
+            user_low = user_message.lower()
+            user_wants_action = bool(action_req_cues and any(c in user_low for c in action_req_cues))
+            while True:
+                function_calls = [
+                    step for step in (interaction.steps or []) if step.type == "function_call"
+                ]
+                if function_calls and step_count >= max_steps:
+                    text = (
+                        f"Completed {step_count} tool steps (step limit {max_steps} reached). "
+                        f"Executed tools: {', '.join(str(tc.get('name')) for tc in recorded_tool_calls[-8:])}."
+                    )
+                    self.storage.add_message(session_id, "assistant", text)
+                    await _close_deltas()
+                    await _emit({"type": "assistant_message", "text": text})
+                    return text
+
+                if function_calls and step_count >= 12 and not read_nudged and not _is_real_mutation(recorded_tool_calls):
+                    read_nudged = True
+                    await _emit({"type": "status", "message": "reminding model to start applying edits..."})
+
+                if not function_calls:
+                    text = interaction.output_text or "(No response generated.)"
+                    low_txt = text.lower()
+                    leaked_tool_json = "__tool_calls__" in low_txt or '"tool_calls"' in low_txt
+                    has_mutated = _is_real_mutation(recorded_tool_calls)
+                    read_only_stalled = (
+                        not has_mutated
+                        and user_wants_action
+                        and len(recorded_tool_calls) >= 1
+                    )
+                    neural_stall = False
+                    try:
+                        from .neural import NeuralEngine
+
+                        neural_stall = NeuralEngine(self.storage).score_reply_stall(text) >= 0.72
+                    except Exception:
+                        pass
+                    broken_py_err = ""
+                    if has_mutated and nudge_count < 3:
+                        from pathlib import Path as _Path
+
+                        for tc in reversed(recorded_tool_calls):
+                            if tc.get("name") in {"write_file", "edit_file"}:
+                                fp_str = str((tc.get("arguments") or {}).get("path") or "")
+                                if fp_str.endswith(".py"):
+                                    fp = _Path(fp_str).expanduser()
+                                    if fp.is_file():
+                                        try:
+                                            compile(fp.read_text(encoding="utf-8", errors="replace"), str(fp), "exec")
+                                        except SyntaxError as exc:
+                                            broken_py_err = f"{fp.name}: {exc}"
+                                            break
+                    should_nudge = (
+                        nudge_count < 3
+                        and (
+                            leaked_tool_json
+                            or read_only_stalled
+                            or neural_stall
+                            or bool(broken_py_err)
+                            or any(cue in low_txt for cue in stall_cues)
+                        )
+                    )
+                    if should_nudge:
+                        nudge_count += 1
+                        if leaked_tool_json:
+                            nudge_msg = (
+                                "[System]: Your previous reply contained raw `__tool_calls__` JSON instead of valid function calls. "
+                                "Emit ONLY clean, valid tool calls right now."
+                            )
+                        elif broken_py_err:
+                            nudge_msg = (
+                                f"[System]: SyntaxError detected in modified file ({broken_py_err}). "
+                                "Fix this syntax error right now before finishing."
+                            )
+                        else:
+                            nudge_msg = (
+                                "[System]: Do NOT stop halfway to announce, check, or ask to continue. "
+                                "Invoke the required edit_file / write_file / run_command / inspection tool calls RIGHT NOW, "
+                                "and only send your final plain-text answer after the work and verification are completely done."
+                            )
+                        await _emit({"type": "status", "message": f"continuing task (nudge {nudge_count})..."})
+                        live_streamed = False
+                        interaction = await self._call_model_with_failover(
+                            session_id,
+                            model=selected_model,
+                            input=nudge_msg,
+                            previous_interaction_id=interaction.id,
+                            tools=pruned_tools,
+                            system_instruction=system_instruction,
+                        )
+                        selected_model = self._session_models.get(session_id, selected_model)
+                        self.sessions[session_id] = interaction.id
+                        self.storage.upsert_session(session_id, interaction.id)
+                        continue
+                    self.storage.add_message(session_id, "assistant", text)
+                    if not had_failure:
+                        PromptRegistry(self.storage).record_outcome("agent_main", True)
+                        if not text.startswith("[Local Offline Mode]"):
+                            from .local_mind import LocalMind
+
+                            LocalMind(self.storage).record_and_learn(
+                                user_message, recorded_tool_calls, text
+                            )
+                            _FAST_PATH_READONLY = {
+                                "system_status", "list_processes", "list_systemd_units", "list_directory",
+                                "read_file", "search_files", "list_memories", "list_automations",
+                                "list_audit_log", "get_app_usage", "read_journal",
+                            }
+                            if (
+                                len(recorded_tool_calls) == 1
+                                and recorded_tool_calls[0].get("name") in _FAST_PATH_READONLY
+                            ):
+                                try:
+                                    from .neural import NeuralEngine
+
+                                    NeuralEngine(self.storage).record_safe_plan(
+                                        user_message,
+                                        str(recorded_tool_calls[0]["name"]),
+                                        dict(recorded_tool_calls[0].get("arguments") or {}),
+                                    )
+                                except Exception:
+                                    pass
+                    await _close_deltas()
+                    if interactive and text and not live_streamed:
+                        chunk_size = 64
+                        for idx in range(0, len(text), chunk_size):
+                            await _emit({"type": "text_delta", "text": text[idx : idx + chunk_size]})
+                    await _emit({"type": "assistant_message", "text": text})
+                    prev_turn = self._last_turn_info.get(session_id)
+                    self._last_turn_info[session_id] = (user_message, recorded_tool_calls)
+                    if not session_id.startswith(("brain-", "auto-", "inspect-")):
+                        bg_task = asyncio.create_task(
+                            self._post_turn_learn(
+                                session_id,
+                                user_message,
+                                text,
+                                recorded_tool_calls,
+                                had_failure,
+                                prev_turn,
+                            )
+                        )
+                        self._bg_learning_tasks.add(bg_task)
+                        bg_task.add_done_callback(self._bg_learning_tasks.discard)
+                    return text
+
+                step_count += 1
+                all_parallel_safe = len(function_calls) > 1 and all(
+                    c.name in SAFE_TOOLS
+                    and not assess_tool_call(
+                        c.name,
+                        dict(c.arguments or {}),
+                        mode=self.settings.approval_mode,
+                        plugin_safe=(self.plugins.is_safe(c.name) if self.plugins else None),
+                    ).requires_approval
+                    for c in function_calls
+                )
+                if all_parallel_safe:
+                    function_results = list(
+                        await asyncio.gather(*(_run_single_tool(c) for c in function_calls))
+                    )
+                else:
+                    function_results = []
+                    for call in function_calls:
+                        function_results.append(await _run_single_tool(call))
+
+                if len(function_calls) == 1 and function_calls[0].name == "switch_model":
+                    try:
+                        sw = json.loads(str(function_results[0].get("result") or "{}"))
+                    except Exception:
+                        sw = {}
+                    if sw.get("status") == "ok":
+                        await _close_deltas()
+                        m_name = str(sw.get("model") or "auto")
+                        loc_code = (locale or self.settings.locale or "en").lower()
+                        reply = (
+                            f"Aktif model {m_name} olarak değiştirildi."
+                            if loc_code.startswith("tr")
+                            else f"Active model switched to {m_name}."
+                        )
+                        self.storage.add_message(session_id, "assistant", reply)
+                        await _emit({"type": "assistant_message", "text": reply})
+                        return reply
+
+                switched_in_step = any(c.name == "switch_model" for c in function_calls)
+                if switched_in_step:
+                    selected_model = self._session_models.get(session_id, "")
+                    if not selected_model or selected_model == "auto":
+                        selected_model = choose_model(user_message, self.settings, storage=self.storage)
+                        self._session_models[session_id] = selected_model
+                await _emit({"type": "status", "message": f"step {step_count}: processing tool results..."})
+                live_streamed = False
+                next_input: Any = function_results
+                if switched_in_step and selected_model in {"local", "local-mind", "local_mind"}:
+                    parts = [
+                        f"[Tool `{x.get('name', 'tool')}` result]:\n{x.get('result', '')}"
+                        for x in function_results
+                    ]
+                    next_input = (
+                        f"Original user request: {user_message}\n\n"
+                        "The active model was switched mid-turn. Here are the tool execution results; "
+                        "please provide the final response or next tool calls:\n\n"
+                        + "\n\n".join(parts)
+                    )
+                next_kwargs: dict[str, Any] = {
+                    "model": selected_model,
+                    "input": next_input,
+                    "tools": pruned_tools,
+                    "system_instruction": system_instruction,
+                    "on_delta": (_local_on_delta if interactive else None),
+                }
+                if not switched_in_step:
+                    next_kwargs["previous_interaction_id"] = interaction.id
+                interaction = await self._call_model_with_failover(session_id, **next_kwargs)
+                selected_model = self._session_models.get(session_id, selected_model)
+                self.sessions[session_id] = interaction.id
+                self.storage.upsert_session(session_id, interaction.id)
+        finally:
+            turn_closed = True
+            if delta_consumer is not None and not delta_consumer.done():
+                delta_consumer.cancel()
+                try:
+                    await delta_consumer
+                except (asyncio.CancelledError, Exception):
+                    pass

@@ -1243,10 +1243,18 @@ def _cmd_self(
             return
 
         if action == "autopsy":
-            from .self_guard import SelfGuard
+            data = None
+            try:
+                resp = ipc_get(f"{base_url}/api/self/guard", headers=hdrs, timeout=10)
+                resp.raise_for_status()
+                data = (resp.json() or {}).get("last_autopsy")
+            except Exception:
+                data = None
+            if not data:
+                from .self_guard import SelfGuard
 
-            with Storage() as st:
-                data = SelfGuard(get_settings(), st).run_crash_autopsy()
+                with Storage() as st:
+                    data = SelfGuard(get_settings(), st).run_crash_autopsy(record=False)
             print(json.dumps(data, indent=2, ensure_ascii=False))
             return
 

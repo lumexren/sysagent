@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 import uuid
@@ -90,11 +91,13 @@ async def lifespan(_app: FastAPI):
     configure_logging(daemon=True)
     logger.info("Starting SysAgent Daemon v%s", __version__)
     auth.initialize()
-    await asyncio.to_thread(self_guard.on_startup)
-    watcher.start()
-    brain.start()
-    evolver.start()
-    self_monitor.start()
+    testing_mode = os.environ.get("SYSAGENT_TESTING") == "1"
+    if not testing_mode:
+        await asyncio.to_thread(self_guard.on_startup)
+        watcher.start()
+        brain.start()
+        evolver.start()
+        self_monitor.start()
     sock = Path(settings.socket_path)
 
     async def _chmod_socket_when_ready() -> None:
@@ -113,11 +116,12 @@ async def lifespan(_app: FastAPI):
     finally:
         chmod_task.cancel()
         logger.info("Stopping SysAgent Daemon")
-        await self_monitor.stop()
-        await evolver.stop()
-        await brain.stop()
-        await watcher.stop()
-        self_guard.mark_clean_shutdown()
+        if not testing_mode:
+            await self_monitor.stop()
+            await evolver.stop()
+            await brain.stop()
+            await watcher.stop()
+            self_guard.mark_clean_shutdown()
 
 
 router = APIRouter()
@@ -823,11 +827,15 @@ async def ws_chat(websocket: WebSocket) -> None:
                     agent._session_models.pop(session_id, None)
                     if hasattr(agent, "_pinned_models"):
                         agent._pinned_models.pop(session_id, None)
+                    agent.sessions.pop(session_id, None)
+                    storage.upsert_session(session_id, None)
                     await emit({"type": "system", "message": "Model routing reset to auto."})
                 else:
                     agent._session_models[session_id] = new_model
                     if hasattr(agent, "_pinned_models"):
                         agent._pinned_models[session_id] = new_model
+                    agent.sessions.pop(session_id, None)
+                    storage.upsert_session(session_id, None)
                     if data.get("persist_default"):
                         settings.model = new_model
                         from .config import persist_env_var

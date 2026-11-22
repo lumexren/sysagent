@@ -602,40 +602,59 @@ def execute_tool(
                         return f"Could not resolve host: {host}"
                     for info in infos:
                         addr = _ip.ip_address(info[4][0])
-                        if (
-                            addr.is_private
-                            or addr.is_loopback
-                            or addr.is_link_local
-                            or addr.is_reserved
-                            or addr.is_multicast
-                            or addr.is_unspecified
-                        ):
+                        if isinstance(addr, _ip.IPv6Address) and addr.ipv4_mapped is not None:
+                            addr = addr.ipv4_mapped
+                        if not addr.is_global:
                             return "Fetching local/private network addresses is not allowed."
                 except (OSError, ValueError):
                     return f"Could not resolve host: {host}"
                 return None
 
             url = str(arguments["url"]).strip()
-            resp = None
+            body_bytes = b""
+            final_url = url
+            status_code = 0
+            encoding = "utf-8"
+            max_bytes = 512 * 1024
+            completed = False
             for _ in range(5):
                 err = _validate_public_url(url)
                 if err:
                     return json.dumps({"error": err})
-                resp = httpx.get(
+                with httpx.stream(
+                    "GET",
                     url,
                     headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"},
                     timeout=12,
                     follow_redirects=False,
-                )
-                if resp.status_code in {301, 302, 303, 307, 308} and resp.headers.get("location"):
-                    url = _urljoin(url, resp.headers["location"])
-                    continue
-                break
-            assert resp is not None
-            text = _re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", resp.text)
+                ) as resp:
+                    status_code = resp.status_code
+                    final_url = str(resp.url)
+                    loc = resp.headers.get("location")
+                    if status_code in {301, 302, 303, 307, 308} and loc and loc.strip():
+                        url = _urljoin(url, loc.strip())
+                        continue
+                    encoding = resp.encoding or "utf-8"
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_bytes(16384):
+                        if not chunk:
+                            continue
+                        remaining = max_bytes - total
+                        if remaining <= 0:
+                            break
+                        chunks.append(chunk[:remaining])
+                        total += len(chunks[-1])
+                    body_bytes = b"".join(chunks)
+                    completed = True
+                    break
+            if not completed:
+                return json.dumps({"error": "Too many redirects."})
+            raw_text = body_bytes.decode(encoding, errors="replace")
+            text = _re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw_text)
             text = _re.sub(r"<[^>]+>", " ", _html.unescape(text))
             text = _re.sub(r"\s+", " ", text).strip()
-            return json.dumps({"url": str(resp.url), "status_code": resp.status_code, "text": text[:5000]}, ensure_ascii=False)
+            return json.dumps({"url": final_url, "status_code": status_code, "text": text[:5000]}, ensure_ascii=False)
 
         if name == "start_focus_timer":
             mins = max(1, int(arguments["minutes"]))
@@ -734,10 +753,13 @@ def execute_tool(
 
                     live_cortex = NeuralBrainCortex(get_settings(), storage, watcher=watcher)
                 c_raw = live_cortex.get_status()
-                habits = c_raw.get("habits") or []
+                habits = c_raw.get("habit_suggestions") or c_raw.get("habits") or []
+                last_heal = c_raw.get("last_heal")
+                if last_heal is None:
+                    last_heal = c_raw.get("predictive_healer")
                 cortex_info: dict[str, Any] = {
                     "flow": c_raw.get("flow"),
-                    "predictive_healer": c_raw.get("predictive_healer"),
+                    "predictive_healer": last_heal,
                     "last_dream": c_raw.get("last_dream"),
                     "habit_suggestions_count": len(habits),
                 }
@@ -795,9 +817,10 @@ def execute_tool(
                 from .self_learn import learn_status_summary, predict_user_routine
 
                 lsum = learn_status_summary(storage)
+                lm_sub = lsum.get("local_model") or {}
                 out["self"] = {
-                    "distilled_count": lsum.get("distilled_count", 0),
-                    "uncertain_count": lsum.get("uncertain_count", 0),
+                    "distilled_count": lm_sub.get("distilled", lsum.get("distilled_count", 0)),
+                    "uncertain_count": lm_sub.get("uncertain_queue", lsum.get("uncertain_count", 0)),
                     "shadow": lsum.get("shadow"),
                     "roadmap_top": (lsum.get("roadmap") or [])[:3],
                 }
@@ -846,9 +869,10 @@ def execute_tool(
                     "quota": get_quota_governor().get_status(),
                 }
 
-            if comp in {"notifications", "all"} and watcher is not None and hasattr(watcher, "notifications"):
+            notifier = (getattr(watcher, "notifier", None) or getattr(watcher, "notifications", None)) if watcher is not None else None
+            if comp in {"notifications", "all"} and notifier is not None:
                 try:
-                    nst = watcher.notifications.get_status()
+                    nst = notifier.get_status()
                     out["notifications"] = {
                         "total": nst.get("total", 0),
                         "suppressed": nst.get("suppressed", 0),
@@ -865,13 +889,14 @@ def execute_tool(
                 n_st = out.get("neural", {}).get("status") or {}
                 wf_s = n_st.get("world_forecast") or {}
                 ev_s = out.get("evolve", {}).get("stats") or {}
+                ev_applied = (ev_s.get("by_status") or {}).get("applied", ev_s.get("applied", 0))
                 lm_s = out.get("local_mind") or {}
                 g_s = out.get("guard") or {}
                 q_s = g_s.get("quota") or {}
                 out["overview"] = (
                     f"Brain latest thought: {latest_th} (rules={out.get('brain', {}).get('rules_count', 0)}); "
                     f"Cortex flow={fl}; Neural acc={n_st.get('tool_accuracy', '-')}, "
-                    f"bottleneck={wf_s.get('bottleneck_prob', 0)}; Evolve applied={ev_s.get('applied', 0)}/{ev_s.get('total', 0)}; "
+                    f"bottleneck={wf_s.get('bottleneck_prob', 0)}; Evolve applied={ev_applied}/{ev_s.get('total', 0)}; "
                     f"LocalMind warm={lm_s.get('warm_model') or 'idle'}; Guard open_breakers={len(g_s.get('open_breakers') or [])}, "
                     f"bg_quota={q_s.get('bg_calls_last_hour', 0)}/{q_s.get('hourly_bg_cap', 40)}."
                 )
