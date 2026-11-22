@@ -170,8 +170,9 @@ class SelfGuard:
                 props = self.storage.list_evolve_proposals(limit=3)
                 latest_applied = next((p for p in props if p.get("status") == "applied"), None)
                 if latest_applied:
-                    tfile = str(latest_applied.get("target_file") or "")
-                    if tfile and tfile in (raw_log or ""):
+                    tfile = str(latest_applied.get("file_path") or latest_applied.get("target_file") or "")
+                    tname = Path(tfile).name if tfile else ""
+                    if tfile and (tfile in (raw_log or "") or (tname and tname in (raw_log or ""))):
                         rolled_back = bool(self.evolver.rollback_last_evolve(int(latest_applied["id"])))
             except Exception:
                 rolled_back = False

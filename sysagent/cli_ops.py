@@ -169,7 +169,9 @@ def _cmd_search(base_url: str, query: str, limit: int = 12, locale: str | None =
         tbl.add_column("Title / Key")
         tbl.add_column("Snippet")
         for r in results:
-            tbl.add_row(str(r.get("source", "")), str(r.get("title", ""))[:32], str(r.get("snippet", ""))[:80])
+            src = str(r.get("type", r.get("source", "")))
+            snip = str(r.get("detail", r.get("snippet", "")))
+            tbl.add_row(src, str(r.get("title", ""))[:32], snip[:80])
         if not results:
             tbl.add_row("-", "No matches", "-")
         Console().print(tbl)
@@ -242,7 +244,7 @@ def _cmd_rollback(
                     etbl.add_row(
                         str(p.get("id", "")),
                         str(p.get("status", "")),
-                        str(p.get("target_file", "")),
+                        str(p.get("file_path", p.get("target_file", ""))),
                         str(p.get("summary", p.get("title", "")))[:60],
                     )
                 console.print(etbl)

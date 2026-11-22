@@ -581,7 +581,7 @@ class SelfEvolver:
             seen_cand.add(name)
         for rm_item in survey_payload.get("self_roadmap") or []:
             if str(rm_item.get("priority")) == "high":
-                rm_file = str(rm_item.get("file") or "")
+                rm_file = str(rm_item.get("target") or rm_item.get("file") or "")
                 if rm_file in codebase and rm_file not in seen_cand and (force or rm_file not in deprioritized):
                     candidates.append({"file": rm_file, "why": str(rm_item.get("goal") or "High-priority roadmap item")})
                     seen_cand.add(rm_file)
@@ -892,11 +892,14 @@ class SelfEvolver:
         )
         hot_ok = False
         if status == "applied":
-            self._write_with_backup(target_file, original_content, new_content)
+            batch_key = f"evolve:{pid}"
+            self._write_with_backup(target_file, original_content, new_content, batch_id=batch_key)
             for cname, c_src in companion_files.items():
-                self._write_with_backup(PACKAGE_DIR / cname, codebase[cname], c_src)
+                self._write_with_backup(PACKAGE_DIR / cname, codebase[cname], c_src, batch_id=batch_key)
             if readme_companion is not None:
-                self._write_with_backup(PACKAGE_DIR.parent / "README.md", readme_companion[0], readme_companion[1])
+                self._write_with_backup(
+                    PACKAGE_DIR.parent / "README.md", readme_companion[0], readme_companion[1], batch_id=batch_key
+                )
             live_ok, _ = await asyncio.to_thread(
                 self._run_staging_tests, target_file.name, new_content, test_code, companion_files
             )
@@ -1008,8 +1011,10 @@ class SelfEvolver:
             # A safety gate that cannot run must reject, never approve.
             return False, f"Critic unavailable, rejecting for safety: {exc}"
 
-    def _write_with_backup(self, path: Path, old_content: str, new_content: str) -> None:
-        self.storage.record_file_backup("evolve", str(path), True, old_content)
+    def _write_with_backup(
+        self, path: Path, old_content: str, new_content: str, batch_id: str | None = None
+    ) -> None:
+        self.storage.record_file_backup("evolve", str(path), True, old_content, batch_id=batch_id)
         path.write_text(new_content, encoding="utf-8")
 
     def apply_proposal(self, proposal_id: int) -> bool:
@@ -1039,7 +1044,22 @@ class SelfEvolver:
         return True
 
     def rollback_last_evolve(self, proposal_id: int | None = None) -> bool:
-        """Auto-rollback latest audit backup, or surgically revert an older commit by proposal_id."""
+        """Auto-rollback latest audit backup (or full multi-file batch), or surgically revert an older commit."""
+        if proposal_id is not None:
+            batch_items = self.storage.get_undoable_batch(f"evolve:{proposal_id}")
+            if batch_items:
+                for it in batch_items:
+                    t = Path(it["target_path"])
+                    if it["existed"]:
+                        t.write_text(it["backup_content"] or "", encoding="utf-8")
+                    self.storage.mark_undone(it["id"])
+                    if t.suffix == ".py":
+                        _hot_reload_module(t.name)
+                self.storage.update_evolve_status(proposal_id, "rolled_back")
+                self.storage.add_brain_thought(
+                    "act", 100, f"Auto-rolled back evolve batch #{proposal_id} ({len(batch_items)} files)"
+                )
+                return True
         item = self.storage.get_latest_undoable(action="evolve")
         if proposal_id is not None:
             prop = self.storage.get_evolve_proposal(proposal_id) or {}
@@ -1059,6 +1079,8 @@ class SelfEvolver:
         if item["existed"]:
             target.write_text(item["backup_content"] or "", encoding="utf-8")
         self.storage.mark_undone(item["id"])
+        if target.suffix == ".py":
+            _hot_reload_module(target.name)
         if proposal_id is not None:
             self.storage.update_evolve_status(proposal_id, "rolled_back")
         self.storage.add_brain_thought("act", 100, f"Auto-rolled back evolve on {target.name}")

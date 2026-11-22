@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import datetime
@@ -485,17 +486,21 @@ def prune_superseded_models(dry_run: bool = False) -> list[str]:
 
 
 _WEIGHTS_CACHE: dict[tuple[str, int], dict[str, Any]] = {}
+_WEIGHTS_LOCK = threading.RLock()
 
 
 def _save_weights_file(weights: dict[str, Any]) -> None:
-    """Persist weights JSON and refresh the in-process mtime cache."""
-    WEIGHTS_FILE.write_text(json.dumps(weights, ensure_ascii=False), encoding="utf-8")
-    try:
-        mtime_ns = WEIGHTS_FILE.stat().st_mtime_ns
-        _WEIGHTS_CACHE.clear()
-        _WEIGHTS_CACHE[(str(WEIGHTS_FILE), mtime_ns)] = weights
-    except Exception:
-        pass
+    """Persist weights JSON atomically and refresh the in-process mtime cache."""
+    with _WEIGHTS_LOCK:
+        tmp = WEIGHTS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(weights, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, WEIGHTS_FILE)
+        try:
+            mtime_ns = WEIGHTS_FILE.stat().st_mtime_ns
+            _WEIGHTS_CACHE.clear()
+            _WEIGHTS_CACHE[(str(WEIGHTS_FILE), mtime_ns)] = weights
+        except Exception:
+            pass
 
 
 class LocalMind:
@@ -511,15 +516,16 @@ class LocalMind:
     def _load_or_init_weights(self) -> dict[str, Any]:
         if WEIGHTS_FILE.is_file():
             try:
-                key = (str(WEIGHTS_FILE), WEIGHTS_FILE.stat().st_mtime_ns)
-                cached = _WEIGHTS_CACHE.get(key)
-                if cached is not None:
-                    return cached
-                data = json.loads(WEIGHTS_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "tool_centroids" in data:
-                    _WEIGHTS_CACHE.clear()
-                    _WEIGHTS_CACHE[key] = data
-                    return data
+                with _WEIGHTS_LOCK:
+                    key = (str(WEIGHTS_FILE), WEIGHTS_FILE.stat().st_mtime_ns)
+                    cached = _WEIGHTS_CACHE.get(key)
+                    if cached is not None:
+                        return cached
+                    data = json.loads(WEIGHTS_FILE.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and "tool_centroids" in data:
+                        _WEIGHTS_CACHE.clear()
+                        _WEIGHTS_CACHE[key] = data
+                        return data
             except Exception:
                 pass
         self.train()
@@ -807,6 +813,7 @@ class LocalMind:
             except Exception as exc:
                 lora_status = f"error:{exc}"
 
+        prev_cb_hash = self.weights.get("codebase_train_hash")
         self.weights = {
             "version": 1,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -824,6 +831,8 @@ class LocalMind:
             "tool_transitions": {k: dict(v) for k, v in tool_transitions.items()},
             "lora_status": lora_status,
         }
+        if prev_cb_hash:
+            self.weights["codebase_train_hash"] = prev_cb_hash
         try:
             _save_weights_file(self.weights)
         except Exception:
@@ -1058,16 +1067,19 @@ class LocalMind:
             return {"status": "skipped", "reason": "agy_cli_not_found"}
 
         uncertain_queries: list[str] = []
+        raw_uncertain_lines: list[str] = []
         if UNCERTAIN_FILE.is_file():
             try:
-                for ln in UNCERTAIN_FILE.read_text(encoding="utf-8").splitlines()[-20:]:
-                    if ln.strip():
-                        q = json.loads(ln).get("query")
-                        if q and q not in uncertain_queries:
-                            uncertain_queries.append(str(q))
-                UNCERTAIN_FILE.unlink(missing_ok=True)
+                raw_uncertain_lines = [
+                    ln for ln in UNCERTAIN_FILE.read_text(encoding="utf-8").splitlines() if ln.strip()
+                ]
+                for ln in raw_uncertain_lines[-20:]:
+                    q = json.loads(ln).get("query")
+                    if q and q not in uncertain_queries:
+                        uncertain_queries.append(str(q))
             except Exception:
                 pass
+        resolved_uncertain: set[str] = set()
 
         tool_names = [d["name"] for d in TOOL_DECLARATIONS]
         harvested = 0
@@ -1087,6 +1099,7 @@ class LocalMind:
                 "You are a Teacher Model generating high-quality training examples for a local Linux system assistant.\n"
                 f"Available tool names: {json.dumps(tool_names)}\n"
             )
+            batch_q: list[str] = []
             if uncertain_queries:
                 batch_q = uncertain_queries[:count_per_teacher]
                 uncertain_queries = uncertain_queries[count_per_teacher:]
@@ -1138,6 +1151,7 @@ class LocalMind:
                 if not isinstance(samples, list):
                     continue
                 teachers_used.append(teacher)
+                resolved_uncertain.update(batch_q)
                 for smp in samples:
                     if not isinstance(smp, dict) or not smp.get("user") or not smp.get("reply"):
                         continue
@@ -1151,6 +1165,20 @@ class LocalMind:
                     harvested += 1
             except Exception:
                 continue
+
+        if raw_uncertain_lines and resolved_uncertain:
+            remaining: list[str] = []
+            for ln in raw_uncertain_lines:
+                try:
+                    q_val = str(json.loads(ln).get("query") or "")
+                except Exception:
+                    continue
+                if q_val and q_val not in resolved_uncertain:
+                    remaining.append(ln)
+            if remaining:
+                UNCERTAIN_FILE.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+            else:
+                UNCERTAIN_FILE.unlink(missing_ok=True)
 
         status = self.train()
         return {
@@ -1193,8 +1221,7 @@ class LocalMind:
                 {
                     "ts": ts,
                     "user": f"inspect sysagent {mod_path.name} {stem} {sym_txt}",
-                    "tool": "read_file",
-                    "args": {"path": str(mod_path)},
+                    "tool_calls": [{"name": "read_file", "arguments": {"path": str(mod_path)}}],
                     "reply": reply,
                     "role": "coding",
                     "source": "self_codebase",
@@ -1221,7 +1248,7 @@ class LocalMind:
         self.weights["codebase_train_hash"] = cb_hash
         status = self.train()
         self.weights["codebase_train_hash"] = cb_hash
-        WEIGHTS_FILE.write_text(json.dumps(self.weights, ensure_ascii=False), encoding="utf-8")
+        _save_weights_file(self.weights)
         return {
             "status": "ok",
             "modules": len(py_files),
@@ -1538,47 +1565,55 @@ class LocalMind:
         )
 
         def _try_server() -> str | None:
-            srv_url = self._ensure_llama_server(gguf)
-            if not srv_url:
+            from .local_inference import inference_lock, touch_warm_model
+
+            with inference_lock():
+                srv_url = self._ensure_llama_server(gguf)
+                if not srv_url:
+                    return None
+                try:
+                    resp = httpx.post(
+                        f"{srv_url}/v1/chat/completions",
+                        json={
+                            "messages": messages,
+                            "temperature": 0.2,
+                            "max_tokens": 1024,
+                        },
+                        timeout=60,
+                    )
+                    touch_warm_model()
+                    if resp.status_code == 200:
+                        choices = resp.json().get("choices") or []
+                        if choices:
+                            content = str(choices[0].get("message", {}).get("content") or "").strip()
+                            if content:
+                                return content
+                except Exception:
+                    pass
                 return None
-            try:
-                resp = httpx.post(
-                    f"{srv_url}/v1/chat/completions",
-                    json={
-                        "messages": messages,
-                        "temperature": 0.2,
-                        "max_tokens": 1024,
-                    },
-                    timeout=60,
-                )
-                if resp.status_code == 200:
-                    choices = resp.json().get("choices") or []
+
+        def _try_llama_cpp() -> str | None:
+            from .local_inference import inference_lock, touch_warm_model
+
+            with inference_lock():
+                llm = self._get_llama_cpp_model(gguf)
+                if llm is None:
+                    return None
+                try:
+                    res = llm.create_chat_completion(
+                        messages=messages,
+                        temperature=0.2,
+                        max_tokens=1024,
+                    )
+                    touch_warm_model()
+                    choices = res.get("choices") or []
                     if choices:
                         content = str(choices[0].get("message", {}).get("content") or "").strip()
                         if content:
                             return content
-            except Exception:
-                pass
-            return None
-
-        def _try_llama_cpp() -> str | None:
-            llm = self._get_llama_cpp_model(gguf)
-            if llm is None:
+                except Exception:
+                    pass
                 return None
-            try:
-                res = llm.create_chat_completion(
-                    messages=messages,
-                    temperature=0.2,
-                    max_tokens=1024,
-                )
-                choices = res.get("choices") or []
-                if choices:
-                    content = str(choices[0].get("message", {}).get("content") or "").strip()
-                    if content:
-                        return content
-            except Exception:
-                pass
-            return None
 
         def _try_cli() -> str | None:
             llama_bin = shutil.which("llama-cli")
@@ -1705,69 +1740,74 @@ class LocalMind:
         specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
         backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
         if backend not in {"llama_cli", "llama-cli", "cli"}:
-            srv_url = self._ensure_llama_server(specialist)
-            if srv_url:
-                import httpx
+            from .local_inference import inference_lock, touch_warm_model
 
-                _, messages = self._build_gguf_messages(
-                    specialist, prompt, system_instruction, history=history, extra_system=extra_system
-                )
-                filt = _ThinkStreamFilter()
-                collected: list[str] = []
-                try:
-                    with httpx.stream(
-                        "POST",
-                        f"{srv_url}/v1/chat/completions",
-                        json={
-                            "messages": messages,
-                            "temperature": 0.2,
-                            "max_tokens": 1024,
-                            "stream": True,
-                        },
-                        timeout=60,
-                    ) as resp:
-                        if resp.status_code == 200:
-                            for line in resp.iter_lines():
-                                if not line or not line.startswith("data:"):
-                                    continue
-                                payload = line[5:].strip()
-                                if payload == "[DONE]":
-                                    break
-                                try:
-                                    chunk_obj = json.loads(payload)
-                                except Exception:
-                                    continue
-                                choices = chunk_obj.get("choices") or []
-                                if not choices:
-                                    continue
-                                token = str((choices[0].get("delta") or {}).get("content") or "")
-                                if not token:
-                                    continue
-                                visible = filt.feed(token)
-                                if visible:
-                                    collected.append(visible)
-                                    on_delta(visible)
-                    tail = filt.flush()
-                    if tail:
-                        collected.append(tail)
-                        on_delta(tail)
-                    final_out = "".join(collected).strip()
-                    if final_out:
-                        if not extra_system and len(prompt.strip()) >= 8:
-                            qa = self.weights.setdefault("qa_memory", [])
-                            qa.append(
-                                {
-                                    "role": target_role,
-                                    "user": prompt.strip()[:300],
-                                    "tool_calls": [],
-                                    "reply": final_out[:600],
-                                }
-                            )
-                            if len(qa) > 150:
-                                self.weights["qa_memory"] = qa[-150:]
-                        return final_out
-                except Exception:
-                    pass
+            with inference_lock():
+                srv_url = self._ensure_llama_server(specialist)
+                if srv_url:
+                    import httpx
+
+                    _, messages = self._build_gguf_messages(
+                        specialist, prompt, system_instruction, history=history, extra_system=extra_system
+                    )
+                    filt = _ThinkStreamFilter()
+                    collected: list[str] = []
+                    try:
+                        with httpx.stream(
+                            "POST",
+                            f"{srv_url}/v1/chat/completions",
+                            json={
+                                "messages": messages,
+                                "temperature": 0.2,
+                                "max_tokens": 1024,
+                                "stream": True,
+                            },
+                            timeout=60,
+                        ) as resp:
+                            if resp.status_code == 200:
+                                for line in resp.iter_lines():
+                                    if not line or not line.startswith("data:"):
+                                        continue
+                                    payload = line[5:].strip()
+                                    if payload == "[DONE]":
+                                        break
+                                    try:
+                                        chunk_obj = json.loads(payload)
+                                    except Exception:
+                                        continue
+                                    choices = chunk_obj.get("choices") or []
+                                    if not choices:
+                                        continue
+                                    token = str((choices[0].get("delta") or {}).get("content") or "")
+                                    if not token:
+                                        continue
+                                    touch_warm_model()
+                                    visible = filt.feed(token)
+                                    if visible:
+                                        collected.append(visible)
+                                        on_delta(visible)
+                        tail = filt.flush()
+                        if tail:
+                            collected.append(tail)
+                            on_delta(tail)
+                        final_out = "".join(collected).strip()
+                        if final_out:
+                            if not extra_system and len(prompt.strip()) >= 8:
+                                qa = self.weights.setdefault("qa_memory", [])
+                                qa.append(
+                                    {
+                                        "role": target_role,
+                                        "user": prompt.strip()[:300],
+                                        "tool_calls": [],
+                                        "reply": final_out[:600],
+                                    }
+                                )
+                                if len(qa) > 150:
+                                    self.weights["qa_memory"] = qa[-150:]
+                            return final_out
+                    except Exception:
+                        if collected:
+                            return "".join(collected).strip() or None
 
         fallback_out = self.run_gguf_inference(
             prompt,

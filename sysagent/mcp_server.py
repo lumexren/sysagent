@@ -76,7 +76,7 @@ def _execute_mcp_tool(name: str, args: dict[str, Any], storage: Storage) -> dict
         disk = psutil.disk_usage("/")
         lm = LocalMind(storage).get_status()
         return {
-            "cpu_percent": psutil.cpu_percent(interval=None),
+            "cpu_percent": psutil.cpu_percent(interval=0.1),
             "ram_percent": mem.percent,
             "ram_used_gb": round(mem.used / (1024**3), 2),
             "ram_total_gb": round(mem.total / (1024**3), 2),
@@ -110,13 +110,21 @@ def _execute_mcp_tool(name: str, args: dict[str, Any], storage: Storage) -> dict
     raise ValueError(f"Unknown MCP tool: {name}")
 
 
-def handle_mcp_request(req: dict[str, Any], storage: Storage) -> dict[str, Any] | None:
+def handle_mcp_request(req: Any, storage: Storage) -> dict[str, Any] | None:
     """Process a single JSON-RPC 2.0 MCP message and return a response dict (or None for notifications)."""
+    if not isinstance(req, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
+    has_id = "id" in req
     req_id = req.get("id")
     method = str(req.get("method") or "")
-    params = req.get("params") or {}
+    raw_params = req.get("params")
+    params = raw_params if isinstance(raw_params, dict) else {}
 
-    if method.startswith("notifications/"):
+    if method.startswith("notifications/") or not has_id:
         return None
 
     if method == "initialize":
@@ -135,7 +143,8 @@ def handle_mcp_request(req: dict[str, Any], storage: Storage) -> dict[str, Any] 
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": MCP_TOOLS}}
     if method == "tools/call":
         tname = str(params.get("name") or "")
-        targs = params.get("arguments") or {}
+        raw_args = params.get("arguments")
+        targs = raw_args if isinstance(raw_args, dict) else {}
         try:
             payload = _execute_mcp_tool(tname, targs, storage)
             return {

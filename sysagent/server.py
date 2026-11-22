@@ -88,14 +88,22 @@ async def lifespan(_app: FastAPI):
     evolver.start()
     self_monitor.start()
     sock = Path(settings.socket_path)
-    if sock.exists():
-        try:
-            sock.chmod(0o600)
-        except OSError as exc:
-            logger.warning("Could not chmod socket %s: %s", sock, exc)
+
+    async def _chmod_socket_when_ready() -> None:
+        for _ in range(40):
+            if sock.exists():
+                try:
+                    sock.chmod(0o600)
+                except OSError as exc:
+                    logger.warning("Could not chmod socket %s: %s", sock, exc)
+                return
+            await asyncio.sleep(0.1)
+
+    chmod_task = asyncio.create_task(_chmod_socket_when_ready())
     try:
         yield
     finally:
+        chmod_task.cancel()
         logger.info("Stopping SysAgent Daemon")
         await self_monitor.stop()
         await evolver.stop()
@@ -396,13 +404,13 @@ async def api_evolve_proposals() -> dict[str, Any]:
 async def api_processes() -> dict[str, Any]:
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ps", "-eo", "pid,%cpu,%mem,comm", "--sort=-%cpu", "-n", "30",
+            "ps", "-eo", "pid,%cpu,%mem,comm", "--sort=-%cpu",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         stdout, _ = await proc.communicate()
         lines = stdout.decode("utf-8", errors="ignore").strip().splitlines()
         procs = []
-        for line in lines[1:]:
+        for line in lines[1:31]:
             parts = line.strip().split(None, 3)
             if len(parts) == 4:
                 procs.append({
@@ -419,9 +427,16 @@ async def api_processes() -> dict[str, Any]:
 @router.post("/api/processes/{pid}/kill")
 async def api_kill_process(pid: int) -> dict[str, Any]:
     try:
-        proc = await asyncio.create_subprocess_exec("kill", "-9", str(pid))
-        await proc.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            "kill", "-9", str(pid), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            detail = stderr.decode("utf-8", errors="ignore").strip() or f"kill failed (rc={proc.returncode})"
+            raise HTTPException(status_code=400, detail=detail)
         return {"status": "killed", "pid": pid}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -512,7 +527,7 @@ async def api_quick_control(action: str, body: dict[str, Any] | None = None) -> 
 
 @router.post("/api/evolve/apply/{proposal_id}")
 async def api_evolve_apply(proposal_id: int) -> dict[str, Any]:
-    ok = evolver.apply_proposal(proposal_id)
+    ok = await asyncio.to_thread(evolver.apply_proposal, proposal_id)
     if not ok:
         raise HTTPException(status_code=400, detail="Proposal not found or failed tests")
     return {"status": "applied", "id": proposal_id}
@@ -690,20 +705,21 @@ async def api_rollback(body: dict[str, Any] | None = None) -> dict[str, Any]:
     )
 
 
-def _run_search(term: str) -> list[dict[str, Any]]:
+def _run_search(term: str, limit: int = 25) -> list[dict[str, Any]]:
+    cap = max(1, min(100, int(limit or 25)))
     results: list[dict[str, Any]] = []
     if term:
         low = term.lower()
         for s in storage.list_sessions(20):
             if low in s["title"].lower():
                 results.append({"type": "session", "title": s["title"], "detail": s["session_id"]})
-        results.extend(storage.search_knowledge(term, limit=25))
-    return results[:25]
+        results.extend(storage.search_knowledge(term, limit=cap))
+    return results[:cap]
 
 
 @router.get("/api/search")
-async def api_search(q: str = "") -> dict[str, Any]:
-    return {"results": await asyncio.to_thread(_run_search, q.strip())}
+async def api_search(q: str = "", limit: int = 25) -> dict[str, Any]:
+    return {"results": await asyncio.to_thread(_run_search, q.strip(), limit)}
 
 
 @router.websocket("/ws/chat")
@@ -771,12 +787,20 @@ async def ws_chat(websocket: WebSocket) -> None:
                 new_model = str(data.get("model") or "").strip()
                 if not new_model:
                     await emit({"type": "error", "message": "Model name is required."})
+                elif new_model.lower() in {"auto", "default", "reset"}:
+                    agent._session_models.pop(session_id, None)
+                    if hasattr(agent, "_pinned_models"):
+                        agent._pinned_models.pop(session_id, None)
+                    await emit({"type": "system", "message": "Model routing reset to auto."})
                 else:
                     agent._session_models[session_id] = new_model
                     if hasattr(agent, "_pinned_models"):
                         agent._pinned_models[session_id] = new_model
                     if data.get("persist_default"):
                         settings.model = new_model
+                        from .config import persist_env_var
+
+                        persist_env_var("SYSAGENT_MODEL", new_model)
                     await emit({"type": "system", "message": f"Model set to {new_model}"})
             elif msg_type == "reset":
                 agent.reset_session(session_id)

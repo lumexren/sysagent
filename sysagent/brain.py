@@ -85,10 +85,15 @@ class CognitiveBrain:
             return False
         try:
             start_s, end_s = [p.strip() for p in qh.split("-", 1)]
-            now_hm = datetime.now().strftime("%H:%M")
-            if start_s <= end_s:
-                return start_s <= now_hm <= end_s
-            return now_hm >= start_s or now_hm <= end_s
+            sh, sm = (int(x) for x in start_s.split(":", 1))
+            eh, em = (int(x) for x in end_s.split(":", 1))
+            now = datetime.now()
+            now_m = now.hour * 60 + now.minute
+            start_m = sh * 60 + sm
+            end_m = eh * 60 + em
+            if start_m <= end_m:
+                return start_m <= now_m <= end_m
+            return now_m >= start_m or now_m <= end_m
         except Exception:
             return False
 
@@ -540,9 +545,10 @@ class CognitiveBrain:
             from .safety import assess_tool_call
 
             pred_tool, pred_args, score = LocalMind(self.storage).predict_tool(action_prompt)
-            risk_level = str(world_forecast.get("anomaly_risk") or "low").lower()
-            if risk_level in {"high", "critical"} and confidence < 88:
-                return False, f"world anomaly_risk={risk_level}"
+            anomaly = bool(world_forecast.get("anomaly_detected"))
+            b_prob = float(world_forecast.get("bottleneck_prob", 0.0) or 0.0)
+            if (anomaly or b_prob >= 0.75) and confidence < 88:
+                return False, f"world anomaly={anomaly} bottleneck={b_prob:.2f}"
             if pred_tool and score >= 0.35:
                 assessment = assess_tool_call(pred_tool, pred_args or {}, mode="smart")
                 if assessment.requires_approval and confidence < 92:

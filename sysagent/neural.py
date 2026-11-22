@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import threading
 import time
 from collections import Counter
 from datetime import datetime
@@ -25,6 +27,7 @@ NEURAL_NPZ_FILE = _DEFAULT_MODELS_DIR / "neural_engine.npz"
 NEURAL_META_FILE = _DEFAULT_MODELS_DIR / "neural_meta.json"
 
 _ENGINE_CACHE: dict[tuple[str, int, int], tuple[dict[str, np.ndarray], dict[str, Any]]] = {}
+_NEURAL_LOCK = threading.RLock()
 
 
 def _gelu_and_grad(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -103,37 +106,38 @@ class NeuralEngine:
             self._shared_cache = False
 
     def _load(self) -> None:
-        npz_mtime = self.npz_file.stat().st_mtime_ns if self.npz_file.is_file() else 0
-        meta_mtime = self.meta_file.stat().st_mtime_ns if self.meta_file.is_file() else 0
-        cache_key = (str(self.npz_file), npz_mtime, meta_mtime)
-        if npz_mtime > 0 and cache_key in _ENGINE_CACHE:
-            cached_w, cached_m = _ENGINE_CACHE[cache_key]
-            self.weights = cached_w
-            self.meta = cached_m
-            self._shared_cache = True
-            return
+        with _NEURAL_LOCK:
+            npz_mtime = self.npz_file.stat().st_mtime_ns if self.npz_file.is_file() else 0
+            meta_mtime = self.meta_file.stat().st_mtime_ns if self.meta_file.is_file() else 0
+            cache_key = (str(self.npz_file), npz_mtime, meta_mtime)
+            if npz_mtime > 0 and cache_key in _ENGINE_CACHE:
+                cached_w, cached_m = _ENGINE_CACHE[cache_key]
+                self.weights = cached_w
+                self.meta = cached_m
+                self._shared_cache = True
+                return
 
-        if self.meta_file.is_file():
-            try:
-                loaded_meta = json.loads(self.meta_file.read_text(encoding="utf-8"))
-                if isinstance(loaded_meta, dict):
-                    self.meta = loaded_meta
-            except Exception:
-                self.meta = {}
+            if self.meta_file.is_file():
+                try:
+                    loaded_meta = json.loads(self.meta_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded_meta, dict):
+                        self.meta = loaded_meta
+                except Exception:
+                    self.meta = {}
 
-        if self.npz_file.is_file():
-            try:
-                with np.load(self.npz_file, allow_pickle=False) as arc:
-                    self.weights = {k: arc[k].astype(np.float32) for k in arc.files}
-            except Exception:
-                self.weights = {}
+            if self.npz_file.is_file():
+                try:
+                    with np.load(self.npz_file, allow_pickle=False) as arc:
+                        self.weights = {k: arc[k].astype(np.float32) for k in arc.files}
+                except Exception:
+                    self.weights = {}
 
-        self._ensure_initialized(self.meta.get("tool_classes") or [])
-        if npz_mtime > 0:
-            _ENGINE_CACHE[cache_key] = (
-                {k: v.copy() for k, v in self.weights.items()},
-                json.loads(json.dumps(self.meta)),
-            )
+            self._ensure_initialized(self.meta.get("tool_classes") or [])
+            if npz_mtime > 0:
+                _ENGINE_CACHE[cache_key] = (
+                    {k: v.copy() for k, v in self.weights.items()},
+                    json.loads(json.dumps(self.meta)),
+                )
 
     def _ensure_initialized(self, tool_classes: list[str]) -> None:
         from .local_mind import SPECIALIST_ROLES
@@ -195,17 +199,22 @@ class NeuralEngine:
     def _save(self) -> None:
         self.meta["param_count"] = self._count_params()
         try:
-            self.npz_file.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(self.npz_file, **self.weights)
-            self.meta_file.write_text(json.dumps(self.meta, ensure_ascii=False), encoding="utf-8")
-            mtime = self.npz_file.stat().st_mtime_ns
-            meta_mtime = self.meta_file.stat().st_mtime_ns
-            for k in [key for key in _ENGINE_CACHE if key[0] == str(self.npz_file)]:
-                _ENGINE_CACHE.pop(k, None)
-            _ENGINE_CACHE[(str(self.npz_file), mtime, meta_mtime)] = (
-                {k: v.copy() for k, v in self.weights.items()},
-                json.loads(json.dumps(self.meta)),
-            )
+            with _NEURAL_LOCK:
+                self.npz_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp_npz = self.npz_file.with_name(f"{self.npz_file.stem}.tmp.npz")
+                np.savez_compressed(tmp_npz, **self.weights)
+                os.replace(tmp_npz, self.npz_file)
+                tmp_meta = self.meta_file.with_suffix(".json.tmp")
+                tmp_meta.write_text(json.dumps(self.meta, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp_meta, self.meta_file)
+                mtime = self.npz_file.stat().st_mtime_ns
+                meta_mtime = self.meta_file.stat().st_mtime_ns
+                for k in [key for key in _ENGINE_CACHE if key[0] == str(self.npz_file)]:
+                    _ENGINE_CACHE.pop(k, None)
+                _ENGINE_CACHE[(str(self.npz_file), mtime, meta_mtime)] = (
+                    {k: v.copy() for k, v in self.weights.items()},
+                    json.loads(json.dumps(self.meta)),
+                )
         except Exception:
             pass
 
@@ -935,6 +944,8 @@ class NeuralEngine:
 
         top_indices = [int(i) for i in np.argsort(-act)[: max(1, top_k)] if float(act[i]) > 0.14]
         if len(top_indices) >= 2:
+            self._detach_for_write()
+            synapses = self.meta.get("synapses") or {}
             for idx_a in top_indices[:4]:
                 id_a = nodes[idx_a]["id"]
                 nbrs_a = synapses.setdefault(id_a, {})
@@ -948,16 +959,19 @@ class NeuralEngine:
                     nbrs_a[id_b] = round(min(1.0, nbrs_a.get(id_b, 0.0) + delta), 3)
             self.meta["synapses"] = synapses
             try:
-                self.meta_file.write_text(json.dumps(self.meta, ensure_ascii=False), encoding="utf-8")
-                mtime = self.npz_file.stat().st_mtime_ns if self.npz_file.is_file() else 0
-                meta_mtime = self.meta_file.stat().st_mtime_ns if self.meta_file.is_file() else 0
-                if mtime > 0:
-                    for k in [key for key in _ENGINE_CACHE if key[0] == str(self.npz_file)]:
-                        _ENGINE_CACHE.pop(k, None)
-                    _ENGINE_CACHE[(str(self.npz_file), mtime, meta_mtime)] = (
-                        {k: v.copy() for k, v in self.weights.items()},
-                        json.loads(json.dumps(self.meta)),
-                    )
+                with _NEURAL_LOCK:
+                    tmp_meta = self.meta_file.with_suffix(".json.tmp")
+                    tmp_meta.write_text(json.dumps(self.meta, ensure_ascii=False), encoding="utf-8")
+                    os.replace(tmp_meta, self.meta_file)
+                    mtime = self.npz_file.stat().st_mtime_ns if self.npz_file.is_file() else 0
+                    meta_mtime = self.meta_file.stat().st_mtime_ns if self.meta_file.is_file() else 0
+                    if mtime > 0:
+                        for k in [key for key in _ENGINE_CACHE if key[0] == str(self.npz_file)]:
+                            _ENGINE_CACHE.pop(k, None)
+                        _ENGINE_CACHE[(str(self.npz_file), mtime, meta_mtime)] = (
+                            {k: v.copy() for k, v in self.weights.items()},
+                            json.loads(json.dumps(self.meta)),
+                        )
             except Exception:
                 pass
 
@@ -978,7 +992,12 @@ class NeuralEngine:
     ) -> dict[str, Any]:
         """Record system telemetry snapshot & hourly role pattern into the Predictive World Model."""
         self._detach_for_write()
-        snap = watcher.get_health_snapshot() if watcher and hasattr(watcher, "get_health_snapshot") else {}
+        if isinstance(watcher, dict):
+            snap = watcher
+        elif watcher and hasattr(watcher, "get_health_snapshot"):
+            snap = watcher.get_health_snapshot()
+        else:
+            snap = {}
         if not snap:
             import psutil
 

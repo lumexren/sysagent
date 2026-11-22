@@ -38,7 +38,7 @@ class Settings:
     gemini_api_keys: list[str] = field(
         default_factory=lambda: [
             k.strip()
-            for k in os.environ.get("GEMINI_API_KEYS", os.environ.get("GEMINI_API_KEY", "")).split(",")
+            for k in (os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY") or "").split(",")
             if k.strip()
         ]
     )
@@ -156,6 +156,7 @@ def get_settings() -> Settings:
 
 def persist_env_var(key: str, value: str) -> Path:
     """Create or update a key=value entry in ~/.config/sysagent/.env."""
+    clean_val = str(value).replace("\r", " ").replace("\n", " ").strip()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     if ENV_FILE.exists():
@@ -165,15 +166,15 @@ def persist_env_var(key: str, value: str) -> Path:
     new_lines: list[str] = []
     for line in lines:
         if line.strip().startswith(f"{key}="):
-            new_lines.append(f"{key}={value}")
+            new_lines.append(f"{key}={clean_val}")
             updated = True
         else:
             new_lines.append(line)
     if not updated:
-        new_lines.append(f"{key}={value}")
+        new_lines.append(f"{key}={clean_val}")
 
     ENV_FILE.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-    os.environ[key] = value
+    os.environ[key] = clean_val
     return ENV_FILE
 
 

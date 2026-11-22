@@ -195,10 +195,17 @@ class _AgyCliInteractions:
         new_id = f"agy-{uuid.uuid4().hex[:10]}"
 
         if stream:
+            history.append(f"ASSISTANT:\n{text}")
+            self._history[new_id] = history[-16:]
+
             def _gen():
                 yield SimpleNamespace(
                     event_type="step.delta",
                     delta=SimpleNamespace(type="text", text=text),
+                )
+                yield SimpleNamespace(
+                    event_type="interaction.complete",
+                    interaction=SimpleNamespace(id=new_id, steps=[], output_text=text),
                 )
             return _gen()
 

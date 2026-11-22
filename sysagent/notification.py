@@ -28,11 +28,13 @@ class NotificationHandle:
     urgency: str
     _proc: subprocess.Popen[str] | None = field(default=None, repr=False)
     _cancelled: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def cancel(self) -> None:
         """Dismiss/terminate the waiting notify-send process if still active."""
-        self._cancelled = True
-        proc = self._proc
+        with self._lock:
+            self._cancelled = True
+            proc = self._proc
         if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
@@ -226,18 +228,44 @@ class NotificationCenter:
 
         def _worker() -> None:
             try:
+                with handle._lock:
+                    if handle._cancelled:
+                        self._record_outcome(entry, "cancelled")
+                        return
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                handle._proc = proc
+                with handle._lock:
+                    handle._proc = proc
+                    cancelled_early = handle._cancelled
+                if cancelled_early:
+                    try:
+                        proc.terminate()
+                        proc.communicate(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=2)
+                        except Exception:
+                            pass
+                    self._record_outcome(entry, "cancelled")
+                    return
                 timeout_s = 300 if actions else 5
                 try:
                     stdout, _ = proc.communicate(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
                     proc.terminate()
+                    try:
+                        proc.communicate(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=2)
+                        except Exception:
+                            pass
                     if not handle._cancelled and actions and on_timeout is not None:
                         self._record_outcome(entry, "timeout")
                         on_timeout()

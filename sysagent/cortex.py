@@ -152,11 +152,12 @@ class NeuralBrainCortex:
             pass
 
         lessons = self.storage.list_lessons(limit=5)
-        cause_hint = (
-            str(hits[0].get("key"))
-            if hits
-            else (str(lessons[0].get("lesson", ""))[:60] if lessons else top_proc or "resource spike")
+        lesson_hint = (
+            str(lessons[0].get("insight") or lessons[0].get("resolution") or "")[:60]
+            if lessons
+            else ""
         )
+        cause_hint = str(hits[0].get("key")) if hits else (lesson_hint or top_proc or "resource spike")
         summary = (
             f"10m forecast: CPU {wf.get('pred_cpu_10m', '?')}%, RAM {wf.get('pred_ram_10m', '?')}% "
             f"(bottleneck={prob:.2f}). Likely factor: {cause_hint}."

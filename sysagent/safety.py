@@ -243,7 +243,7 @@ def _is_safe_conditional_command(base_cmd: str, tokens: list[str]) -> bool:
     return False
 
 RISKY_PATTERNS = [
-    r"[;&|`$><]",  # Shell chaining, pipes to mutators, redirection, command substitution
+    r"[;&|`$><\r\n]",  # Shell chaining, newlines, pipes to mutators, redirection, command substitution
     r"\bsudo\b",
     r"\brm\b",
     r"\bmv\b",

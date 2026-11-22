@@ -140,7 +140,7 @@ def perform_rollback(
             plugins=plugins,
         )
         parsed = json.loads(raw) if isinstance(raw, str) else {"result": raw}
-        if "error" in parsed:
+        if "error" in parsed or parsed.get("status") == "nothing_to_undo":
             return {"ok": False, "target": "file", **parsed}
         return {"ok": True, "target": "file", **parsed}
 

@@ -279,42 +279,44 @@ async def _send_and_stream(
                             asyncio.to_thread(_read_line_cancelable, t("cli_confirm", loc), stop_stdin)
                         )
                         ws_task = asyncio.create_task(ws.recv())
-                        done, _ = await asyncio.wait(
-                            {stdin_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        if stdin_task in done:
-                            ws_task.cancel()
-                            try:
-                                await ws_task
-                            except BaseException:
-                                pass
-                            ans = (stdin_task.result() or "").strip().lower()
-                            yes_set = set(t("cli_yes_tokens", loc).split(","))
-                            approved = ans in yes_set
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "approval_response",
-                                        "approval_id": event["approval_id"],
-                                        "approved": approved,
-                                    }
-                                )
+                        while True:
+                            done, _ = await asyncio.wait(
+                                {stdin_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
                             )
-                        else:
-                            stop_stdin.set()
-                            await stdin_task
+                            if stdin_task in done:
+                                ws_task.cancel()
+                                try:
+                                    await ws_task
+                                except BaseException:
+                                    pass
+                                ans = (stdin_task.result() or "").strip().lower()
+                                yes_set = set(t("cli_yes_tokens", loc).split(","))
+                                approved = ans in yes_set
+                                await ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "approval_response",
+                                            "approval_id": event["approval_id"],
+                                            "approved": approved,
+                                        }
+                                    )
+                                )
+                                break
                             ws_raw = ws_task.result()
                             ws_ev = json.loads(ws_raw)
                             if (
                                 ws_ev.get("type") == "approval_resolved"
                                 and ws_ev.get("approval_id") == event["approval_id"]
                             ):
+                                stop_stdin.set()
+                                await stdin_task
                                 approved = bool(ws_ev.get("approved"))
                                 lbl = t("cli_ok", loc) if approved else t("cli_denied", loc)
                                 col = "\033[32m" if approved else "\033[31m"
                                 print(f"\n{col}[{lbl} via notification]\033[0m")
-                            else:
-                                queued_raw.append(ws_raw)
+                                break
+                            queued_raw.append(ws_raw)
+                            ws_task = asyncio.create_task(ws.recv())
                         spin_label[0] = f"running {event['tool_name']}..."
                         stop_spin = asyncio.Event()
                         spin_task = asyncio.create_task(_spinner(stop_spin))
@@ -490,9 +492,9 @@ def _setup_shell_readline(get_cwd=None) -> Path:
         readline.set_history_length(500)
 
         slash_cmds = [
-            "/help", "/status", "/live", "/new", "/reset", "/sessions", "/resume",
+            "/help", "/status", "/doctor", "/digest", "/live", "/new", "/reset", "/sessions", "/resume",
             "/paste", "/model", "/undo", "/fix", "/clear", "/prompts", "/local",
-            "/neural", "/evolve", "/brain", "/exit",
+            "/neural", "/evolve", "/brain", "/exit", "/quit",
         ]
 
         def _completer(text: str, state: int) -> str | None:
@@ -549,26 +551,6 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
         f"\033[1;36m{settings.agent_name} Shell\033[0m "
         f"\033[90m(session: {session_id} | /help commands, @file attach, !<cmd> bash, Ctrl+C cancel turn)\033[0m\n"
     )
-    try:
-        import readline
-
-        _slash_cmds = (
-            "/help", "/model", "/paste", "/resume", "/sessions", "/new", "/clear",
-            "/status", "/doctor", "/digest", "/live", "/brain", "/evolve", "/neural",
-            "/local", "/prompts", "/undo", "/fix", "/reset", "/exit", "/quit",
-        )
-
-        def _slash_completer(text: str, state: int) -> str | None:
-            if not text.startswith("/"):
-                return None
-            matches = [c for c in _slash_cmds if c.startswith(text)]
-            return matches[state] if state < len(matches) else None
-
-        readline.set_completer_delims(" \t\n")
-        readline.set_completer(_slash_completer)
-        readline.parse_and_bind("tab: complete")
-    except Exception:
-        pass
     try:
         while True:
             model_tag = f" \001\033[33m\002[{pinned_model}]\001\033[0m\002" if pinned_model else ""
@@ -662,6 +644,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                             resp_st = await asyncio.to_thread(
                                 ipc_get, f"{base_url}/api/status", headers=_auth_headers(), timeout=5
                             )
+                            resp_st.raise_for_status()
                             st = resp_st.json()
                             m_info = st.get("models") or {}
                             print(
@@ -673,6 +656,12 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                             print(f"Active override: {pinned_model or 'auto'} ({exc})")
                     elif parts[1].lower() in {"auto", "default", "reset"}:
                         pinned_model = None
+                        try:
+                            async with ipc_ws_connect(_ws_url(base_url, session_id), open_timeout=5) as ws:
+                                await ws.send(json.dumps({"type": "set_model", "model": "auto"}))
+                                await asyncio.wait_for(ws.recv(), timeout=3)
+                        except Exception:
+                            pass
                         print("\033[90mModel override cleared (back to adaptive routing).\033[0m")
                     else:
                         chosen = _MODEL_ALIASES.get(parts[1].lower(), parts[1].strip())
@@ -689,6 +678,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                         resp_s = await asyncio.to_thread(
                             ipc_get, f"{base_url}/api/sessions", headers=_auth_headers(), timeout=5
                         )
+                        resp_s.raise_for_status()
                         data = resp_s.json()
                         for s in (data.get("sessions") or [])[:15]:
                             sid_item = s.get("session_id", "")
@@ -707,6 +697,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                         resp_sl = await asyncio.to_thread(
                             ipc_get, f"{base_url}/api/sessions", headers=_auth_headers(), timeout=5
                         )
+                        resp_sl.raise_for_status()
                         sessions = resp_sl.json().get("sessions") or []
                         match = next(
                             (s["session_id"] for s in sessions if s["session_id"] == prefix or s["session_id"].startswith(prefix)),
@@ -720,6 +711,7 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                         resp_m = await asyncio.to_thread(
                             ipc_get, f"{base_url}/api/sessions/{session_id}/messages", headers=_auth_headers(), timeout=5
                         )
+                        resp_m.raise_for_status()
                         msgs = resp_m.json().get("messages") or []
                         print(f"\033[1;36mResumed {session_id}\033[0m ({len(msgs)} messages):")
                         for m in msgs[-4:]:
@@ -739,6 +731,8 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                             asyncio.to_thread(ipc_get, f"{base_url}/api/brain", headers=hdrs, timeout=5),
                             asyncio.to_thread(ipc_get, f"{base_url}/api/evolve", headers=hdrs, timeout=5),
                         )
+                        for r_item in (r_st, r_br, r_ev):
+                            r_item.raise_for_status()
                         st, br, ev = r_st.json(), r_br.json(), r_ev.json()
                         print(f"\033[1;36mDaemon:\033[0m {st.get('status')} | model={st.get('model')} | auth={st.get('auth_mode') or 'none'}")
                         thoughts = br.get("thoughts") or []
@@ -765,23 +759,32 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                             print("  (none yet)")
                     except Exception as exc:
                         print(f"\033[31m{exc}\033[0m")
-                elif cmd == "/prompts":
-                    _cmd_prompts(base_url, "list", parts[1] if len(parts) > 1 else None, locale)
-                elif cmd == "/local":
-                    _cmd_local(base_url, parts[1] if len(parts) > 1 else "status", " ".join(parts[2:]) if len(parts) > 2 else None, locale)
-                elif cmd == "/neural":
-                    _cmd_neural(base_url, parts[1] if len(parts) > 1 else "status", " ".join(parts[2:]) if len(parts) > 2 else None, locale)
-                elif cmd == "/brain":
-                    _cmd_brain(base_url, parts[1] if len(parts) > 1 else "status", locale)
-                elif cmd == "/evolve":
-                    _cmd_evolve(base_url, parts[1] if len(parts) > 1 else "status", locale)
-                elif cmd == "/fix":
-                    _cmd_fix(base_url, locale)
+                elif cmd in {"/prompts", "/local", "/neural", "/brain", "/evolve", "/fix"}:
+                    try:
+                        if cmd == "/prompts":
+                            await asyncio.to_thread(_cmd_prompts, base_url, "list", parts[1] if len(parts) > 1 else None, locale)
+                        elif cmd == "/local":
+                            await asyncio.to_thread(_cmd_local, base_url, parts[1] if len(parts) > 1 else "status", " ".join(parts[2:]) if len(parts) > 2 else None, locale)
+                        elif cmd == "/neural":
+                            await asyncio.to_thread(_cmd_neural, base_url, parts[1] if len(parts) > 1 else "status", " ".join(parts[2:]) if len(parts) > 2 else None, locale)
+                        elif cmd == "/brain":
+                            await asyncio.to_thread(_cmd_brain, base_url, parts[1] if len(parts) > 1 else "status", locale)
+                        elif cmd == "/evolve":
+                            ev_act = parts[1] if len(parts) > 1 else "status"
+                            if ev_act == "run":
+                                await _stream_evolve(base_url, locale)
+                            else:
+                                await asyncio.to_thread(_cmd_evolve, base_url, ev_act, locale)
+                        elif cmd == "/fix":
+                            await _cmd_fix_async(base_url, locale)
+                    except SystemExit:
+                        pass
                 elif cmd == "/undo":
                     try:
                         r = await asyncio.to_thread(
                             ipc_post, f"{base_url}/api/undo-batch", headers=_auth_headers(), timeout=10
                         )
+                        r.raise_for_status()
                         print(json.dumps(r.json(), indent=2, ensure_ascii=False))
                     except Exception as exc:
                         print(f"\033[31m{exc}\033[0m")
@@ -1041,7 +1044,7 @@ async def _quick_launcher(base_url: str, locale: str | None = None) -> None:
         return
 
     if prompt.strip() == "!fix":
-        _cmd_fix(base_url, locale)
+        await _cmd_fix_async(base_url, locale)
         return
     if prompt.strip() == "!clip":
         for ccmd in (["wl-paste", "--no-newline"], ["xclip", "-o", "-selection", "clipboard"]):
@@ -1121,12 +1124,12 @@ alias fix="{_prog_name()} fix"
 """)
 
 
-def _cmd_fix(base_url: str, locale: str | None = None) -> None:
+def _prepare_fix_prompt(locale: str | None = None) -> str | None:
     loc = locale or get_settings().locale
     err_file = DATA_DIR / "last_error.json"
     if not err_file.exists():
         print(t("cli_no_last_error", loc), file=sys.stderr)
-        sys.exit(1)
+        return None
     try:
         data = json.loads(err_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
@@ -1138,18 +1141,34 @@ def _cmd_fix(base_url: str, locale: str | None = None) -> None:
         from .self_guard import match_cached_fix
         from .storage import Storage
 
-        hit = match_cached_fix(Storage(), cmd_str, exit_code)
+        with Storage() as st:
+            hit = match_cached_fix(st, cmd_str, exit_code)
         if hit is not None:
             print(f"[0-token fix memory | match {int(hit['score'] * 100)}%] ({hit['topic']})")
             print(hit["lesson"])
-            return
+            return ""
     except Exception:
         pass
-    prompt = (
+    return (
         f"The user's last shell command failed in `{data.get('cwd')}` with exit code {exit_code}:\n"
         f"`{cmd_str}`\n"
         "Explain why it likely failed and suggest (or run if safe/approved) the fix."
     )
+
+
+async def _cmd_fix_async(base_url: str, locale: str | None = None) -> None:
+    prompt = _prepare_fix_prompt(locale)
+    if not prompt:
+        return
+    await _send_and_stream(prompt, f"fix-{uuid.uuid4().hex[:6]}", base_url, locale)
+
+
+def _cmd_fix(base_url: str, locale: str | None = None) -> None:
+    prompt = _prepare_fix_prompt(locale)
+    if prompt is None:
+        sys.exit(1)
+    if not prompt:
+        return
     asyncio.run(_send_and_stream(prompt, f"fix-{uuid.uuid4().hex[:6]}", base_url, locale))
 
 
@@ -1266,7 +1285,7 @@ def main() -> None:
     prompts_parser.add_argument("prompt_key", nargs="?", default=None, help="Target prompt key (e.g. agent_main)")
     local_parser = sub.add_parser("local", help="Self-training local offline model status, train, distill, download, bench, or test")
     local_parser.add_argument("local_action", nargs="?", default="status", choices=["status", "train", "distill", "download", "test", "bench", "prune", "profile"])
-    local_parser.add_argument("local_query", nargs="?", default=None, help="Optional test query")
+    local_parser.add_argument("local_query", nargs="*", default=None, help="Optional test query")
     neural_parser = sub.add_parser("neural", help="Vectorized Neural Engine status, train, or pulse inspection")
     neural_parser.add_argument("neural_action", nargs="?", default="status", choices=["status", "train", "pulse", "activate"])
     neural_parser.add_argument("neural_query", nargs="*", default=None, help="Query text for neural pulse inspection")
@@ -1354,7 +1373,8 @@ def main() -> None:
         elif args.subcommand == "prompts":
             _cmd_prompts(settings.base_url, args.prompts_action, args.prompt_key, locale_override)
         elif args.subcommand == "local":
-            _cmd_local(settings.base_url, args.local_action, args.local_query, locale_override)
+            lq = " ".join(args.local_query).strip() if args.local_query else None
+            _cmd_local(settings.base_url, args.local_action, lq, locale_override)
         elif args.subcommand == "neural":
             nq = " ".join(args.neural_query).strip() if args.neural_query else None
             _cmd_neural(settings.base_url, args.neural_action, nq, locale_override)

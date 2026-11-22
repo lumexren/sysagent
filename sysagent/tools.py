@@ -102,9 +102,9 @@ def execute_tool(
             backup = p.read_text(encoding="utf-8", errors="replace") if existed else None
             if existed and backup is not None:
                 _backup_critical_config(p, backup)
-            storage.record_file_backup("write_file", str(p), existed, backup, batch_id=batch_id)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(str(arguments["content"]), encoding="utf-8")
+            storage.record_file_backup("write_file", str(p), existed, backup, batch_id=batch_id)
             return json.dumps(
                 {"status": "ok", "path": str(p), "bytes": p.stat().st_size, "batch_id": batch_id},
                 ensure_ascii=False,
@@ -116,14 +116,16 @@ def execute_tool(
                 return json.dumps({"error": f"File not found: {p}"}, ensure_ascii=False)
             backup = p.read_text(encoding="utf-8", errors="replace")
             target = str(arguments["target"])
+            if not target:
+                return json.dumps({"error": "target must be non-empty"}, ensure_ascii=False)
             replacement = str(arguments["replacement"])
             count = backup.count(target)
             if count == 0:
                 return json.dumps({"error": f"Target snippet not found in {p}"}, ensure_ascii=False)
             _backup_critical_config(p, backup)
-            storage.record_file_backup("edit_file", str(p), True, backup, batch_id=batch_id)
             updated = backup.replace(target, replacement)
             p.write_text(updated, encoding="utf-8")
+            storage.record_file_backup("edit_file", str(p), True, backup, batch_id=batch_id)
             return json.dumps(
                 {"status": "ok", "path": str(p), "replacements": count, "bytes": p.stat().st_size, "batch_id": batch_id},
                 ensure_ascii=False,
@@ -155,10 +157,10 @@ def execute_tool(
             skip_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", ".local", ".cargo", ".rustup", "dist", "build"}
             if content_search:
                 if shutil.which("rg"):
-                    cmd = ["rg", "-n", "--max-count", "50", "--max-filesize", "1M", query, str(base)]
+                    cmd = ["rg", "-n", "--max-count", "50", "--max-filesize", "1M", "--", query, str(base)]
                 else:
                     exclude_args = [f"--exclude-dir={d}" for d in skip_dirs]
-                    cmd = ["grep", "-rnI", "-m", "50", *exclude_args, query, str(base)]
+                    cmd = ["grep", "-rnI", "-m", "50", *exclude_args, "--", query, str(base)]
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
                 content_matches: list[str] = []
                 try:
@@ -219,7 +221,8 @@ def execute_tool(
             cmd = ["systemctl"]
             if arguments.get("user_only"):
                 cmd.append("--user")
-            cmd.extend(["list-units", "--type=service", f"--state={state}", "--no-legend", "--no-pager", "--plain"])
+            state_flag = "--all" if state == "all" else f"--state={state}"
+            cmd.extend(["list-units", "--type=service", state_flag, "--no-legend", "--no-pager", "--plain"])
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
             units: list[dict[str, str]] = []
             for ln in proc.stdout.splitlines():
@@ -395,15 +398,18 @@ def execute_tool(
             target = Path(item["target_path"])
             if item["action"] == "trash_file" and item["backup_content"]:
                 trashed = Path(item["backup_content"])
-                if trashed.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(trashed), str(target))
+                if not trashed.exists():
+                    return json.dumps({"error": f"Trashed file missing: {trashed}"}, ensure_ascii=False)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(trashed), str(target))
             elif item["existed"]:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(item["backup_content"] or "", encoding="utf-8")
             elif target.exists():
                 target.unlink()
             storage.mark_undone(item["id"])
+            if plugins and item["action"] == "forge_skill":
+                plugins.reload()
             return json.dumps({"status": "undone", "target_path": str(target), "existed": bool(item["existed"])}, ensure_ascii=False)
 
         if name == "undo_batch_actions":
@@ -412,13 +418,16 @@ def execute_tool(
             if not items:
                 return json.dumps({"status": "nothing_to_undo", "reverted": []})
             reverted: list[str] = []
+            skipped: list[str] = []
             for item in items:
                 target = Path(item["target_path"])
                 if item["action"] == "trash_file" and item["backup_content"]:
                     trashed = Path(item["backup_content"])
-                    if trashed.exists():
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(trashed), str(target))
+                    if not trashed.exists():
+                        skipped.append(str(target))
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(trashed), str(target))
                 elif item["existed"]:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(item["backup_content"] or "", encoding="utf-8")
@@ -434,6 +443,7 @@ def execute_tool(
                     "batch_id": items[0].get("batch_id"),
                     "count": len(reverted),
                     "reverted": reverted,
+                    "skipped": skipped,
                 },
                 ensure_ascii=False,
             )
@@ -491,8 +501,8 @@ def execute_tool(
             dest = pdir / f"{raw_name}.py"
             existed = dest.is_file()
             old_code = dest.read_text(encoding="utf-8", errors="replace") if existed else None
-            storage.record_file_backup("forge_skill", str(dest), existed, old_code, batch_id=batch_id)
             dest.write_text(code, encoding="utf-8")
+            storage.record_file_backup("forge_skill", str(dest), existed, old_code, batch_id=batch_id)
             count = plugins.reload() if plugins else 0
             from .self_ops import sync_capabilities_doc
             sync_capabilities_doc(plugins)
@@ -557,29 +567,54 @@ def execute_tool(
 
         if name == "fetch_url":
             import html as _html
+            import ipaddress as _ip
             import re as _re
+            import socket as _socket
+            from urllib.parse import urljoin as _urljoin, urlparse as _urlparse
             import httpx
 
-            url = str(arguments["url"]).strip()
-            if not url.startswith(("http://", "https://")):
-                return json.dumps({"error": "Only http:// and https:// URLs are allowed."})
-            import ipaddress as _ip
-            import socket as _socket
-            from urllib.parse import urlparse as _urlparse
+            def _validate_public_url(target_url: str) -> str | None:
+                if not target_url.startswith(("http://", "https://")):
+                    return "Only http:// and https:// URLs are allowed."
+                host = _urlparse(target_url).hostname or ""
+                if not host:
+                    return "Invalid URL host."
+                try:
+                    infos = _socket.getaddrinfo(host, None)
+                    if not infos:
+                        return f"Could not resolve host: {host}"
+                    for info in infos:
+                        addr = _ip.ip_address(info[4][0])
+                        if (
+                            addr.is_private
+                            or addr.is_loopback
+                            or addr.is_link_local
+                            or addr.is_reserved
+                            or addr.is_multicast
+                            or addr.is_unspecified
+                        ):
+                            return "Fetching local/private network addresses is not allowed."
+                except (OSError, ValueError):
+                    return f"Could not resolve host: {host}"
+                return None
 
-            host = _urlparse(url).hostname or ""
-            try:
-                addr = _ip.ip_address(_socket.gethostbyname(host))
-                if addr.is_private or addr.is_loopback or addr.is_link_local:
-                    return json.dumps({"error": "Fetching local/private network addresses is not allowed."})
-            except (OSError, ValueError):
-                return json.dumps({"error": f"Could not resolve host: {host}"})
-            resp = httpx.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"},
-                timeout=12,
-                follow_redirects=True,
-            )
+            url = str(arguments["url"]).strip()
+            resp = None
+            for _ in range(5):
+                err = _validate_public_url(url)
+                if err:
+                    return json.dumps({"error": err})
+                resp = httpx.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"},
+                    timeout=12,
+                    follow_redirects=False,
+                )
+                if resp.status_code in {301, 302, 303, 307, 308} and resp.headers.get("location"):
+                    url = _urljoin(url, resp.headers["location"])
+                    continue
+                break
+            assert resp is not None
             text = _re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", resp.text)
             text = _re.sub(r"<[^>]+>", " ", _html.unescape(text))
             text = _re.sub(r"\s+", " ", text).strip()

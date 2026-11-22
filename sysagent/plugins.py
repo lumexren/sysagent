@@ -30,12 +30,13 @@ def validate_plugin_code_isolated(
     except SyntaxError as exc:
         return False, f"Syntax error in plugin code: {exc}"
 
+    safe_name = "".join(c if c.isalnum() or c == "_" else "_" for c in Path(tool_name).name).strip("_") or "plugin"
     with tempfile.TemporaryDirectory() as td:
-        mod_path = Path(td) / f"{tool_name}.py"
+        mod_path = Path(td) / f"{safe_name}.py"
         mod_path.write_text(python_code, encoding="utf-8")
         runner = (
             "import importlib.util, json, sys\n"
-            f"spec = importlib.util.spec_from_file_location('sandbox_plugin', r'{mod_path}')\n"
+            f"spec = importlib.util.spec_from_file_location('sandbox_plugin', {json.dumps(str(mod_path))})\n"
             "mod = importlib.util.module_from_spec(spec)\n"
             "spec.loader.exec_module(mod)\n"
             "tools = getattr(mod, 'TOOLS', None)\n"
@@ -254,9 +255,11 @@ class PluginRegistry:
         tool = self.tools.get(name)
         if not tool:
             raise KeyError(f"Plugin tool not found: {name}")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(tool.handler, arguments)
-            try:
-                return fut.result(timeout=timeout_sec)
-            except concurrent.futures.TimeoutError:
-                return json.dumps({"error": f"Plugin tool '{name}' timed out after {timeout_sec}s"})
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(tool.handler, arguments)
+        try:
+            return fut.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            return json.dumps({"error": f"Plugin tool '{name}' timed out after {timeout_sec}s"})
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)

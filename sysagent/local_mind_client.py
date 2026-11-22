@@ -185,6 +185,12 @@ class _LocalMindInteractions:
             def _guarded_delta(chunk: str) -> None:
                 if stream_mode[0] == "suppress":
                     return
+                if allowed and "{" in chunk:
+                    before = chunk.split("{", 1)[0]
+                    if stream_mode[0] == "live" and before:
+                        on_delta(before)
+                    stream_mode[0] = "suppress"
+                    return
                 if stream_mode[0] == "pending":
                     stripped = chunk.lstrip()
                     if not stripped:

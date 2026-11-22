@@ -68,7 +68,7 @@ def collect_top_state(base_url: str, headers: dict[str, str]) -> dict[str, Any]:
                 "lessons": 0,
                 "evolve_proposals": 0,
                 "health": {
-                    "cpu_percent": psutil.cpu_percent(interval=None),
+                    "cpu_percent": psutil.cpu_percent(interval=0.1),
                     "ram_percent": mem.percent,
                     "ram_used_gb": round(mem.used / (1024**3), 2),
                     "ram_total_gb": round(mem.total / (1024**3), 2),
@@ -139,7 +139,11 @@ def build_dashboard(state: dict[str, Any]) -> Layout:
     ev_tbl.add_column("Event")
     for ev in (state.get("events") or [])[:6]:
         ts = str(ev.get("timestamp", ev.get("created_at", "")))[-8:]
-        ev_tbl.add_row(ts, str(ev.get("source", ev.get("kind", "-")))[:12], str(ev.get("message", ev.get("detail", "")))[:90])
+        ev_tbl.add_row(
+            ts,
+            str(ev.get("category", ev.get("source", ev.get("kind", "-"))))[:12],
+            str(ev.get("message", ev.get("detail", "")))[:90],
+        )
     if not state.get("events"):
         ev_tbl.add_row("-", "-", "[dim]No recent events[/]")
 

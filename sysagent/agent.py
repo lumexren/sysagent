@@ -351,8 +351,8 @@ class AgentManager:
         client = self._get_client()
         on_delta = kwargs.pop("on_delta", None)
         model = str(kwargs["model"])
-        if model in {"local", "local-mind", "local_mind"}:
-            local_client = getattr(self, "_local_client", None)
+        if model in {"local", "local-mind", "local_mind"} or type(client).__name__ == "LocalMindClient":
+            local_client = client if type(client).__name__ == "LocalMindClient" else getattr(self, "_local_client", None)
             if local_client is None:
                 from .local_mind import LocalMindClient
 
@@ -436,23 +436,31 @@ class AgentManager:
                 eng_fp = NeuralEngine(self.storage)
                 plan = eng_fp.match_safe_plan(user_message, min_sim=0.92)
                 if plan and not eng_fp.predict_with_uncertainty(user_message).get("uncertain"):
-                    raw_out = await asyncio.to_thread(
-                        execute_tool,
+                    plan_assess = assess_tool_call(
                         plan["tool"],
-                        plan["args"],
-                        self.watcher,
-                        self.storage,
-                        self.plugins,
-                        self.auth,
-                        f"fast-{uuid.uuid4().hex[:6]}",
+                        dict(plan.get("args") or {}),
+                        mode=self.settings.approval_mode,
+                        plugin_safe=(self.plugins.is_safe(plan["tool"]) if self.plugins else None),
                     )
-                    if isinstance(raw_out, str) and '"error":' not in raw_out:
-                        self.storage.add_message(session_id, "user", user_message)
-                        summary = f"[{plan['tool']}] {truncate_tool_output(scrub_secrets(raw_out), max_chars=2400)}"
-                        self.storage.add_message(session_id, "assistant", summary)
-                        if emit:
-                            await emit({"type": "assistant_message", "text": summary})
-                        return summary
+                    if not plan_assess.requires_approval:
+                        raw_out = await asyncio.to_thread(
+                            execute_tool,
+                            plan["tool"],
+                            plan["args"],
+                            self.watcher,
+                            self.storage,
+                            self.plugins,
+                            self.auth,
+                            f"fast-{uuid.uuid4().hex[:6]}",
+                        )
+                        if isinstance(raw_out, str) and '"error":' not in raw_out:
+                            self.storage.upsert_session(session_id, None)
+                            self.storage.add_message(session_id, "user", user_message)
+                            summary = f"[{plan['tool']}] {truncate_tool_output(scrub_secrets(raw_out), max_chars=2400)}"
+                            self.storage.add_message(session_id, "assistant", summary)
+                            if emit:
+                                await emit({"type": "assistant_message", "text": summary})
+                            return summary
             except Exception:
                 pass
         rel_ctx = self.storage.get_relevant_context(
@@ -581,14 +589,31 @@ class AgentManager:
 
         loop = asyncio.get_running_loop()
         live_streamed = False
+        delta_q: asyncio.Queue[str | None] = asyncio.Queue()
+
+        async def _drain_deltas() -> None:
+            while True:
+                item = await delta_q.get()
+                try:
+                    if item is None:
+                        return
+                    await _emit({"type": "text_delta", "text": item})
+                finally:
+                    delta_q.task_done()
+
+        delta_consumer: asyncio.Task[None] | None = (
+            asyncio.create_task(_drain_deltas()) if interactive else None
+        )
 
         def _local_on_delta(chunk: str) -> None:
             nonlocal live_streamed
             if chunk:
                 live_streamed = True
-                loop.call_soon_threadsafe(
-                    asyncio.create_task, _emit({"type": "text_delta", "text": chunk})
-                )
+                loop.call_soon_threadsafe(delta_q.put_nowait, chunk)
+
+        async def _flush_deltas() -> None:
+            if delta_consumer is not None:
+                await delta_q.join()
 
         if interactive:
             kwargs["on_delta"] = _local_on_delta
@@ -994,9 +1019,14 @@ class AgentManager:
                         LocalMind(self.storage).record_and_learn(
                             user_message, recorded_tool_calls, text
                         )
+                        _FAST_PATH_READONLY = {
+                            "system_status", "list_processes", "list_systemd_units", "list_directory",
+                            "read_file", "search_files", "list_memories", "list_automations",
+                            "list_audit_log", "get_app_usage", "read_journal",
+                        }
                         if (
                             len(recorded_tool_calls) == 1
-                            and recorded_tool_calls[0].get("name") in SAFE_TOOLS
+                            and recorded_tool_calls[0].get("name") in _FAST_PATH_READONLY
                         ):
                             try:
                                 from .neural import NeuralEngine
@@ -1008,6 +1038,10 @@ class AgentManager:
                                 )
                             except Exception:
                                 pass
+                await _flush_deltas()
+                if delta_consumer is not None and not delta_consumer.done():
+                    delta_q.put_nowait(None)
+                    await delta_consumer
                 if interactive and text and not live_streamed:
                     chunk_size = 64
                     for idx in range(0, len(text), chunk_size):
@@ -1056,6 +1090,9 @@ class AgentManager:
                 except Exception:
                     sw = {}
                 if sw.get("status") == "ok":
+                    if delta_consumer is not None and not delta_consumer.done():
+                        delta_q.put_nowait(None)
+                        await delta_consumer
                     m_name = str(sw.get("model") or "auto")
                     loc_code = (locale or self.settings.locale or "en").lower()
                     reply = (
@@ -1067,17 +1104,21 @@ class AgentManager:
                     await _emit({"type": "assistant_message", "text": reply})
                     return reply
 
+            switched_in_step = any(c.name == "switch_model" for c in function_calls)
+            if switched_in_step:
+                selected_model = self._session_models.get(session_id, selected_model)
             await _emit({"type": "status", "message": f"step {step_count}: processing tool results..."})
             live_streamed = False
-            interaction = await self._call_model_with_failover(
-                session_id,
-                model=selected_model,
-                input=function_results,
-                previous_interaction_id=interaction.id,
-                tools=pruned_tools,
-                system_instruction=system_instruction,
-                on_delta=(_local_on_delta if interactive else None),
-            )
+            next_kwargs: dict[str, Any] = {
+                "model": selected_model,
+                "input": function_results,
+                "tools": pruned_tools,
+                "system_instruction": system_instruction,
+                "on_delta": (_local_on_delta if interactive else None),
+            }
+            if not switched_in_step:
+                next_kwargs["previous_interaction_id"] = interaction.id
+            interaction = await self._call_model_with_failover(session_id, **next_kwargs)
             selected_model = self._session_models.get(session_id, selected_model)
             self.sessions[session_id] = interaction.id
             self.storage.upsert_session(session_id, interaction.id)

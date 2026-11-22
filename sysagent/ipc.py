@@ -16,7 +16,9 @@ def _resolve_uds(url_or_base: str | None) -> str | None:
     if url_or_base.startswith("unix://"):
         return url_or_base[len("unix://") :]
     if url_or_base.startswith("/"):
-        return url_or_base
+        if url_or_base.endswith(".sock"):
+            return url_or_base
+        return get_settings().socket_path
     return None
 
 

@@ -1145,17 +1145,17 @@ def _build_workflow_plugin_source(tool_name: str, sig: str, goal: str, step_spec
         "    from sysagent.storage import Storage\n"
         "    from sysagent.tools import execute_tool\n"
         "    from sysagent.watcher import SystemWatcher\n\n"
-        "    st = Storage()\n"
-        "    w = SystemWatcher(get_settings(), storage=st)\n"
-        "    results: list[dict[str, Any]] = []\n"
-        "    for step in _WORKFLOW_STEPS:\n"
-        '        targs = dict(step.get("arguments") or {})\n'
-        '        if arguments.get("path") and "path" in targs:\n'
-        '            targs["path"] = arguments["path"]\n'
-        '        if arguments.get("query") and "query" in targs:\n'
-        '            targs["query"] = arguments["query"]\n'
-        '        out = execute_tool(str(step["name"]), targs, watcher=w, storage=st)\n'
-        '        results.append({"tool": step["name"], "output": out})\n'
+        "    with Storage() as st:\n"
+        "        w = SystemWatcher(get_settings(), storage=st)\n"
+        "        results: list[dict[str, Any]] = []\n"
+        "        for step in _WORKFLOW_STEPS:\n"
+        '            targs = dict(step.get("arguments") or {})\n'
+        '            if arguments.get("path") and "path" in targs:\n'
+        '                targs["path"] = arguments["path"]\n'
+        '            if arguments.get("query") and "query" in targs:\n'
+        '                targs["query"] = arguments["query"]\n'
+        '            out = execute_tool(str(step["name"]), targs, watcher=w, storage=st)\n'
+        '            results.append({"tool": step["name"], "output": out})\n'
         "    return json.dumps(results, ensure_ascii=False)\n\n\n"
         "TOOLS = [\n"
         "    {\n"
@@ -1662,6 +1662,9 @@ def evaluate_graduation_arena(storage: Storage) -> dict[str, Any]:
             candidates[tool_name] = {"samples": tot, "accuracy": acc}
             if tot >= 5 and acc >= 0.88 and tool_name not in graduated:
                 graduated.append(tool_name)
-    if graduated != list(sh.get("graduated") or []):
+    prev_saved = _load_json_memory(storage, "_internal:graduated_tools", [])
+    if not isinstance(prev_saved, list):
+        prev_saved = []
+    if graduated != prev_saved:
         _save_json_memory(storage, "_internal:graduated_tools", graduated[-32:])
     return {"graduated": graduated, "candidates": candidates}

@@ -19,6 +19,7 @@ def _now_iso() -> str:
 _DB_LOCKS_GUARD = threading.Lock()
 _DB_LOCKS: dict[str, threading.RLock] = {}
 _INITIALIZED_DBS: set[str] = set()
+_FTS_ENABLED_DBS: set[str] = set()
 
 
 def _get_db_lock(db_path: Path) -> threading.RLock:
@@ -45,6 +46,10 @@ class Storage(_BrainStorageMixin):
         if db_key not in _INITIALIZED_DBS or not self.db_path.is_file():
             self._init_schema()
             _INITIALIZED_DBS.add(db_key)
+            if self._fts_enabled:
+                _FTS_ENABLED_DBS.add(db_key)
+        else:
+            self._fts_enabled = db_key in _FTS_ENABLED_DBS
 
     def close(self) -> None:
         with self._lock:
@@ -366,8 +371,22 @@ class Storage(_BrainStorageMixin):
                 self._fts_dirty = True
             return deleted
 
-    def resolve_memory_conflicts(self, base_key: str, preferred_value: str | None = None) -> bool:
-        """Resolve conflicting memory variations by key prefix, keeping either preferred or newest."""
+    def resolve_memory_conflicts(
+        self, base_key: str | None = None, preferred_value: str | None = None
+    ) -> int | bool:
+        """Resolve conflicting memory variations by key prefix (or all prefixes when base_key is None)."""
+        if base_key is None:
+            resolved = 0
+            with self._lock, self._connect() as conn:
+                keys = [
+                    str(r["key"])
+                    for r in conn.execute("SELECT key FROM memories WHERE key NOT LIKE '_internal:%'").fetchall()
+                ]
+            prefixes = {k.split(":", 1)[0] for k in keys if ":" in k}
+            for prefix in prefixes:
+                if self.resolve_memory_conflicts(prefix):
+                    resolved += 1
+            return resolved
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT key, value, updated_at FROM memories WHERE key = ? OR key LIKE ? ORDER BY updated_at DESC",
