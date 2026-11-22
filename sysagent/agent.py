@@ -351,9 +351,12 @@ class AgentManager:
         client = self._get_client()
         model = str(kwargs["model"])
         if model in {"local", "local-mind", "local_mind"}:
-            from .local_mind import LocalMindClient
+            local_client = getattr(self, "_local_client", None)
+            if local_client is None:
+                from .local_mind import LocalMindClient
 
-            local_client = LocalMindClient(self.storage)
+                local_client = LocalMindClient(self.storage)
+                self._local_client = local_client
             self.storage.record_model_request("local-mind")
             return await asyncio.to_thread(local_client.interactions.create, **kwargs)
         try:
@@ -396,9 +399,12 @@ class AgentManager:
                     return await self._create_safe(client, kwargs)
                 except Exception:
                     pass
-            from .local_mind import LocalMindClient
+            local_client = getattr(self, "_local_client", None)
+            if local_client is None:
+                from .local_mind import LocalMindClient
 
-            local_client = LocalMindClient(self.storage)
+                local_client = LocalMindClient(self.storage)
+                self._local_client = local_client
             self.storage.record_model_request("local-mind")
             return await asyncio.to_thread(local_client.interactions.create, **kwargs)
 

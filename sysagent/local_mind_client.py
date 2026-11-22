@@ -21,6 +21,78 @@ class _LocalMindInteractions:
 
         self.mind = LocalMind(storage)
         self._last_user_input: dict[str, str] = {}
+        self._history: dict[str, list[dict[str, str]]] = {}
+
+    @staticmethod
+    def _format_tool_catalog(tools: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for t in tools[:14]:
+            if not isinstance(t, dict) or not t.get("name"):
+                continue
+            params = list(((t.get("parameters") or {}).get("properties") or {}).keys())[:5]
+            desc = str(t.get("description") or "").splitlines()[0][:85]
+            sig = f"{t['name']}({', '.join(params)})"
+            lines.append(f"- {sig}: {desc}")
+        if not lines:
+            return ""
+        return (
+            "Available tools:\n"
+            + "\n".join(lines)
+            + '\nIf a tool is required to answer accurately, respond ONLY with JSON: {"tool": "<name>", "args": {...}}.'
+            " Otherwise, reply directly in natural plain text without JSON."
+        )
+
+    @staticmethod
+    def _extract_tool_call(text: str, allowed: set[str]) -> tuple[str, dict[str, Any]] | None:
+        import json as _json
+
+        raw = (text or "").strip()
+        if not raw or "{" not in raw:
+            return None
+        if raw.startswith("```"):
+            parts = raw.split("```")
+            if len(parts) >= 2:
+                raw = parts[1].lstrip("json").strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            obj = _json.loads(raw[start : end + 1])
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        tname = str(obj.get("tool") or obj.get("name") or "").strip()
+        targs = obj.get("args") if isinstance(obj.get("args"), dict) else obj.get("arguments")
+        if tname in allowed:
+            return tname, (targs if isinstance(targs, dict) else {})
+        return None
+
+    def _emit_step(self, new_id: str, step: Any, stream: bool) -> Any:
+        if stream:
+            def _fgen():
+                yield SimpleNamespace(event_type="step.complete", step=step)
+                yield SimpleNamespace(
+                    event_type="interaction.complete",
+                    interaction=SimpleNamespace(id=new_id, steps=[step], output_text=""),
+                )
+            return _fgen()
+        return SimpleNamespace(id=new_id, steps=[step], output_text="")
+
+    def _emit_text(self, new_id: str, reply: str, stream: bool) -> Any:
+        if stream:
+            def _tgen():
+                yield SimpleNamespace(
+                    event_type="step.delta",
+                    delta=SimpleNamespace(type="text", text=reply),
+                )
+                yield SimpleNamespace(
+                    event_type="interaction.complete",
+                    interaction=SimpleNamespace(id=new_id, steps=[], output_text=reply),
+                )
+            return _tgen()
+        return SimpleNamespace(id=new_id, steps=[], output_text=reply)
 
     def create(
         self,
@@ -33,8 +105,11 @@ class _LocalMindInteractions:
         stream: bool = False,
         **kwargs: Any,
     ) -> Any:
+        import json as _json
+
         new_id = f"local-{uuid.uuid4().hex[:10]}"
         sys_inst = system_instruction or ""
+        prev_hist = list(self._history.get(previous_interaction_id or "", []))
 
         if "Respond ONLY with valid JSON" in sys_inst or "Respond ONLY with JSON" in sys_inst:
             json_reply = '{"decision": "ignore", "confidence": 85, "thought": "Offline local mode: no critical action required."}'
@@ -42,35 +117,30 @@ class _LocalMindInteractions:
                 json_reply = '{"candidates": [], "notes": "Offline local mode"}'
             elif "approved" in sys_inst:
                 json_reply = '{"approved": true, "critique": "Offline local check"}'
-            if stream:
-                def _jgen():
-                    yield SimpleNamespace(
-                        event_type="step.delta",
-                        delta=SimpleNamespace(type="text", text=json_reply),
-                    )
-                return _jgen()
-            return SimpleNamespace(id=new_id, steps=[], output_text=json_reply)
+            return self._emit_text(new_id, json_reply, stream)
 
         if isinstance(input, list):
             orig_q = self._last_user_input.get(previous_interaction_id or "", "")
-            reply = self.mind.synthesize_reply(orig_q, tool_results=input, system_instruction=sys_inst)
-            if stream:
-                def _rgen():
-                    yield SimpleNamespace(
-                        event_type="step.delta",
-                        delta=SimpleNamespace(type="text", text=reply),
-                    )
-                    yield SimpleNamespace(
-                        event_type="interaction.complete",
-                        interaction=SimpleNamespace(id=new_id, steps=[], output_text=reply),
-                    )
-                return _rgen()
-            return SimpleNamespace(id=new_id, steps=[], output_text=reply)
+            summary_prompt = (
+                f"User request: {orig_q}\n"
+                f"Tool results: {_json.dumps(input, ensure_ascii=False)[:2400]}\n"
+                "Answer the user's request concisely in their language based on these tool results."
+            )
+            reply = self.mind.run_gguf_inference(
+                summary_prompt, system_instruction=sys_inst, history=prev_hist
+            ) or self.mind.synthesize_reply(orig_q, tool_results=input, system_instruction=sys_inst)
+            self._history[new_id] = (prev_hist + [{"role": "user", "content": orig_q}, {"role": "assistant", "content": reply}])[-8:]
+            return self._emit_text(new_id, reply, stream)
 
         user_text = str(input or "")
         self._last_user_input[new_id] = user_text
+        self._history[new_id] = prev_hist
         if len(self._last_user_input) > 200:
-            self._last_user_input.pop(next(iter(self._last_user_input)), None)
+            oldest = next(iter(self._last_user_input))
+            self._last_user_input.pop(oldest, None)
+            self._history.pop(oldest, None)
+
+        allowed: set[str] = set()
         if tools:
             allowed = {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
             low_u = user_text.lower()
@@ -85,41 +155,41 @@ class _LocalMindInteractions:
                             name="switch_model",
                             arguments={"model": alias},
                         )
-                        return SimpleNamespace(id=new_id, steps=[step], output_text="")
+                        return self._emit_step(new_id, step, stream)
 
-            from .local_mind import classify_task_role
-
-            min_score = 0.65 if classify_task_role(user_text) == "chat" else 0.50
             pred_tool, pred_args, score = self.mind.predict_tool(user_text, allowed_names=allowed)
-            if pred_tool and score >= min_score:
+            if pred_tool and score >= 0.72:
                 step = SimpleNamespace(
                     type="function_call",
                     id=f"local_call_{uuid.uuid4().hex[:6]}",
                     name=pred_tool,
                     arguments=pred_args,
                 )
-                if stream:
-                    def _fgen():
-                        yield SimpleNamespace(
-                            event_type="step.complete",
-                            step=step,
-                        )
-                        yield SimpleNamespace(
-                            event_type="interaction.complete",
-                            interaction=SimpleNamespace(id=new_id, steps=[step], output_text=""),
-                        )
-                    return _fgen()
-                return SimpleNamespace(id=new_id, steps=[step], output_text="")
+                return self._emit_step(new_id, step, stream)
 
-        reply = self.mind.synthesize_reply(user_text, tool_results=None, system_instruction=sys_inst)
-        if stream:
-            def _tgen():
-                yield SimpleNamespace(
-                    event_type="step.delta",
-                    delta=SimpleNamespace(type="text", text=reply),
+        extra_sys = self._format_tool_catalog(tools) if tools else ""
+        reply = self.mind.run_gguf_inference(
+            user_text,
+            system_instruction=sys_inst,
+            history=prev_hist,
+            extra_system=extra_sys,
+        )
+        if reply and allowed:
+            parsed = self._extract_tool_call(reply, allowed)
+            if parsed is not None:
+                tname, targs = parsed
+                step = SimpleNamespace(
+                    type="function_call",
+                    id=f"local_call_{uuid.uuid4().hex[:6]}",
+                    name=tname,
+                    arguments=targs,
                 )
-            return _tgen()
-        return SimpleNamespace(id=new_id, steps=[], output_text=reply)
+                return self._emit_step(new_id, step, stream)
+
+        if not reply:
+            reply = self.mind.synthesize_reply(user_text, tool_results=None, system_instruction=sys_inst)
+        self._history[new_id] = (prev_hist + [{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])[-8:]
+        return self._emit_text(new_id, reply, stream)
 
 
 class LocalMindClient:

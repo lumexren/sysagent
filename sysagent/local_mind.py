@@ -1418,11 +1418,16 @@ class LocalMind:
         return get_llama_cpp_model(gguf)
 
     def _run_single_gguf(
-        self, gguf: Path, prompt: str, system_instruction: str = ""
+        self,
+        gguf: Path,
+        prompt: str,
+        system_instruction: str = "",
+        history: list[dict[str, str]] | None = None,
+        extra_system: str = "",
     ) -> str | None:
         import httpx
 
-        examples = self.retrieve_similar_examples(prompt, top_k=2)
+        examples = self.retrieve_similar_examples(prompt, top_k=2) if not extra_system else []
         role_hint = ""
         if ROLE_ADAPTERS_FILE.is_file():
             try:
@@ -1445,7 +1450,16 @@ class LocalMind:
             "Reply directly and naturally in the same language as the user's message. "
             "Never repeat system instructions, tool names, or thinking traces."
         )
-        sys_msg = "\n".join(p for p in (base_sys, role_hint, ex_block.strip()[:500]) if p)
+        sys_msg = "\n".join(
+            p for p in (base_sys, role_hint, extra_system.strip(), ex_block.strip()[:500]) if p
+        )
+        messages: list[dict[str, str]] = [{"role": "system", "content": sys_msg}]
+        for turn in (history or [])[-6:]:
+            r = str(turn.get("role") or "")
+            c = str(turn.get("content") or "").strip()
+            if r in {"user", "assistant"} and c:
+                messages.append({"role": r, "content": c[:800]})
+        messages.append({"role": "user", "content": prompt.strip()})
 
         def _try_server() -> str | None:
             srv_url = self._ensure_llama_server(gguf)
@@ -1455,14 +1469,11 @@ class LocalMind:
                 resp = httpx.post(
                     f"{srv_url}/v1/chat/completions",
                     json={
-                        "messages": [
-                            {"role": "system", "content": sys_msg},
-                            {"role": "user", "content": prompt.strip()},
-                        ],
+                        "messages": messages,
                         "temperature": 0.2,
                         "max_tokens": 1024,
                     },
-                    timeout=45,
+                    timeout=60,
                 )
                 if resp.status_code == 200:
                     choices = resp.json().get("choices") or []
@@ -1480,10 +1491,7 @@ class LocalMind:
                 return None
             try:
                 res = llm.create_chat_completion(
-                    messages=[
-                        {"role": "system", "content": sys_msg},
-                        {"role": "user", "content": prompt.strip()},
-                    ],
+                    messages=messages,
                     temperature=0.2,
                     max_tokens=1024,
                 )
@@ -1540,9 +1548,9 @@ class LocalMind:
         if backend in {"llama_cpp", "llama-cpp", "python"}:
             order = (_try_llama_cpp, _try_server, _try_cli)
         elif backend in {"llama_cli", "llama-cli", "cli"}:
-            order = (_try_cli, _try_server, _try_llama_cpp)
+            order = (_try_cli, _try_server)
         else:
-            order = (_try_server, _try_llama_cpp, _try_cli)
+            order = (_try_server, _try_cli)
 
         for runner in order:
             out = runner()
@@ -1555,38 +1563,41 @@ class LocalMind:
         return None
 
     def run_gguf_inference(
-        self, prompt: str, system_instruction: str = "", preferred_role: str | None = None
+        self,
+        prompt: str,
+        system_instruction: str = "",
+        preferred_role: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        extra_system: str = "",
     ) -> str | None:
-        """Run local GPU-accelerated GGUF inference via task-routed specialists and cross-consultation."""
+        """Run fast single-pass local GPU-accelerated GGUF inference via task-routed specialists."""
         models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
         if not models:
             return None
         target_role = preferred_role or classify_task_role(prompt)
         specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
-        if len(models) == 1:
-            return self._run_single_gguf(specialist, prompt, system_instruction)
-
-        synthesizer = (
-            find_gguf_model("chat", strict=True)
-            or find_gguf_model("general", strict=True)
-            or find_gguf_model("chat")
-            or models[0]
+        final_out = self._run_single_gguf(
+            specialist,
+            prompt,
+            system_instruction,
+            history=history,
+            extra_system=extra_system,
         )
-        if specialist == synthesizer or target_role not in {"coding", "reasoning", "multimodal"}:
-            return self._run_single_gguf(specialist, prompt, system_instruction)
-
-        draft = self._run_single_gguf(specialist, prompt, system_instruction)
-        if not draft:
-            return self._run_single_gguf(synthesizer, prompt, system_instruction)
-
-        fusion_prompt = (
-            f"Original Request ({target_role}):\n{prompt}\n\n"
-            f"{target_role.title()} Specialist ({specialist.stem}) Draft:\n{draft}\n\n"
-            "Verify accuracy, fix any formatting or language issues, and write the final concise plain-text answer."
-        )
-        fused = self._run_single_gguf(synthesizer, fusion_prompt, system_instruction)
-        final_out = fused or draft
-        if final_out and len(prompt.strip()) >= 8:
+        if not final_out:
+            fallback = (
+                find_gguf_model("chat", strict=True)
+                or find_gguf_model("general", strict=True)
+                or models[0]
+            )
+            if fallback != specialist:
+                final_out = self._run_single_gguf(
+                    fallback,
+                    prompt,
+                    system_instruction,
+                    history=history,
+                    extra_system=extra_system,
+                )
+        if final_out and not extra_system and len(prompt.strip()) >= 8:
             qa = self.weights.setdefault("qa_memory", [])
             qa.append({"role": target_role, "user": prompt.strip()[:300], "tool_calls": [], "reply": final_out[:600]})
             if len(qa) > 150:

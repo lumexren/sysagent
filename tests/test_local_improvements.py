@@ -163,6 +163,37 @@ class LocalAndStorageImprovementsTests(unittest.TestCase):
                 lines_after_force = len(ds.read_text(encoding="utf-8").splitlines())
                 self.assertEqual(lines_after_first, lines_after_force)
 
+    def test_local_mind_client_gguf_tool_calling_and_history(self) -> None:
+        from sysagent.local_mind_client import LocalMindClient
+
+        client = LocalMindClient(storage=None)
+        tools = [
+            {
+                "name": "list_directory",
+                "description": "List files in a directory.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }
+        ]
+        with patch.object(client.interactions.mind, "predict_tool", return_value=(None, {}, 0.0)), patch.object(
+            client.interactions.mind,
+            "run_gguf_inference",
+            return_value='{"tool": "list_directory", "args": {"path": "~/Downloads"}}',
+        ):
+            r1 = client.interactions.create(input="Downloads klasöründe ne var?", tools=tools)
+            self.assertEqual(len(r1.steps), 1)
+            self.assertEqual(r1.steps[0].name, "list_directory")
+            self.assertEqual(r1.steps[0].arguments, {"path": "~/Downloads"})
+
+        with patch.object(
+            client.interactions.mind, "run_gguf_inference", return_value="Downloads klasöründe 2 dosya var."
+        ):
+            r2 = client.interactions.create(
+                input=[{"name": "list_directory", "result": '{"entries": ["a.pdf", "b.png"]}'}],
+                previous_interaction_id=r1.id,
+            )
+            self.assertIn("2 dosya", r2.output_text)
+            self.assertGreaterEqual(len(client.interactions._history[r2.id]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
