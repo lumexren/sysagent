@@ -259,6 +259,16 @@ def _cmd_local(base_url: str, action: str, query: str | None = None, locale: str
             prof = discover_system_profile(Storage(), seed=True, force=True)
             print(json.dumps(prof, indent=2, ensure_ascii=False))
             return
+        if action == "curriculum":
+            try:
+                resp = ipc_get(f"{base_url}/api/local/curriculum", headers=hdrs, timeout=10)
+                resp.raise_for_status()
+                cur = resp.json()
+            except Exception:
+                with Storage() as st_db:
+                    cur = LocalMind(st_db).build_distillation_curriculum()
+            print(json.dumps(cur, indent=2, ensure_ascii=False))
+            return
         if action == "test":
             mind = LocalMind(Storage())
             q = query or "check system status cpu ram"

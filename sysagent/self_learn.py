@@ -58,10 +58,12 @@ _SAFE_SELF_PLAY_TOOLS = frozenset(
 _SAFE_WORKFLOW_TOOLS = frozenset(
     {
         "system_status",
+        "inspect_self_component",
         "list_directory",
         "read_file",
         "search_files",
         "read_journal_logs",
+        "list_systemd_units",
         "list_events",
         "recall_memories",
         "search_memory_and_history",
@@ -1211,8 +1213,34 @@ def compact_distilled_dataset(max_per_class: int = 80, sim_threshold: float = 0.
 
 
 def _build_workflow_plugin_source(tool_name: str, sig: str, goal: str, step_specs: list[dict[str, Any]]) -> str:
-    """Render a standalone verified plugin module combining a repeated safe tool sequence."""
+    """Render a standalone verified plugin module combining a repeated safe tool sequence with parameterized overrides."""
+    from .tools import TOOL_DECLARATIONS
+
+    param_props: dict[str, dict[str, str]] = {
+        "path": {"type": "string", "description": "Optional path override"},
+        "query": {"type": "string", "description": "Optional query override"},
+        "unit": {"type": "string", "description": "Optional systemd unit override"},
+        "component": {"type": "string", "description": "Optional component override"},
+        "limit": {"type": "integer", "description": "Optional limit override"},
+    }
+    tool_schema_map: dict[str, list[str]] = {}
+    decl_by_name = {str(d.get("name") or ""): d for d in TOOL_DECLARATIONS if isinstance(d, dict)}
+    for st in step_specs:
+        sname = str(st.get("name") or "")
+        decl = decl_by_name.get(sname) or {}
+        props = (decl.get("parameters") or {}).get("properties") or {}
+        if isinstance(props, dict):
+            tool_schema_map[sname] = [str(k) for k in props.keys()]
+            for k, v in props.items():
+                if k not in param_props and isinstance(v, dict):
+                    param_props[str(k)] = {
+                        "type": str(v.get("type") or "string"),
+                        "description": str(v.get("description") or f"Optional {k} override"),
+                    }
+
     steps_lit = json.dumps(step_specs, ensure_ascii=False)
+    schema_lit = json.dumps(tool_schema_map, ensure_ascii=False)
+    props_lit = json.dumps(param_props, ensure_ascii=False)
     desc_lit = json.dumps(f"Auto-forged macro for workflow '{sig}' ({goal[:60]})", ensure_ascii=False)
     name_lit = json.dumps(tool_name)
     return (
@@ -1220,24 +1248,28 @@ def _build_workflow_plugin_source(tool_name: str, sig: str, goal: str, step_spec
         "from __future__ import annotations\n\n"
         "import json\n"
         "from typing import Any\n\n"
-        f"_WORKFLOW_STEPS = json.loads({json.dumps(steps_lit)})\n\n\n"
+        f"_WORKFLOW_STEPS = json.loads({json.dumps(steps_lit)})\n"
+        f"_STEP_PARAM_KEYS = json.loads({json.dumps(schema_lit)})\n"
+        f"_MACRO_PROPERTIES = json.loads({json.dumps(props_lit)})\n\n\n"
         "def execute(arguments: dict[str, Any]) -> str:\n"
         '    """Run the learned read-only workflow steps sequentially and return combined JSON."""\n'
         "    from sysagent.config import get_settings\n"
         "    from sysagent.storage import Storage\n"
         "    from sysagent.tools import execute_tool\n"
         "    from sysagent.watcher import SystemWatcher\n\n"
+        "    call_args = arguments if isinstance(arguments, dict) else {}\n"
         "    with Storage() as st:\n"
         "        w = SystemWatcher(get_settings(), storage=st)\n"
         "        results: list[dict[str, Any]] = []\n"
         "        for step in _WORKFLOW_STEPS:\n"
+        '            sname = str(step["name"])\n'
         '            targs = dict(step.get("arguments") or {})\n'
-        '            if arguments.get("path") and "path" in targs:\n'
-        '                targs["path"] = arguments["path"]\n'
-        '            if arguments.get("query") and "query" in targs:\n'
-        '                targs["query"] = arguments["query"]\n'
-        '            out = execute_tool(str(step["name"]), targs, watcher=w, storage=st)\n'
-        '            results.append({"tool": step["name"], "output": out})\n'
+        "            allowed_keys = set(_STEP_PARAM_KEYS.get(sname) or targs.keys())\n"
+        "            for k, val in call_args.items():\n"
+        "                if val not in (None, '') and (k in allowed_keys or k in targs):\n"
+        "                    targs[k] = val\n"
+        "            out = execute_tool(sname, targs, watcher=w, storage=st)\n"
+        '            results.append({"tool": sname, "arguments": targs, "output": out})\n'
         "    return json.dumps(results, ensure_ascii=False)\n\n\n"
         "TOOLS = [\n"
         "    {\n"
@@ -1246,10 +1278,7 @@ def _build_workflow_plugin_source(tool_name: str, sig: str, goal: str, step_spec
         f'            "description": {desc_lit},\n'
         '            "parameters": {\n'
         '                "type": "object",\n'
-        '                "properties": {\n'
-        '                    "path": {"type": "string", "description": "Optional path override"},\n'
-        '                    "query": {"type": "string", "description": "Optional query override"},\n'
-        "                },\n"
+        '                "properties": _MACRO_PROPERTIES,\n'
         "            },\n"
         "        },\n"
         '        "handler": execute,\n'
@@ -1512,8 +1541,53 @@ def surgical_git_rollback(repo_dir: Path, proposal_id: int) -> bool:
         return False
 
 
+def prune_dead_macro_skills(
+    storage: Storage,
+    plugins: Any = None,
+    max_error_rate: float = 0.65,
+    min_calls: int = 4,
+) -> list[str]:
+    """Quarantine auto-forged workflow macro plugins that repeatedly fail in production."""
+    from .plugins import PLUGINS_DIR
+
+    pdir = Path(getattr(plugins, "plugins_dir", None) or PLUGINS_DIR)
+    if not pdir.is_dir():
+        return []
+
+    pruned: list[str] = []
+    metrics_by_name = {
+        str(m.get("tool_name") or ""): m for m in storage.get_tool_metrics(limit=50) if isinstance(m, dict)
+    }
+    for py_file in sorted(pdir.glob("auto_workflow_*.py")):
+        slug = py_file.stem[len("auto_workflow_") :]
+        tool_name = f"macro_{slug}"
+        m = metrics_by_name.get(tool_name)
+        if not m:
+            continue
+        calls = int(m.get("calls") or 0)
+        errors = int(m.get("errors") or 0)
+        if calls < min_calls:
+            continue
+        err_rate = errors / max(1, calls)
+        if err_rate >= max_error_rate:
+            qpath = py_file.with_suffix(".py.quarantine")
+            try:
+                py_file.replace(qpath)
+                pruned.append(tool_name)
+                storage.add_lesson(
+                    f"dead_skill_gc:{tool_name}",
+                    f"Retired auto-forged macro `{tool_name}` due to high error rate ({errors}/{calls} = {int(err_rate * 100)}%).",
+                    f"Archived to {qpath.name}",
+                )
+            except Exception:
+                pass
+    if pruned and plugins and hasattr(plugins, "reload"):
+        plugins.reload()
+    return pruned
+
+
 def heal_runtime_anomalies(storage: Storage, plugins: Any = None) -> dict[str, Any]:
-    """Quarantine broken plugins and compute adaptive runtime tuning for slow/error-prone tools."""
+    """Quarantine broken plugins, prune failing auto-forged macros, and compute adaptive runtime tuning."""
     from .plugins import PLUGINS_DIR, validate_plugin_code_isolated
 
     pdir = Path(getattr(plugins, "plugins_dir", None) or PLUGINS_DIR)
@@ -1542,6 +1616,8 @@ def heal_runtime_anomalies(storage: Storage, plugins: Any = None) -> dict[str, A
     if quarantined and plugins and hasattr(plugins, "reload"):
         plugins.reload()
 
+    pruned_macros = prune_dead_macro_skills(storage, plugins)
+
     tuning: dict[str, Any] = _load_json_memory(storage, _RUNTIME_TUNING_KEY, {})
     if not isinstance(tuning, dict):
         tuning = {}
@@ -1566,7 +1642,7 @@ def heal_runtime_anomalies(storage: Storage, plugins: Any = None) -> dict[str, A
     if tuned_tools:
         _save_json_memory(storage, _RUNTIME_TUNING_KEY, tuning)
 
-    return {"quarantined": quarantined, "tuned_tools": tuned_tools}
+    return {"quarantined": quarantined, "pruned_macros": pruned_macros, "tuned_tools": tuned_tools}
 
 
 def build_self_roadmap(storage: Storage) -> list[dict[str, Any]]:

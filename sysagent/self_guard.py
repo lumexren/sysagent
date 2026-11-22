@@ -240,6 +240,85 @@ class SelfGuard:
                 )
         return result
 
+    def audit_dpo_preferences(self, auto_repair: bool = True) -> dict[str, Any]:
+        """Audit saved DPO preference pairs against live LocalMind routing and auto-recalibrate regressions."""
+        from .local_mind import PREFERENCE_FILE, LocalMind
+
+        if not PREFERENCE_FILE.is_file():
+            return {
+                "total_pairs": 0,
+                "consistent_before": 0,
+                "consistent_after": 0,
+                "repaired": 0,
+                "consistency_score": 1.0,
+            }
+
+        pairs: list[tuple[str, str, dict[str, Any], str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for raw_ln in PREFERENCE_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]:
+            ln = raw_ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            user_q = str(rec.get("user") or "").strip()
+            chosen = rec.get("chosen") if isinstance(rec.get("chosen"), dict) else {}
+            rejected = rec.get("rejected") if isinstance(rec.get("rejected"), dict) else {}
+            c_tool = str(chosen.get("tool") or "").strip()
+            r_tool = str(rejected.get("tool") or "").strip()
+            c_args = chosen.get("arguments") if isinstance(chosen.get("arguments"), dict) else {}
+            if not user_q or not c_tool or not r_tool or c_tool == r_tool:
+                continue
+            key = (user_q.lower(), c_tool, r_tool)
+            if key not in seen:
+                seen.add(key)
+                pairs.append((user_q, c_tool, dict(c_args), r_tool))
+
+        total = len(pairs)
+        if total == 0:
+            return {
+                "total_pairs": 0,
+                "consistent_before": 0,
+                "consistent_after": 0,
+                "repaired": 0,
+                "consistency_score": 1.0,
+            }
+
+        mind = LocalMind(self.storage)
+        ok_before = 0
+        repaired = 0
+        ok_after = 0
+        for user_q, c_tool, c_args, r_tool in pairs:
+            pred_tool, _, _ = mind.predict_tool(user_q, record_uncertain=False)
+            if pred_tool == c_tool:
+                ok_before += 1
+                ok_after += 1
+                continue
+            if auto_repair:
+                try:
+                    mind._update_weights_incremental(user_q, c_tool, c_args)
+                    from .neural import NeuralEngine
+
+                    NeuralEngine(self.storage).online_preference_step(user_q, c_tool, r_tool, lr=0.14)
+                    repaired += 1
+                except Exception:
+                    pass
+                pred_after, _, _ = mind.predict_tool(user_q, record_uncertain=False)
+                if pred_after == c_tool:
+                    ok_after += 1
+
+        return {
+            "total_pairs": total,
+            "consistent_before": ok_before,
+            "consistent_after": ok_after,
+            "repaired": repaired,
+            "consistency_score": round(ok_after / max(1, total), 4),
+        }
+
     def calibrate_thresholds(self) -> dict[str, Any]:
         """Dynamically tune local routing and bottleneck deferral thresholds from live metrics."""
         tool_acc = 0.85
@@ -270,6 +349,10 @@ class SelfGuard:
             local_max_words = 22
 
         bottleneck_defer = 0.72 if forecast_mae <= 6.0 else 0.82
+        try:
+            dpo_audit = self.audit_dpo_preferences(auto_repair=True)
+        except Exception:
+            dpo_audit = {"total_pairs": 0, "consistency_score": 1.0}
         cal = {
             "local_tool_threshold": local_tool_thresh,
             "local_max_words": local_max_words,
@@ -277,6 +360,7 @@ class SelfGuard:
             "tool_accuracy": round(tool_acc, 4),
             "tool_error_rate": round(err_rate, 4),
             "forecast_mae": round(forecast_mae, 2),
+            "dpo_audit": dpo_audit,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
         self.storage.set_memory("_internal:self_calibration", json.dumps(cal, ensure_ascii=False))
@@ -300,18 +384,33 @@ class SelfGuard:
         probes["unix_socket"] = {"ok": sock.exists(), "path": str(sock)}
 
         try:
+            from .local_mind import SEMANTIC_INDEX_FILE
             from .neural import NeuralEngine
 
-            wf = NeuralEngine(self.storage).predict_world_state()
+            eng = NeuralEngine(self.storage)
+            wf = eng.predict_world_state()
             probes["neural"] = {"ok": isinstance(wf, dict), "samples": int(wf.get("samples", 0) or 0)}
+            probes["semantic_index"] = {
+                "ok": True,
+                "persisted": SEMANTIC_INDEX_FILE.is_file(),
+            }
         except Exception as exc:
             probes["neural"] = {"ok": False, "error": str(exc)}
+            probes["semantic_index"] = {"ok": False, "error": str(exc)}
 
         try:
+            from .local_inference import get_aux_warm_model_name, get_vram_info, get_warm_model_name
             from .local_mind import find_all_gguf_models
 
             cnt = len(find_all_gguf_models())
-            probes["local_models"] = {"ok": cnt >= 0, "count": cnt}
+            vram = get_vram_info()
+            probes["local_models"] = {
+                "ok": cnt >= 0,
+                "count": cnt,
+                "dual_slot_ready": bool(vram.get("available") and int(vram.get("total_mb", 0)) >= 8000),
+                "active_slot": get_warm_model_name(),
+                "aux_slot": get_aux_warm_model_name(),
+            }
         except Exception as exc:
             probes["local_models"] = {"ok": False, "error": str(exc)}
 

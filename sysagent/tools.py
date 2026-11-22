@@ -60,15 +60,42 @@ def execute_tool(
         if name == "run_command":
             cmd = str(arguments["command"])
             cwd = str(_resolve(arguments["cwd"])) if arguments.get("cwd") else str(Path.home())
-            proc = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=os.environ.copy(),
-            )
+            timeout_sec = int(arguments.get("timeout") or 60)
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    shell=True,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                    env=os.environ.copy(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raw_out = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+                raw_err = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+                part_out = raw_out[-3000:]
+                part_err = raw_err[-2000:]
+                tail_low = (part_out[-400:] + "\n" + part_err[-400:]).lower()
+                prompt_cues = ("[y/n]", "(y/n)", "password:", "passphrase", "proceed?", "continue?", "[yes/no]")
+                interactive_stall = any(cue in tail_low for cue in prompt_cues)
+                recovery_hint = (
+                    "Command appears stalled waiting for interactive confirmation/input; retry with non-interactive flags (e.g. -y, --yes, --noconfirm, DEBIAN_FRONTEND=noninteractive)."
+                    if interactive_stall
+                    else "Command timed out; inspect partial_stdout/partial_stderr or limit scope."
+                )
+                return json.dumps(
+                    {
+                        "error": f"Command timed out after {timeout_sec}s",
+                        "exit_code": 124,
+                        "timed_out": True,
+                        "interactive_stall": interactive_stall,
+                        "partial_stdout": part_out,
+                        "partial_stderr": part_err,
+                        "recovery_hint": recovery_hint,
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(
                 {
                     "exit_code": proc.returncode,

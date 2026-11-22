@@ -602,17 +602,60 @@ def _short_cwd(cwd: Path) -> str:
 def record_last_shell_error(
     command: str, exit_code: int, cwd: str, stderr_text: str = ""
 ) -> Path:
-    """Persist the latest failed terminal command and trailing stderr lines for `sysagent fix`."""
+    """Persist the latest failed terminal command, trailing stderr, repeat count, and pre-matched 0-token fix."""
     from datetime import datetime
 
     err_file = DATA_DIR / "last_error.json"
     err_file.parent.mkdir(parents=True, exist_ok=True)
+    clean_cmd = str(command or "").strip()[:1000]
+    code_int = int(exit_code or 1)
     stderr_clean = "\n".join((stderr_text or "").splitlines()[-30:])[-2500:]
-    payload = {
-        "command": str(command or "").strip()[:1000],
-        "exit_code": int(exit_code or 1),
+
+    repeat_count = 1
+    if err_file.is_file():
+        try:
+            prev = json.loads(err_file.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(prev, dict) and str(prev.get("command") or "") == clean_cmd:
+                repeat_count = int(prev.get("repeat_count") or 1) + 1
+        except Exception:
+            pass
+
+    instant_fix: dict[str, object] | None = None
+    recovery_hint = ""
+    try:
+        from .self_guard import match_cached_fix
+        from .self_resilience import build_recovery_hint
+
+        with Storage() as st:
+            hit = match_cached_fix(st, clean_cmd, code_int)
+            if isinstance(hit, dict) and hit.get("lesson"):
+                instant_fix = dict(hit)
+            hint_val = build_recovery_hint(
+                st,
+                "run_command",
+                {"command": clean_cmd},
+                json.dumps({"exit_code": code_int, "stderr": stderr_clean}, ensure_ascii=False),
+            )
+            if hint_val:
+                recovery_hint = str(hint_val)
+            if repeat_count >= 2 and (instant_fix or recovery_hint):
+                hint_txt = str(instant_fix.get("lesson") if instant_fix else recovery_hint)[:160]
+                st.add_brain_thought(
+                    "info",
+                    70,
+                    f"Repeated shell failure (x{repeat_count}) on `{clean_cmd}` -> instant fix ready: {hint_txt}",
+                )
+    except Exception:
+        pass
+
+    payload: dict[str, object] = {
+        "command": clean_cmd,
+        "exit_code": code_int,
         "cwd": str(cwd or "."),
         "stderr": stderr_clean,
+        "repeat_count": repeat_count,
+        "instant_fix": instant_fix,
+        "recovery_hint": recovery_hint,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
     tmp = err_file.with_suffix(".json.tmp")
@@ -1538,6 +1581,7 @@ def _cmd_self(
     base_url: str,
     action: str,
     locale_override: str | None = None,
+    target_arg: str | None = None,
 ) -> None:
     loc = locale_override or get_settings().locale
     hdrs = _auth_headers()
@@ -1562,9 +1606,11 @@ def _cmd_self(
             print(json.dumps(data, indent=2, ensure_ascii=False))
             return
 
-        if action in {"drift", "breakers", "quota"}:
+        if action in {"drift", "breakers", "quota", "twin", "blast", "dpo"}:
+            target_sym = (target_arg or "execute_tool").strip()
             try:
-                resp = ipc_get(f"{base_url}/api/self/{action}", headers=hdrs, timeout=15)
+                params = {"target": target_sym} if action == "blast" else None
+                resp = ipc_get(f"{base_url}/api/self/{action}", params=params, headers=hdrs, timeout=15)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception:
@@ -1574,6 +1620,16 @@ def _cmd_self(
                     sg = SelfGuard(get_settings(), st)
                     if action == "drift":
                         data = sg.run_drift_audit()
+                    elif action == "twin":
+                        from .self_learn import analyze_causal_digital_twin
+
+                        data = analyze_causal_digital_twin(st)
+                    elif action == "blast":
+                        from .evolve_ast import analyze_symbol_blast_radius
+
+                        data = analyze_symbol_blast_radius(target_sym, storage=st)
+                    elif action == "dpo":
+                        data = sg.audit_dpo_preferences(auto_repair=True)
                     else:
                         data = sg.get_resilience_status().get(
                             "circuit_breaker" if action == "breakers" else "quota", {}
@@ -1659,8 +1715,8 @@ def main() -> None:
     prompts_parser = sub.add_parser("prompts", help="List, evolve, or rollback centralized system prompts")
     prompts_parser.add_argument("prompts_action", nargs="?", default="list", choices=["list", "evolve", "rollback"])
     prompts_parser.add_argument("prompt_key", nargs="?", default=None, help="Target prompt key (e.g. agent_main)")
-    local_parser = sub.add_parser("local", help="Self-training local offline model status, train, distill, download, bench, or test")
-    local_parser.add_argument("local_action", nargs="?", default="status", choices=["status", "train", "distill", "download", "test", "bench", "prune", "profile"])
+    local_parser = sub.add_parser("local", help="Self-training local offline model status, train, distill, curriculum, download, bench, or test")
+    local_parser.add_argument("local_action", nargs="?", default="status", choices=["status", "train", "distill", "curriculum", "download", "test", "bench", "prune", "profile"])
     local_parser.add_argument("local_query", nargs="*", default=None, help="Optional test query")
     neural_parser = sub.add_parser("neural", help="Vectorized Neural Engine status, train, or pulse inspection")
     neural_parser.add_argument("neural_action", nargs="?", default="status", choices=["status", "train", "pulse", "activate"])
@@ -1691,8 +1747,9 @@ def main() -> None:
     cortex_parser = sub.add_parser("cortex", help="Neural+Brain Cortex: status, dream cycle, predictive heal, habits, flow")
     cortex_parser.add_argument("cortex_action", nargs="?", default="status", choices=["status", "dream", "heal", "habits", "flow"])
     cortex_parser.add_argument("cortex_arg", nargs="?", default=None, help="Optional flow mode (deep_focus|meeting_media|idle_maintenance|normal|auto)")
-    self_parser = sub.add_parser("self", help="Self-Autopsy, Self-Canary, Self-Calibration, Self-Profiler, Eval, Drift, Breakers, Quota, and Self-Skills")
-    self_parser.add_argument("self_action", nargs="?", default="status", choices=["status", "canary", "calibrate", "profile", "autopsy", "skills", "eval", "drift", "breakers", "quota"])
+    self_parser = sub.add_parser("self", help="Self-Autopsy, Self-Canary, Self-Calibration, Self-Profiler, Eval, Drift, Breakers, Quota, Twin, Blast, DPO, and Self-Skills")
+    self_parser.add_argument("self_action", nargs="?", default="status", choices=["status", "canary", "calibrate", "profile", "autopsy", "skills", "eval", "drift", "breakers", "quota", "twin", "blast", "dpo"])
+    self_parser.add_argument("self_target", nargs="?", default=None, help="Optional symbol or file target for blast radius analysis")
 
     locale_override: str | None = None
     raw_argv = sys.argv[1:]
@@ -1825,7 +1882,7 @@ def main() -> None:
                 locale_override,
             )
         elif args.subcommand == "self":
-            _cmd_self(settings.base_url, args.self_action, locale_override)
+            _cmd_self(settings.base_url, args.self_action, locale_override, args.self_target)
         return
 
     piped_text = ""

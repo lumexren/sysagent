@@ -1102,6 +1102,91 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             self.assertGreater(cache.get_ttl("list_systemd_units"), cache.get_ttl("read_file"))
             self.assertGreaterEqual(cache.get_ttl("list_systemd_units"), 100.0)
 
+    def test_five_operational_cli_api_and_resilience_features(self) -> None:
+        import subprocess
+        from sysagent import cli as cli_mod
+        from sysagent import local_mind as lm_mod
+        from sysagent.config import Settings
+        from sysagent.plugins import PluginRegistry
+        from sysagent.self_guard import SelfGuard
+        from sysagent.self_learn import auto_forge_workflow_skills, prune_dead_macro_skills
+
+        with Storage(db_path=self.root / "ops_five.db") as st:
+            # 1) Feature 1: run_command TimeoutExpired partial output recovery & interactive stall detection
+            timeout_exc = subprocess.TimeoutExpired(
+                cmd="apt upgrade",
+                timeout=5,
+                output="Reading package lists...\nDo you want to continue? [Y/n] ",
+                stderr="waiting on tty",
+            )
+            with patch("subprocess.run", side_effect=timeout_exc):
+                t_out = json.loads(
+                    execute_tool("run_command", {"command": "apt upgrade", "timeout": 5}, watcher=None, storage=st)
+                )
+            self.assertTrue(t_out["timed_out"])
+            self.assertEqual(t_out["exit_code"], 124)
+            self.assertTrue(t_out["interactive_stall"])
+            self.assertIn("Do you want to continue?", t_out["partial_stdout"])
+            self.assertIn("non-interactive flags", t_out["recovery_hint"])
+
+            # 2) Feature 2: SelfGuard 2.0 DPO Preference Consistency Audit & Auto-Repair + Canary semantic_index
+            pref_file = self.root / "dpo_prefs.jsonl"
+            with patch.object(lm_mod, "PREFERENCE_FILE", pref_file):
+                lm = LocalMind(st)
+                lm.record_preference_pair(
+                    "check cpu ram and system health snapshot",
+                    chosen_tool="system_status",
+                    chosen_args={},
+                    rejected_tool="list_directory",
+                    rejected_args={"path": "/"},
+                )
+                sg = SelfGuard(Settings(socket_path=str(self.root / "test.sock")), st)
+                dpo_res = sg.audit_dpo_preferences(auto_repair=True)
+                self.assertEqual(dpo_res["total_pairs"], 1)
+                self.assertGreaterEqual(dpo_res["consistency_score"], 1.0)
+                cal_res = sg.calibrate_thresholds()
+                self.assertIn("dpo_audit", cal_res)
+                canary_res = sg.run_canary_probes()
+                self.assertIn("semantic_index", canary_res["probes"])
+                self.assertIn("dual_slot_ready", canary_res["probes"]["local_models"])
+
+            # 3) Feature 3: Parameterized Skill Forging & Dead-Skill GC
+            pdir = self.root / "plugins_macro"
+            pm = PluginRegistry(plugins_dir=pdir, mcp_config_file=self.root / "mcp.json")
+            steps = [
+                {"name": "inspect_self_component", "arguments": {"component": "prompts"}},
+                {"name": "list_events", "arguments": {"limit": 5}},
+            ]
+            st.record_workflow("inspect self and events", steps)
+            st.record_workflow("inspect self and events", steps)
+            forged = auto_forge_workflow_skills(st, plugins=pm, min_hits=2)
+            self.assertEqual(len(forged), 1)
+            m_name = forged[0]
+            self.assertIn(m_name, pm.tools)
+            decl_props = pm.tools[m_name].declaration["parameters"]["properties"]
+            self.assertIn("component", decl_props)
+            self.assertIn("limit", decl_props)
+
+            for _ in range(5):
+                st.record_tool_metric(m_name, 25.0, True)
+            retired = prune_dead_macro_skills(st, plugins=pm, max_error_rate=0.65, min_calls=4)
+            self.assertIn(m_name, retired)
+            self.assertTrue((pdir / f"auto_workflow_{m_name[len('macro_'):]}.py.quarantine").is_file())
+
+            # 4) Feature 4: Shell Hook Auto-Triage & Instant Fix Cache
+            st.add_lesson("fix:pytest_flag", "Use `pytest -q` without invalid `--badflag`.", "cmd=pytest --badflag exit=2")
+            with (
+                patch.object(cli_mod, "DATA_DIR", self.root),
+                patch.object(cli_mod, "Storage", lambda: Storage(db_path=self.root / "ops_five.db")),
+            ):
+                err_p1 = cli_mod.record_last_shell_error("pytest --badflag", 2, str(self.root), "error: unrecognized arguments")
+                err_p2 = cli_mod.record_last_shell_error("pytest --badflag", 2, str(self.root), "error: unrecognized arguments")
+                rec_err = json.loads(err_p2.read_text(encoding="utf-8"))
+            self.assertEqual(err_p1, err_p2)
+            self.assertEqual(rec_err["repeat_count"], 2)
+            self.assertIsNotNone(rec_err["instant_fix"])
+            self.assertIn("pytest -q", rec_err["instant_fix"]["lesson"])
+
 
 if __name__ == "__main__":
     unittest.main()

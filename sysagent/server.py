@@ -683,6 +683,25 @@ async def api_self_quota() -> dict[str, Any]:
     return get_quota_governor().get_status()
 
 
+@router.get("/api/self/twin")
+async def api_self_twin() -> dict[str, Any]:
+    from .self_learn import analyze_causal_digital_twin
+
+    return await asyncio.to_thread(analyze_causal_digital_twin, storage, watcher)
+
+
+@router.get("/api/self/blast")
+async def api_self_blast(target: str = "execute_tool") -> dict[str, Any]:
+    from .evolve_ast import analyze_symbol_blast_radius
+
+    return await asyncio.to_thread(analyze_symbol_blast_radius, target, None, storage)
+
+
+@router.get("/api/self/dpo")
+async def api_self_dpo(auto_repair: bool = True) -> dict[str, Any]:
+    return await asyncio.to_thread(self_guard.audit_dpo_preferences, auto_repair)
+
+
 @router.get("/api/prompts")
 async def api_list_prompts() -> dict[str, Any]:
     return {"prompts": PromptRegistry(storage).list_status()}
@@ -733,6 +752,13 @@ async def api_local_distill(count_per_teacher: int = 2) -> dict[str, Any]:
     from .local_mind import LocalMind
 
     return await asyncio.to_thread(LocalMind(storage).distill_from_teachers, count_per_teacher)
+
+
+@router.get("/api/local/curriculum")
+async def api_local_curriculum() -> dict[str, Any]:
+    from .local_mind import LocalMind
+
+    return await asyncio.to_thread(LocalMind(storage).build_distillation_curriculum)
 
 
 @router.get("/api/neural")
