@@ -1163,6 +1163,59 @@ from .cli_ops import (
 )
 
 
+def _cmd_self(
+    base_url: str,
+    action: str,
+    locale_override: str | None = None,
+) -> None:
+    loc = locale_override or get_settings().locale
+    hdrs = _auth_headers()
+    try:
+        if action in {"canary", "calibrate", "profile"}:
+            try:
+                resp = ipc_post(f"{base_url}/api/self/{action}", headers=hdrs, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                from .self_guard import SelfGuard
+
+                with Storage() as st:
+                    sg = SelfGuard(get_settings(), st)
+                    fn = {
+                        "canary": sg.run_canary_probes,
+                        "calibrate": sg.calibrate_thresholds,
+                        "profile": sg.run_memory_profiler,
+                    }[action]
+                    data = fn()
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return
+
+        if action == "autopsy":
+            from .self_guard import SelfGuard
+
+            with Storage() as st:
+                data = SelfGuard(get_settings(), st).run_crash_autopsy()
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return
+
+        try:
+            resp = ipc_get(f"{base_url}/api/self/guard", headers=hdrs, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            from .self_guard import SelfGuard
+
+            with Storage() as st:
+                data = SelfGuard(get_settings(), st).get_status()
+        if action == "skills":
+            print(json.dumps(data.get("skill_candidates", []), indent=2, ensure_ascii=False))
+        else:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception as exc:
+        print(f"{t('error_prefix', loc)}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     from .logging_setup import configure_logging
 
@@ -1230,6 +1283,8 @@ def main() -> None:
     cortex_parser = sub.add_parser("cortex", help="Neural+Brain Cortex: status, dream cycle, predictive heal, habits, flow")
     cortex_parser.add_argument("cortex_action", nargs="?", default="status", choices=["status", "dream", "heal", "habits", "flow"])
     cortex_parser.add_argument("cortex_arg", nargs="?", default=None, help="Optional flow mode (deep_focus|meeting_media|idle_maintenance|normal|auto)")
+    self_parser = sub.add_parser("self", help="Self-Autopsy, Self-Canary, Self-Calibration, Self-Profiler, and Self-Skills")
+    self_parser.add_argument("self_action", nargs="?", default="status", choices=["status", "canary", "calibrate", "profile", "autopsy", "skills"])
 
     locale_override: str | None = None
     raw_argv = sys.argv[1:]
@@ -1246,7 +1301,7 @@ def main() -> None:
             filtered_argv.append(raw_argv[i])
             i += 1
 
-    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "notifications", "cortex", "-h", "--help"}:
+    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "notifications", "cortex", "self", "-h", "--help"}:
         args = parser.parse_args(filtered_argv)
         if args.subcommand == "serve":
             sock = Path(settings.socket_path)
@@ -1351,6 +1406,8 @@ def main() -> None:
                 args.cortex_arg,
                 locale_override,
             )
+        elif args.subcommand == "self":
+            _cmd_self(settings.base_url, args.self_action, locale_override)
         return
 
     piped_text = ""

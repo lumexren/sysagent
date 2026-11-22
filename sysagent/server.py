@@ -44,6 +44,9 @@ evolver = SelfEvolver(settings, watcher, storage, agent)
 agent.cortex = brain.cortex
 evolver.cortex = brain.cortex
 self_monitor = SelfMonitor(storage, watcher, plugins=plugins, agent=agent, evolver=evolver)
+from .self_guard import SelfGuard
+
+self_guard = SelfGuard(settings, storage, watcher=watcher, agent=agent, evolver=evolver)
 
 
 async def _run_automation(auto: dict[str, Any], trigger_context: str) -> None:
@@ -78,6 +81,7 @@ async def lifespan(_app: FastAPI):
     configure_logging(daemon=True)
     logger.info("Starting SysAgent Daemon v%s", __version__)
     auth.initialize()
+    await asyncio.to_thread(self_guard.on_startup)
     watcher.start()
     brain.start()
     evolver.start()
@@ -96,6 +100,7 @@ async def lifespan(_app: FastAPI):
         await evolver.stop()
         await brain.stop()
         await watcher.stop()
+        self_guard.mark_clean_shutdown()
 
 
 router = APIRouter()
@@ -526,6 +531,26 @@ async def api_evolve_rollback() -> dict[str, Any]:
 @router.get("/api/self")
 async def api_self_health() -> dict[str, Any]:
     return await asyncio.to_thread(self_monitor.get_self_health)
+
+
+@router.get("/api/self/guard")
+async def api_self_guard() -> dict[str, Any]:
+    return await asyncio.to_thread(self_guard.get_status)
+
+
+@router.post("/api/self/canary")
+async def api_self_canary() -> dict[str, Any]:
+    return await asyncio.to_thread(self_guard.run_canary_probes)
+
+
+@router.post("/api/self/calibrate")
+async def api_self_calibrate() -> dict[str, Any]:
+    return await asyncio.to_thread(self_guard.calibrate_thresholds)
+
+
+@router.post("/api/self/profile")
+async def api_self_profile() -> dict[str, Any]:
+    return await asyncio.to_thread(self_guard.run_memory_profiler)
 
 
 @router.get("/api/prompts")
