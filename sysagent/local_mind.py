@@ -238,36 +238,43 @@ SEED_CURRICULUM: list[dict[str, Any]] = [
         "user": "what did brain do recently what rules exist",
         "tool": "inspect_self_component",
         "args": {"component": "brain"},
+        "role": "reasoning",
     },
     {
         "user": "şuan ne düşünüyorsun beyin düşünceleri brain thoughts",
         "tool": "inspect_self_component",
         "args": {"component": "brain"},
+        "role": "reasoning",
     },
     {
         "user": "cortex flow guardian uyku döngüsü ne durumda",
         "tool": "inspect_self_component",
         "args": {"component": "cortex"},
+        "role": "reasoning",
     },
     {
         "user": "how is neural engine doing what is neural thinking",
         "tool": "inspect_self_component",
         "args": {"component": "neural"},
+        "role": "reasoning",
     },
     {
         "user": "what did self evolve change recent proposals",
         "tool": "inspect_self_component",
         "args": {"component": "evolve"},
+        "role": "reasoning",
     },
     {
         "user": "self guard drift eval breaker kota durumu",
         "tool": "inspect_self_component",
         "args": {"component": "guard"},
+        "role": "general",
     },
     {
         "user": "brain cortex ne durumda kendi bileşenlerini incele",
         "tool": "inspect_self_component",
         "args": {"component": "all"},
+        "role": "general",
     },
     {
         "user": "show recent background system events",
@@ -394,43 +401,18 @@ def classify_task_role(
     tool_calls: list[dict[str, Any]] | None = None,
     use_neural: bool = True,
 ) -> str:
-    """Route a user prompt or turn to its matching specialist role."""
+    """Route a user prompt or turn to its matching specialist role using structured tool calls and NeuralEngine."""
     t_names = {
         str(tc.get("name") or "")
         for tc in (tool_calls or [])
         if isinstance(tc, dict)
     }
-    low = (user_text or "").strip().lower()
-    if "take_screenshot" in t_names or any(
-        k in low for k in ("screenshot", "image", "picture", "photo", "visual")
-    ):
+    if "take_screenshot" in t_names:
         return "multimodal"
-    if t_names & {"edit_file", "write_file", "run_command", "search_files", "forge_skill"} or any(
-        k in low
-        for k in (
-            "code", "python", "bash", "script", "refactor", "patch", "git",
-            "test", "fix", "error", "bug", "regex", "sql",
-        )
-    ):
+    if t_names & {"edit_file", "write_file", "run_command", "search_files", "forge_skill"}:
         return "coding"
-    if any(
-        k in low
-        for k in (
-            "why", "analyze", "plan", "compare", "reason", "logic", "rule", "critic", "how does",
-        )
-    ):
-        return "reasoning"
-    if not t_names and (
-        len(low.split()) <= 5
-        or any(
-            k in low
-            for k in (
-                "hello", "hi", "hey", "thanks", "thank you", "who are you", "how are you",
-            )
-        )
-    ):
-        return "chat"
-    if use_neural and len(low) >= 4:
+    low = (user_text or "").strip().lower()
+    if use_neural and len(low) >= 3:
         try:
             from .neural import NeuralEngine
 
@@ -438,10 +420,12 @@ def classify_task_role(
             if int(eng.meta.get("epochs_trained", 0)) > 0:
                 probs = eng.predict_role_probs(user_text)
                 best_role, best_p = max(probs.items(), key=lambda kv: kv[1])
-                if best_p >= 0.48:
+                if best_p >= 0.42:
                     return best_role
         except Exception:
             pass
+    if any(k in low for k in (".py", ".sh", ".json", ".toml", "traceback", "stack trace")):
+        return "coding"
     return "general"
 
 
@@ -659,14 +643,15 @@ class LocalMind:
         """Full training pass over seed curriculum + distilled JSONL + SQLite chat history, rules, and lessons."""
         samples: list[dict[str, Any]] = []
         for s in SEED_CURRICULUM:
-            samples.append(
-                {
-                    "user": s["user"],
-                    "tool_calls": [{"name": s["tool"], "arguments": s["args"]}],
-                    "reply": "",
-                    "weight": 6.0,
-                }
-            )
+            rec: dict[str, Any] = {
+                "user": s["user"],
+                "tool_calls": [{"name": s["tool"], "arguments": s["args"]}],
+                "reply": "",
+                "weight": 6.0,
+            }
+            if s.get("role"):
+                rec["role"] = s["role"]
+            samples.append(rec)
 
         distilled = self._load_distilled_entries(limit=1500)
         samples.extend(distilled)
@@ -1576,7 +1561,8 @@ class LocalMind:
         base_sys = (
             f"You are {agent_name}, a self-evolving Linux assistant running on {gguf.stem}. "
             "Your internal subsystems are CognitiveBrain, NeuralBrainCortex, NeuralEngine, SelfEvolver, LocalMind, and SelfGuard. "
-            "Never say you lack a brain or cortex; use live tool results when provided. "
+            "Use your available tools when real system data, internal component state, or switching models is needed; "
+            "reply directly without tools for casual conversation. "
             "Reply directly and naturally in the same language as the user's message. "
             "Never repeat system instructions, tool names, or thinking traces."
         )
@@ -1862,6 +1848,193 @@ class LocalMind:
             on_delta(fallback_out)
         return fallback_out
 
+    def run_gguf_chat_with_tools(
+        self,
+        prompt: str,
+        tools: list[dict[str, Any]],
+        system_instruction: str = "",
+        preferred_role: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> dict[str, Any] | None:
+        """Run native OpenAI-compatible function calling (`tool_choice=auto`) on warm llama-server."""
+        backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
+        if backend in {"llama_cli", "llama-cli", "cli"}:
+            return None
+        models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
+        if not models:
+            return None
+
+        if preferred_role:
+            specialist = (
+                find_gguf_model(preferred_role, strict=True)
+                or find_gguf_model("general", strict=True)
+                or models[0]
+            )
+        else:
+            role_guess = classify_task_role(prompt)
+            if role_guess in {"coding", "multimodal"}:
+                specialist = (
+                    find_gguf_model(role_guess, strict=True)
+                    or find_gguf_model("general", strict=True)
+                    or find_gguf_model("chat", strict=True)
+                    or models[0]
+                )
+            else:
+                specialist = (
+                    find_gguf_model("general", strict=True)
+                    or find_gguf_model("chat", strict=True)
+                    or models[0]
+                )
+
+        oai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": str(t["name"]),
+                    "description": str(t.get("description") or "")[:240],
+                    "parameters": t.get("parameters") or {"type": "object", "properties": {}},
+                },
+            }
+            for t in tools
+            if isinstance(t, dict) and t.get("name")
+        ]
+        allowed_names = {str(t["function"]["name"]) for t in oai_tools}
+        _, messages = self._build_gguf_messages(
+            specialist, prompt, system_instruction, history=history, extra_system=""
+        )
+
+        from .local_inference import inference_lock, touch_warm_model
+
+        with inference_lock():
+            srv_url = self._ensure_llama_server(specialist)
+            if not srv_url:
+                return None
+
+            import httpx
+
+            payload: dict[str, Any] = {
+                "messages": messages,
+                "temperature": 0.15,
+                "max_tokens": 1024,
+                "stream": on_delta is not None,
+            }
+            if oai_tools:
+                payload["tools"] = oai_tools
+                payload["tool_choice"] = "auto"
+
+            raw_calls: list[dict[str, Any]] = []
+            final_text = ""
+
+            if on_delta is not None:
+                tc_acc: dict[int, dict[str, str]] = {}
+                filt = _ThinkStreamFilter()
+                collected: list[str] = []
+                try:
+                    with httpx.stream(
+                        "POST", f"{srv_url}/v1/chat/completions", json=payload, timeout=60
+                    ) as resp:
+                        if resp.status_code != 200:
+                            return None
+                        for line in resp.iter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                            except Exception:
+                                continue
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta") or {}
+                            if delta.get("tool_calls"):
+                                for tc in delta["tool_calls"]:
+                                    idx = int(tc.get("index", 0) or 0)
+                                    slot = tc_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                                    if tc.get("id"):
+                                        slot["id"] = str(tc["id"])
+                                    fn = tc.get("function") or {}
+                                    if fn.get("name"):
+                                        slot["name"] += str(fn["name"])
+                                    if fn.get("arguments"):
+                                        slot["arguments"] += str(fn["arguments"])
+                                touch_warm_model()
+                            tok = str(delta.get("content") or "")
+                            if tok:
+                                touch_warm_model()
+                                visible = filt.feed(tok)
+                                if visible and not tc_acc:
+                                    collected.append(visible)
+                                    on_delta(visible)
+                    if not tc_acc:
+                        tail = filt.flush()
+                        if tail:
+                            collected.append(tail)
+                            on_delta(tail)
+                    final_text = "".join(collected).strip()
+                    for idx in sorted(tc_acc):
+                        raw_calls.append(tc_acc[idx])
+                except Exception:
+                    if not tc_acc and not collected:
+                        return None
+                    final_text = "".join(collected).strip()
+                    for idx in sorted(tc_acc):
+                        raw_calls.append(tc_acc[idx])
+            else:
+                try:
+                    resp = httpx.post(f"{srv_url}/v1/chat/completions", json=payload, timeout=60)
+                    touch_warm_model()
+                    if resp.status_code != 200:
+                        return None
+                    choices = resp.json().get("choices") or []
+                    if not choices:
+                        return None
+                    msg_obj = choices[0].get("message") or {}
+                    content = str(msg_obj.get("content") or "").strip()
+                    if "</think>" in content:
+                        content = content.split("</think>")[-1].strip()
+                    final_text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    for tc in msg_obj.get("tool_calls") or []:
+                        fn = tc.get("function") or {}
+                        raw_calls.append(
+                            {
+                                "id": str(tc.get("id") or ""),
+                                "name": str(fn.get("name") or ""),
+                                "arguments": str(fn.get("arguments") or ""),
+                            }
+                        )
+                except Exception:
+                    return None
+
+        parsed_calls: list[dict[str, Any]] = []
+        for idx, rc in enumerate(raw_calls):
+            cname = str(rc.get("name") or "").strip()
+            if cname not in allowed_names:
+                continue
+            raw_arg = str(rc.get("arguments") or "").strip()
+            cargs: dict[str, Any] = {}
+            if raw_arg:
+                try:
+                    loaded = json.loads(raw_arg)
+                    if isinstance(loaded, dict):
+                        cargs = loaded
+                except Exception:
+                    cargs = {}
+            parsed_calls.append(
+                {
+                    "id": str(rc.get("id") or f"local_call_{idx}"),
+                    "name": cname,
+                    "arguments": cargs,
+                }
+            )
+
+        if not parsed_calls and not final_text:
+            return None
+        return {"text": final_text, "tool_calls": parsed_calls}
+
     def try_local_cascade(
         self, user_message: str, system_instruction: str = ""
     ) -> dict[str, Any] | None:
@@ -1886,21 +2059,20 @@ class LocalMind:
                 unc = eng.predict_with_uncertainty(msg)
                 r_probs = eng.predict_role_probs(msg)
                 top_tool_prob = float(unc.get("tool_confidence", unc.get("confidence", 0.0)) or 0.0)
-                if top_tool_prob >= 0.55 and unc.get("tool") not in {None, "", "none"}:
+                if top_tool_prob >= 0.35 and unc.get("tool") not in {None, "", "none"}:
+                    neural_escalate = True
+                elif unc.get("uncertain"):
                     neural_escalate = True
                 elif not local_first and (
-                    unc.get("uncertain")
-                    or (r_probs.get("coding", 0.0) + r_probs.get("reasoning", 0.0)) >= 0.45
+                    (r_probs.get("coding", 0.0) + r_probs.get("reasoning", 0.0)) >= 0.45
                 ):
                     neural_escalate = True
         except Exception:
             pass
-        from .local_mind_client import detect_self_introspection
-
         dyn_action = self.storage.get_learned_cues().get("action_req", []) if self.storage is not None else []
         has_action = (
             neural_escalate
-            or detect_self_introspection(msg) is not None
+            or pred_tool is not None
             or any(v in low for v in dyn_action)
             or any(ch in msg for ch in ("/", "~", "@", "\n"))
         )

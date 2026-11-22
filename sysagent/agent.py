@@ -144,12 +144,6 @@ class AgentManager:
         )
         if any(c in low for c in block_cues):
             return None
-        if any(k in low for k in ("system status", "ram usage", "cpu usage", "disk usage", "disk space", "temperature")):
-            return "system_status", {}
-        if any(k in low for k in ("top processes", "memory hogs", "cpu hogs", "running processes")):
-            return "list_processes", {"limit": 10}
-        if any(k in low for k in ("recent logs", "service logs", "journal logs")):
-            return "read_journal_logs", {"unit": "sysagent", "user_unit": True, "lines": 30}
         try:
             from .local_mind import LocalMind
             from .self_learn import shadow_stats
@@ -574,7 +568,11 @@ class AgentManager:
             await _emit({"type": "assistant_message", "text": reply_text})
             return reply_text
 
-        if not prev_id and type(self._get_client()).__name__ in {"AgyCliClient", "LocalMindClient"}:
+        if (
+            not prev_id
+            and selected_model not in {"local", "local-mind", "local_mind"}
+            and type(self._get_client()).__name__ == "AgyCliClient"
+        ):
             from .local_mind import LocalMind
 
             cascade = await asyncio.to_thread(

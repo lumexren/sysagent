@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import gc
+import os
 import shutil
 import socket
 import subprocess
@@ -146,6 +147,7 @@ def ensure_llama_server(gguf: Path) -> str | None:
 
         port = _pick_server_port(8769)
         base_url = f"http://127.0.0.1:{port}"
+        ctx_size = os.environ.get("SYSAGENT_LOCAL_CTX", "8192").strip() or "8192"
         _LLAMA_SERVER_PROC = subprocess.Popen(
             [
                 server_bin,
@@ -154,7 +156,7 @@ def ensure_llama_server(gguf: Path) -> str | None:
                 "-ngl",
                 "99",
                 "-c",
-                "4096",
+                ctx_size,
                 "--host",
                 "127.0.0.1",
                 "--port",

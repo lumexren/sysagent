@@ -174,10 +174,14 @@ class LocalAndStorageImprovementsTests(unittest.TestCase):
                 "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
             }
         ]
-        with patch.object(client.interactions.mind, "predict_tool", return_value=(None, {}, 0.0)), patch.object(
-            client.interactions.mind,
-            "run_gguf_inference",
-            return_value='{"tool": "list_directory", "args": {"path": "~/Downloads"}}',
+        with (
+            patch.object(client.interactions.mind, "run_gguf_chat_with_tools", return_value=None),
+            patch.object(client.interactions.mind, "predict_tool", return_value=(None, {}, 0.0)),
+            patch.object(
+                client.interactions.mind,
+                "run_gguf_inference",
+                return_value='{"tool": "list_directory", "args": {"path": "~/Downloads"}}',
+            ),
         ):
             r1 = client.interactions.create(input="Downloads klasöründe ne var?", tools=tools)
             self.assertEqual(len(r1.steps), 1)

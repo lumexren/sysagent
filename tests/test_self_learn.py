@@ -70,10 +70,30 @@ for role in SPECIALIST_ROLES:
     assert GGUF_PRESETS[pk].get("hf_source")
     assert classify_gguf_role(Path(GGUF_PRESETS[pk]["filename"])) == role
 
-assert classify_task_role("fix bug in python code") == "coding"
+assert classify_task_role("edit app.py", [{"name": "edit_file"}]) == "coding"
 assert classify_task_role("analyze screenshot image", [{"name": "take_screenshot"}]) == "multimodal"
-assert classify_task_role("why is this happening analyze") == "reasoning"
-assert classify_task_role("hello how are you") == "chat"
+assert classify_task_role("check status", use_neural=False) in SPECIALIST_ROLES
+
+from types import SimpleNamespace as _SimpleNamespace
+from unittest.mock import patch as _patch
+
+with _patch(
+    "sysagent.neural.NeuralEngine",
+    return_value=_SimpleNamespace(
+        meta={"epochs_trained": 10},
+        predict_role_probs=lambda _q: {"reasoning": 0.9, "general": 0.05, "chat": 0.05},
+    ),
+):
+    assert classify_task_role("why is this happening analyze") == "reasoning"
+
+with _patch(
+    "sysagent.neural.NeuralEngine",
+    return_value=_SimpleNamespace(
+        meta={"epochs_trained": 10},
+        predict_role_probs=lambda _q: {"chat": 0.9, "general": 0.05, "reasoning": 0.05},
+    ),
+):
+    assert classify_task_role("hello how are you") == "chat"
 
 with tempfile.TemporaryDirectory() as td:
     st_lm = Storage(Path(td) / "lm.db")
