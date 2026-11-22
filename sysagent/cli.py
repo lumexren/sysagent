@@ -1685,7 +1685,8 @@ def main() -> None:
     sub.add_parser("chat", help="Start interactive terminal chat")
     sub.add_parser("status", help="Show daemon and system status")
     sub.add_parser("digest", help="Show daily system & brain digest")
-    sub.add_parser("doctor", help="Run health and configuration diagnostics")
+    doc_parser = sub.add_parser("doctor", help="Run health and configuration diagnostics (use --fix for autonomous repair)")
+    doc_parser.add_argument("--fix", action="store_true", help="Run deep self-integrity audit and auto-repair")
     plug_parser = sub.add_parser("plugin", help="Manage user plugins (list/enable/disable/remove)")
     plug_parser.add_argument("plugin_action", nargs="?", default="list", choices=["list", "enable", "disable", "remove"])
     plug_parser.add_argument("plugin_name", nargs="?", default=None, help="Plugin filename or stem")
@@ -1784,7 +1785,7 @@ def main() -> None:
         elif args.subcommand == "digest":
             _cmd_digest(settings.base_url, locale_override)
         elif args.subcommand == "doctor":
-            _cmd_doctor(settings.base_url)
+            _cmd_doctor(settings.base_url, fix=bool(getattr(args, "fix", False)))
         elif args.subcommand == "plugin":
             _cmd_plugin(args.plugin_action, args.plugin_name)
         elif args.subcommand == "search":

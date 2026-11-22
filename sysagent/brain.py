@@ -502,7 +502,9 @@ class CognitiveBrain:
 
         import psutil as _ps
 
-        avail_before_mb = round(_ps.virtual_memory().available / (1024 * 1024), 1)
+        vm_before = _ps.virtual_memory()
+        avail_before_mb = round(vm_before.available / (1024 * 1024), 1)
+        ram_pct_before = round(float(vm_before.percent), 1)
         if code.startswith("kill_leak:"):
             raw_pid = code.split(":", 1)[1].strip()
             if not raw_pid.isdigit():
@@ -522,18 +524,21 @@ class CognitiveBrain:
                     "pid": pid,
                     "error": str(exc),
                 }
-            avail_after_mb = round(_ps.virtual_memory().available / (1024 * 1024), 1)
+            vm_after = _ps.virtual_memory()
+            avail_after_mb = round(vm_after.available / (1024 * 1024), 1)
+            ram_pct_after = round(float(vm_after.percent), 1)
             freed_mb = round(max(0.0, avail_after_mb - avail_before_mb), 1)
             summary = f"Terminated leaking process '{proc_name}' (PID {pid}); freed ~{freed_mb} MB RAM."
+            cf_impact: dict[str, Any] = {}
             try:
-                self.storage.add_lesson(
-                    f"closed_loop:{code}",
-                    f"User approved terminating leaking process {proc_name} (PID {pid})",
-                    summary,
-                )
-                from .neural import NeuralEngine
+                from .self_learn import verify_remediation_impact
 
-                NeuralEngine(self.storage).online_step(f"remediate memory leak {proc_name}", "system_status", reward=1.3)
+                cf_impact = verify_remediation_impact(
+                    self.storage,
+                    code,
+                    {"ram_percent": ram_pct_before, "pid_alive": True},
+                    {"ram_percent": ram_pct_after, "freed_ram_mb": freed_mb, "pid_alive": False},
+                )
             except Exception:
                 pass
             return {
@@ -542,6 +547,7 @@ class CognitiveBrain:
                 "pid": pid,
                 "process": proc_name,
                 "freed_ram_mb": freed_mb,
+                "counterfactual": cf_impact,
                 "summary": summary,
             }
 

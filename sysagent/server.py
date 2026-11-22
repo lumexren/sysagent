@@ -702,6 +702,13 @@ async def api_self_dpo(auto_repair: bool = True) -> dict[str, Any]:
     return await asyncio.to_thread(self_guard.audit_dpo_preferences, auto_repair)
 
 
+@router.post("/api/self/doctor")
+async def api_self_doctor() -> dict[str, Any]:
+    from .self_learn import run_doctor_auto_repair
+
+    return await asyncio.to_thread(run_doctor_auto_repair, storage, plugins)
+
+
 @router.get("/api/prompts")
 async def api_list_prompts() -> dict[str, Any]:
     return {"prompts": PromptRegistry(storage).list_status()}

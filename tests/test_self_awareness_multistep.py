@@ -1195,17 +1195,21 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
 
         with Storage(db_path=self.root / "diag_five.db") as st:
             # 1) Feature 1: Autonomous Hypothesis-Driven Root-Cause Investigator
-            diag = investigate_root_cause(
-                st,
-                events=[
-                    {
-                        "category": "systemd",
-                        "severity": "critical",
-                        "message": "Unit redis-cache.service entered failed state with exit-code",
-                    }
-                ],
-                health={"cpu_percent": 15.0, "ram_percent": 42.0, "disk_percent": 30.0},
-            )
+            with patch(
+                "sysagent.self_learn.analyze_causal_digital_twin",
+                return_value={"memory_leaks": [], "causal_chains": [], "healthy": True},
+            ):
+                diag = investigate_root_cause(
+                    st,
+                    events=[
+                        {
+                            "category": "systemd",
+                            "severity": "critical",
+                            "message": "Unit redis-cache.service entered failed state with exit-code",
+                        }
+                    ],
+                    health={"cpu_percent": 15.0, "ram_percent": 42.0, "disk_percent": 30.0},
+                )
             self.assertFalse(diag["healthy"])
             self.assertIsNotNone(diag["top_hypothesis"])
             self.assertEqual(diag["top_hypothesis"]["kind"], "service_failure")
@@ -1282,6 +1286,101 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
                 }
             )
             self.assertIsNotNone(layout)
+
+    def test_five_counterfactual_preflight_episodic_config_and_doctor_features(self) -> None:
+        from sysagent.self_learn import (
+            mine_episodic_workflows,
+            run_doctor_auto_repair,
+            verify_remediation_impact,
+        )
+        from sysagent.self_resilience import analyze_command_preflight, verify_written_file
+
+        with Storage(db_path=self.root / "cf_five.db") as st:
+            # 1) Feature 1: Counterfactual Action Impact Verifier
+            rid = st.add_brain_rule("high memory leak alert", "terminate leaking pid", confidence=80)
+            cf_ok = verify_remediation_impact(
+                st,
+                "kill_leak:1234",
+                {"ram_percent": 88.0, "pid_alive": True},
+                {"ram_percent": 72.0, "freed_ram_mb": 512.0, "pid_alive": False},
+                rule_id=rid,
+            )
+            self.assertTrue(cf_ok["effective"])
+            self.assertEqual(cf_ok["reward"], 1.5)
+            self.assertIn("target_pid_terminated", cf_ok["reasons"])
+            rules = {r["id"]: r for r in st.list_brain_rules()}
+            self.assertGreater(rules[rid]["confidence"], 80)
+
+            cf_fail = verify_remediation_impact(
+                st,
+                "kill_leak:1234",
+                {"ram_percent": 88.0, "pid_alive": True},
+                {"ram_percent": 92.5, "freed_ram_mb": 0.0, "pid_alive": True},
+                rule_id=rid,
+            )
+            self.assertFalse(cf_fail["effective"])
+            self.assertEqual(cf_fail["reward"], -1.0)
+
+            # 2) Feature 2: Pre-Flight Destructive Command Blast-Radius Analyzer
+            pf_block = analyze_command_preflight("rm -rf /etc", cwd=self.root)
+            self.assertTrue(pf_block["destructive"])
+            self.assertTrue(pf_block["blocked"])
+            blocked_out = json.loads(
+                execute_tool("run_command", {"command": "rm -rf /etc"}, watcher=None, storage=st)
+            )
+            self.assertEqual(blocked_out["exit_code"], 126)
+            self.assertTrue(blocked_out["preflight"]["blocked"])
+
+            scratch_dir = self.root / "pf_target"
+            scratch_dir.mkdir(exist_ok=True)
+            (scratch_dir / "a.txt").write_text("1", encoding="utf-8")
+            (scratch_dir / "b.txt").write_text("2", encoding="utf-8")
+            pf_ok = analyze_command_preflight(f"rm -rf {scratch_dir}", cwd=self.root)
+            self.assertTrue(pf_ok["destructive"])
+            self.assertFalse(pf_ok["blocked"])
+            self.assertGreaterEqual(pf_ok["affected_files"], 2)
+
+            # 3) Feature 3: Cross-Session Episodic Workflow Miner
+            for idx in range(2):
+                st.save_session_checkpoint(
+                    session_id=f"ep-sess-{idx}",
+                    topic="audit systemd logs and search config",
+                    summary="Checked service journal and searched config files",
+                    files=[str(self.root / "demo.conf")],
+                    commands=["journalctl -n 20", "rg timeout /etc"],
+                )
+            ep_res = mine_episodic_workflows(st, min_occurrences=2)
+            self.assertGreaterEqual(ep_res["mined_count"], 1)
+            self.assertTrue(any("read_file -> read_journal_logs" in w["signature"] for w in ep_res["promoted_workflows"]))
+
+            # 4) Feature 4: Config Schema & Syntax Guard 2.0 (.toml, .yaml, .service, .sh)
+            bad_yaml = self.root / "bad.yaml"
+            bad_yaml.write_text('key: "unclosed quote\n', encoding="utf-8")
+            self.assertFalse(verify_written_file(bad_yaml)["ok"])
+
+            good_yaml = self.root / "good.yaml"
+            good_yaml.write_text('key: "valid"\ncount: 3\n', encoding="utf-8")
+            self.assertTrue(verify_written_file(good_yaml)["ok"])
+
+            bad_svc = self.root / "broken.service"
+            bad_svc.write_text("[Other]\nFoo=bar\n", encoding="utf-8")
+            self.assertFalse(verify_written_file(bad_svc)["ok"])
+
+            good_svc = self.root / "valid.service"
+            good_svc.write_text("[Unit]\nDescription=Demo\n[Service]\nExecStart=/bin/true\n", encoding="utf-8")
+            self.assertTrue(verify_written_file(good_svc)["ok"])
+
+            bad_sh = self.root / "broken.sh"
+            bad_sh.write_text("#!/usr/bin/env bash\nif [ 1 -eq 1 ]; then\n  echo 'missing fi'\n", encoding="utf-8")
+            self.assertFalse(verify_written_file(bad_sh)["ok"])
+
+            # 5) Feature 5: `sysagent doctor --fix` / `run_doctor_auto_repair`
+            doc_rep = run_doctor_auto_repair(st)
+            self.assertEqual(doc_rep["status"], "repaired")
+            self.assertTrue(doc_rep["sqlite_ok"])
+            self.assertIn("kg_cleanup", doc_rep)
+            self.assertIn("dpo_audit", doc_rep)
+            self.assertIn("episodic_workflows", doc_rep)
 
 
 if __name__ == "__main__":

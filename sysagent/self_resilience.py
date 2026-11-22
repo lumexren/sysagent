@@ -239,45 +239,191 @@ def evaluate_self_gate(mind: Any, storage: Storage | None = None) -> dict[str, A
 
 
 def verify_written_file(path: Path) -> dict[str, Any]:
-    """Run fast syntax/schema verification on newly written `.py`, `.json`, `.toml`, or systemd files."""
+    """Run fast syntax/schema verification on newly written `.py`, `.json`, `.toml`, `.yaml`, `.ini`/`.conf`/`.service`, or `.sh` files."""
     if not path.is_file():
         return {"ok": False, "kind": "missing", "error": f"File not found: {path}"}
     suffix = path.suffix.lower()
+    src = path.read_text(encoding="utf-8", errors="replace")
     if suffix == ".py":
         try:
-            src = path.read_text(encoding="utf-8", errors="replace")
             compile(src, str(path), "exec")
             return {"ok": True, "kind": "python"}
         except SyntaxError as exc:
             return {"ok": False, "kind": "python", "error": f"SyntaxError line {exc.lineno}: {exc.msg}"}
     if suffix == ".json":
         try:
-            json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            json.loads(src)
             return {"ok": True, "kind": "json"}
         except json.JSONDecodeError as exc:
             return {"ok": False, "kind": "json", "error": f"JSONDecodeError line {exc.lineno}: {exc.msg}"}
     if suffix == ".toml":
         try:
-            tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
+            tomllib.loads(src)
             return {"ok": True, "kind": "toml"}
         except tomllib.TOMLDecodeError as exc:
             return {"ok": False, "kind": "toml", "error": str(exc)}
-    if suffix in {".service", ".timer"} and shutil.which("systemd-analyze"):
+    if suffix in {".yaml", ".yml"}:
+        for idx, raw_ln in enumerate(src.splitlines(), start=1):
+            stripped = raw_ln.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "\t" in raw_ln[: len(raw_ln) - len(raw_ln.lstrip())]:
+                return {"ok": False, "kind": "yaml", "error": f"YAML syntax error line {idx}: tab indentation not allowed"}
+            if stripped.count('"') % 2 == 1 and not stripped.endswith("\\"):
+                return {"ok": False, "kind": "yaml", "error": f"YAML syntax error line {idx}: unclosed double quote"}
+        return {"ok": True, "kind": "yaml"}
+    if suffix in {".sh", ".bash"} and shutil.which("bash"):
         try:
             proc = subprocess.run(
-                ["systemd-analyze", "verify", str(path)],
+                ["bash", "-n", str(path)],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=2,
             )
             if proc.returncode == 0:
-                return {"ok": True, "kind": "systemd"}
+                return {"ok": True, "kind": "shell"}
             err = (proc.stderr or proc.stdout or "").strip().splitlines()[0:1]
-            return {"ok": False, "kind": "systemd", "error": err[0] if err else f"rc={proc.returncode}"}
+            return {"ok": False, "kind": "shell", "error": err[0] if err else f"rc={proc.returncode}"}
         except Exception:
             pass
+    if suffix in {".ini", ".cfg", ".service", ".timer"}:
+        import configparser
+
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        try:
+            cp.read_string(src)
+        except configparser.Error as exc:
+            return {"ok": False, "kind": suffix.lstrip("."), "error": str(exc).splitlines()[0]}
+        if suffix in {".service", ".timer"}:
+            secs = set(cp.sections())
+            req_sec = "Service" if suffix == ".service" else "Timer"
+            if req_sec not in secs and "Unit" not in secs:
+                return {"ok": False, "kind": "systemd", "error": f"Missing [{req_sec}] or [Unit] section in {path.name}"}
+            return {"ok": True, "kind": "systemd"}
+        return {"ok": True, "kind": suffix.lstrip(".")}
     return {"ok": True, "kind": "skipped"}
+
+
+_CRITICAL_PROTECTED_ROOTS = frozenset(
+    {
+        "/",
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/home",
+        "/lib",
+        "/lib64",
+        "/proc",
+        "/root",
+        "/sbin",
+        "/sys",
+        "/usr",
+        "/var",
+    }
+)
+
+
+def analyze_command_preflight(command: str, cwd: str | Path | None = None) -> dict[str, Any]:
+    """Perform a 0-token pre-flight blast-radius simulation on destructive or state-mutating shell commands."""
+    import shlex
+
+    cmd_str = (command or "").strip()
+    base_cwd = Path(cwd).expanduser().resolve() if cwd else Path.home().resolve()
+    home_dir = Path.home().resolve()
+    if not cmd_str:
+        return {"destructive": False, "blocked": False, "summary": "empty command"}
+
+    try:
+        tokens = shlex.split(cmd_str)
+    except ValueError:
+        tokens = cmd_str.split()
+
+    low_cmd = cmd_str.lower()
+    affected_files = 0
+    dirty_git_files = 0
+    targets: list[str] = []
+    blocked = False
+    block_reason = ""
+    destructive = False
+    kind = "normal"
+
+    if any(
+        pat in low_cmd
+        for pat in ("rm ", "rm\t", "find ", "git reset --hard", "git clean", "chmod -r", "chown -r", "systemctl stop", "systemctl disable")
+    ):
+        destructive = True
+
+    if tokens and tokens[0] in {"rm", "sudo"}:
+        rm_idx = 0 if tokens[0] == "rm" else (1 if len(tokens) > 1 and tokens[1] == "rm" else -1)
+        if rm_idx >= 0:
+            destructive = True
+            kind = "file_deletion"
+            flags = [t for t in tokens[rm_idx + 1 :] if t.startswith("-")]
+            recursive = any("r" in f.lower() or "--recursive" in f.lower() for f in flags)
+            path_args = [t for t in tokens[rm_idx + 1 :] if not t.startswith("-")]
+            for raw_p in path_args:
+                if raw_p in {"/", "/*"}:
+                    blocked = True
+                    block_reason = f"Refusing catastrophic deletion target `{raw_p}`"
+                    break
+                p_obj = Path(raw_p).expanduser()
+                resolved = p_obj.resolve() if p_obj.is_absolute() or raw_p.startswith("~") else (base_cwd / p_obj).resolve()
+                targets.append(str(resolved))
+                if str(resolved) in _CRITICAL_PROTECTED_ROOTS or (recursive and resolved == home_dir):
+                    blocked = True
+                    block_reason = f"Refusing recursive/root deletion on protected path `{resolved}`"
+                    break
+                if resolved.is_file():
+                    affected_files += 1
+                elif resolved.is_dir():
+                    try:
+                        affected_files += sum(
+                            1 for _ in zip(range(500), resolved.rglob("*"), strict=False)
+                        )
+                    except Exception:
+                        affected_files += 1
+
+    if "git reset --hard" in low_cmd or "git clean" in low_cmd:
+        destructive = True
+        kind = "git_worktree_discard"
+        if shutil.which("git") and base_cwd.is_dir():
+            try:
+                proc = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(base_cwd),
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                )
+                if proc.returncode == 0:
+                    dirty_lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+                    dirty_git_files = len(dirty_lines)
+                    affected_files = max(affected_files, dirty_git_files)
+            except Exception:
+                pass
+
+    summary_parts: list[str] = [f"kind={kind}"]
+    if targets:
+        summary_parts.append(f"targets={targets[:3]}")
+    if affected_files:
+        summary_parts.append(f"affected_files~={affected_files}")
+    if dirty_git_files:
+        summary_parts.append(f"dirty_git_files={dirty_git_files}")
+    if blocked:
+        summary_parts.append(f"BLOCKED({block_reason})")
+
+    return {
+        "destructive": destructive,
+        "kind": kind,
+        "blocked": blocked,
+        "block_reason": block_reason,
+        "targets": targets,
+        "affected_files": affected_files,
+        "dirty_git_files": dirty_git_files,
+        "summary": " | ".join(summary_parts),
+    }
 
 
 def build_recovery_hint(

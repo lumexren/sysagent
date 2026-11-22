@@ -43,7 +43,7 @@ def _cmd_digest(base_url: str, locale: str | None = None) -> None:
         sys.exit(1)
 
 
-def _cmd_doctor(base_url: str) -> None:
+def _cmd_doctor(base_url: str, fix: bool = False) -> None:
     import psutil
     from rich import box
     from rich.console import Console
@@ -98,6 +98,17 @@ def _cmd_doctor(base_url: str) -> None:
         styled = f"[green]{state}[/green]" if state == "OK" else (f"[yellow]{state}[/yellow]" if state == "WARN" else f"[red]{state}[/red]")
         tbl.add_row(name, styled, detail)
     Console().print(tbl)
+    if fix:
+        try:
+            r_fix = ipc_post(f"{base_url}/api/self/doctor", headers=_auth_headers(), timeout=20)
+            r_fix.raise_for_status()
+            fix_data = r_fix.json()
+        except Exception:
+            from .self_learn import run_doctor_auto_repair
+
+            with Storage() as st_fix:
+                fix_data = run_doctor_auto_repair(st_fix)
+        print(json.dumps(fix_data, indent=2, ensure_ascii=False))
 
 
 def _cmd_plugin(action: str, name: str | None = None) -> None:

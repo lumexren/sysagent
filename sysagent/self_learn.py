@@ -334,7 +334,7 @@ def learn_status_summary(storage: Storage) -> dict[str, Any]:
         rt_mem = {}
     cal_raw = _load_json_memory(storage, "_internal:self_calibration", {})
     dpo_audit = (cal_raw.get("dpo_audit") if isinstance(cal_raw, dict) else None) or {}
-    twin_snap = analyze_causal_digital_twin(storage)
+    twin_snap = analyze_causal_digital_twin(storage, snapshots=list(_TWIN_HISTORY))
     return {
         "local_model": {
             "samples": lm.get("samples_trained", 0),
@@ -2145,4 +2145,201 @@ def investigate_root_cause(
         "top_hypothesis": top_h,
         "hypotheses": hypotheses[:5],
         "summary": summary,
+    }
+
+
+def verify_remediation_impact(
+    storage: Storage,
+    action_label: str,
+    before_state: dict[str, Any],
+    after_state: dict[str, Any],
+    rule_id: int | None = None,
+) -> dict[str, Any]:
+    """Counterfactually evaluate whether an autonomous or closed-loop remediation resolved the target anomaly."""
+    ram_b = float(before_state.get("ram_percent") or 0.0)
+    ram_a = float(after_state.get("ram_percent") or ram_b)
+    cpu_b = float(before_state.get("cpu_percent") or 0.0)
+    cpu_a = float(after_state.get("cpu_percent") or cpu_b)
+    freed_mb = float(after_state.get("freed_ram_mb") or 0.0)
+    pid_alive_b = bool(before_state.get("pid_alive", False))
+    pid_alive_a = bool(after_state.get("pid_alive", False))
+    svc_active_b = bool(before_state.get("service_active", True))
+    svc_active_a = bool(after_state.get("service_active", True))
+    reply_err = bool(after_state.get("reply_error", False))
+
+    ram_delta = round(ram_a - ram_b, 2)
+    cpu_delta = round(cpu_a - cpu_b, 2)
+    reasons: list[str] = []
+    effective = True
+
+    if reply_err:
+        effective = False
+        reasons.append("reply_reported_error")
+    if pid_alive_b and not pid_alive_a:
+        reasons.append("target_pid_terminated")
+    elif pid_alive_b and pid_alive_a and action_label.startswith("kill_leak:"):
+        effective = False
+        reasons.append("target_pid_still_alive")
+
+    if not svc_active_b and svc_active_a:
+        reasons.append("service_recovered")
+    elif not svc_active_b and not svc_active_a and "service" in action_label:
+        effective = False
+        reasons.append("service_still_inactive")
+
+    if freed_mb >= 5.0 or ram_delta <= -1.0:
+        reasons.append(f"ram_improved({ram_delta:+.1f}%,+{freed_mb:.1f}MB)")
+    elif ram_b >= 85.0 and ram_delta > 3.0:
+        effective = False
+        reasons.append(f"ram_worsened({ram_delta:+.1f}%)")
+
+    if cpu_b >= 85.0 and cpu_delta <= -5.0:
+        reasons.append(f"cpu_improved({cpu_delta:+.1f}%)")
+
+    if not reasons:
+        reasons.append("telemetry_stable")
+
+    reward = 1.5 if effective else -1.0
+    conf_delta = 6 if effective else -15
+    if rule_id is not None:
+        try:
+            storage.reinforce_brain_rule(int(rule_id), delta=conf_delta)
+        except Exception:
+            pass
+    try:
+        from .neural import NeuralEngine
+
+        eng = NeuralEngine(storage)
+        eng.online_step(f"remediate {action_label}", "system_status", reward=reward)
+        eng.sync_associative_memory()
+    except Exception:
+        pass
+    try:
+        storage.add_lesson(
+            f"counterfactual:{'ok' if effective else 'missed'}:{action_label[:48]}",
+            f"Action `{action_label}` counterfactual impact: {', '.join(reasons)}",
+            f"RAM delta={ram_delta:+.1f}%, CPU delta={cpu_delta:+.1f}%, reward={reward:+.1f}",
+        )
+    except Exception:
+        pass
+
+    return {
+        "effective": effective,
+        "action": action_label,
+        "ram_delta": ram_delta,
+        "cpu_delta": cpu_delta,
+        "freed_ram_mb": freed_mb,
+        "reward": reward,
+        "confidence_delta": conf_delta,
+        "reasons": reasons,
+    }
+
+
+def mine_episodic_workflows(
+    storage: Storage, min_occurrences: int = 2, max_new: int = 3
+) -> dict[str, Any]:
+    """Mine recurring multi-step command/file patterns across distinct sessions into learned_workflows and NeuralEngine."""
+    checkpoints = storage.list_session_checkpoints(limit=80)
+    seq_sessions: dict[tuple[str, ...], set[str]] = {}
+    seq_topics: dict[tuple[str, ...], str] = {}
+    seq_steps: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+
+    for cp in checkpoints:
+        sid = str(cp.get("session_id") or "")
+        topic = str(cp.get("topic") or "cross-session workflow").strip()
+        files = [str(f) for f in (cp.get("files") or []) if str(f).strip()]
+        cmds = [str(c) for c in (cp.get("commands") or []) if str(c).strip()]
+        inferred: list[dict[str, Any]] = []
+        if files:
+            inferred.append({"name": "read_file", "arguments": {"path": files[0]}})
+        for cmd in cmds[:3]:
+            low_c = cmd.lower()
+            if low_c.startswith(("rg ", "grep ", "find ")):
+                inferred.append({"name": "search_files", "arguments": {"query": cmd.split()[-1]}})
+            elif low_c.startswith("journalctl"):
+                inferred.append({"name": "read_journal_logs", "arguments": {"lines": 40}})
+            elif low_c.startswith("systemctl"):
+                inferred.append({"name": "list_systemd_units", "arguments": {"state": "running"}})
+            else:
+                inferred.append({"name": "run_command", "arguments": {"command": cmd}})
+        if len(inferred) >= 2:
+            key = tuple(st["name"] for st in inferred[:4])
+            if len(set(key)) >= 2 or len(key) >= 2:
+                seq_sessions.setdefault(key, set()).add(sid or f"cp_{id(cp)}")
+                seq_topics.setdefault(key, topic)
+                seq_steps.setdefault(key, inferred[:4])
+
+    audits = storage.list_audit_log(limit=60)
+    by_batch: dict[str, list[dict[str, Any]]] = {}
+    for row in audits:
+        bid = str(row.get("batch_id") or "")
+        if bid:
+            by_batch.setdefault(bid, []).append(row)
+    for bid, items in by_batch.items():
+        if len(items) >= 2:
+            ordered = list(reversed(items))
+            steps = [
+                {"name": str(it.get("action") or "edit_file"), "arguments": {"path": str(it.get("target_path") or "")}}
+                for it in ordered[:4]
+            ]
+            key = tuple(s["name"] for s in steps)
+            seq_sessions.setdefault(key, set()).add(f"batch:{bid}")
+            seq_topics.setdefault(key, f"multi-file edit ({Path(steps[0]['arguments']['path']).name})")
+            seq_steps.setdefault(key, steps)
+
+    promoted: list[dict[str, Any]] = []
+    for key, sids in sorted(seq_sessions.items(), key=lambda kv: len(kv[1]), reverse=True):
+        if len(sids) < min_occurrences or len(promoted) >= max_new:
+            continue
+        topic = seq_topics[key]
+        steps = seq_steps[key]
+        storage.record_workflow(topic, steps)
+        storage.record_workflow(topic, steps)
+        sig = " -> ".join(key)
+        try:
+            from .neural import NeuralEngine
+
+            eng = NeuralEngine(storage)
+            eng.remember_safe_plan(topic, steps[0]["name"], steps[0].get("arguments") or {})
+        except Exception:
+            pass
+        promoted.append({"signature": sig, "topic": topic, "sessions_count": len(sids), "steps": steps})
+
+    return {
+        "mined_count": len(promoted),
+        "promoted_workflows": promoted,
+    }
+
+
+def run_doctor_auto_repair(storage: Storage, plugins: Any = None) -> dict[str, Any]:
+    """Execute unified deep self-integrity audit and auto-repair across DB, KG, DPO, plugins, and episodic workflows."""
+    from .config import get_settings
+    from .self_guard import SelfGuard
+
+    sqlite_ok = False
+    try:
+        qc = storage._connect().execute("PRAGMA quick_check;").fetchone()[0]
+        sqlite_ok = qc == "ok"
+    except Exception:
+        sqlite_ok = False
+
+    expired_pruned = storage.prune_expired_memories()
+    mem_consolidated = storage.consolidate_memories()
+    kg_cleanup = storage.consolidate_knowledge_graph()
+    runtime_healed = heal_runtime_anomalies(storage, plugins=plugins)
+    episodic = mine_episodic_workflows(storage)
+    sg = SelfGuard(get_settings(), storage)
+    dpo_audit = sg.audit_dpo_preferences(auto_repair=True)
+    cal = sg.calibrate_thresholds()
+
+    return {
+        "status": "repaired",
+        "sqlite_ok": sqlite_ok,
+        "expired_memories_pruned": expired_pruned,
+        "memories_consolidated": mem_consolidated,
+        "kg_cleanup": kg_cleanup,
+        "runtime_healed": runtime_healed,
+        "episodic_workflows": episodic,
+        "dpo_audit": dpo_audit,
+        "calibration": cal,
     }

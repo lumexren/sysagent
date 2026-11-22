@@ -132,6 +132,18 @@ def execute_tool(
             cmd = str(arguments["command"])
             cwd = str(_resolve(arguments["cwd"])) if arguments.get("cwd") else str(Path.home())
             timeout_sec = int(arguments.get("timeout") or 60)
+            from .self_resilience import analyze_command_preflight
+
+            preflight = analyze_command_preflight(cmd, cwd=cwd)
+            if preflight.get("blocked"):
+                return json.dumps(
+                    {
+                        "error": f"Pre-flight safety guard blocked command: {preflight.get('block_reason')}",
+                        "exit_code": 126,
+                        "preflight": preflight,
+                    },
+                    ensure_ascii=False,
+                )
             try:
                 proc = subprocess.run(
                     cmd,
@@ -167,14 +179,14 @@ def execute_tool(
                     },
                     ensure_ascii=False,
                 )
-            return json.dumps(
-                {
-                    "exit_code": proc.returncode,
-                    "stdout": compress_tool_output(proc.stdout, max_chars=4000),
-                    "stderr": compress_tool_output(proc.stderr, max_chars=2000),
-                },
-                ensure_ascii=False,
-            )
+            res_cmd: dict[str, Any] = {
+                "exit_code": proc.returncode,
+                "stdout": compress_tool_output(proc.stdout, max_chars=4000),
+                "stderr": compress_tool_output(proc.stderr, max_chars=2000),
+            }
+            if preflight.get("destructive"):
+                res_cmd["preflight"] = preflight
+            return json.dumps(res_cmd, ensure_ascii=False)
 
         if name == "read_file":
             p = _resolve(arguments["path"])
