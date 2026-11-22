@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 from sysagent import local_inference as li_mod
 from sysagent.agent import (
     AgentManager,
-    _looks_like_unexecuted_tool_stall,
+    _has_fenced_shell_block,
     build_system_instruction,
 )
 from sysagent.config import Settings
@@ -247,6 +247,13 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
         self.assertEqual(out["tool_calls"][0]["name"], "read_file")
 
     def test_inspect_self_component_prompts_checkpoints_and_codebase(self) -> None:
+        inspect_schema = next(d for d in TOOL_DECLARATIONS if d["name"] == "inspect_self_component")
+        comp_enum = inspect_schema["parameters"]["properties"]["component"].get("enum")
+        self.assertIsInstance(comp_enum, list)
+        self.assertIn("prompts", comp_enum)
+        self.assertIn("checkpoints", comp_enum)
+        self.assertIn("codebase", comp_enum)
+
         with Storage(db_path=self.root / "isp.db") as st:
             st.save_prompt_version("agent_main", "You are {agent_name}. Custom prompt with length > 40 chars.", "tuned formatting")
             st.save_session_checkpoint("s1", "prompt migration", "Updated prompt registry", files=["prompts.py"])
@@ -259,12 +266,18 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             self.assertIn("codebase", data)
             self.assertIn("Prompts evolved=1/", data["overview"])
 
-            only_prompts = json.loads(execute_tool("inspect_self_component", {"component": "promptları"}, None, st))
-            self.assertEqual(only_prompts["component"], "prompts")
-            self.assertIn("prompts", only_prompts)
-            self.assertTrue(any(p.get("template_preview") for p in only_prompts["prompts"]["prompts"]))
+            for alias in ("prompts", "prompt_registry", "promptları"):
+                only_prompts = json.loads(execute_tool("inspect_self_component", {"component": alias}, None, st))
+                self.assertEqual(only_prompts["component"], "prompts")
+                self.assertIn("prompts", only_prompts)
+                self.assertTrue(any(p.get("template_preview") for p in only_prompts["prompts"]["prompts"]))
+
+            fallback_all = json.loads(execute_tool("inspect_self_component", {"component": "nonexistent_xyz"}, None, st))
+            self.assertEqual(fallback_all["component"], "all")
 
     def test_runtime_contract_compact_sys_inst_and_bash_stall_nudge(self) -> None:
+        from sysagent.neural import NeuralEngine
+
         with Storage(db_path=self.root / "sc.db") as st:
             # Stale evolved DB prompt lacking inspect_self_component wording still gets contract
             st.save_prompt_version("agent_main", "You are {agent_name}, a minimal assistant on Linux with custom filler text.", "stale custom")
@@ -280,18 +293,22 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             self.assertIn("Language rule:", compact)
 
             self.assertTrue(
-                _looks_like_unexecuted_tool_stall(
-                    "promptlar ne durumda",
-                    "Dosyayı okuyayım:\n```bash\ncat /home/eren/Projects/sysagent/sysagent/prompts.py\n```",
+                _has_fenced_shell_block(
+                    "Dosyayı okuyayım:\n```bash\ncat /home/eren/Projects/sysagent/sysagent/prompts.py\n```"
                 )
             )
-            self.assertTrue(_looks_like_unexecuted_tool_stall("terminali temizle", "```bash\nclear\n```"))
-            self.assertFalse(_looks_like_unexecuted_tool_stall("örnek bash script yaz", "```bash\ncat foo.txt\n```"))
+            self.assertTrue(_has_fenced_shell_block("```sh\nclear\n```"))
+            self.assertFalse(_has_fenced_shell_block("Merhaba dünya"))
+            self.assertFalse(_has_fenced_shell_block("```python\nprint(1)\n```"))
 
-            # Verify AgentManager.run_turn nudges when model stalls with fake ```bash\ncat ...``` block
+            # 1) Judge returns true -> run_turn nudges, calls inspect_self_component, and updates NeuralEngine stall_samples
             watcher = SimpleNamespace(current_context="normal", _send_desktop_notification=MagicMock())
             am = AgentManager(Settings(), watcher, st, PluginRegistry(), MagicMock(is_configured=True))
             calls: list[dict[str, object]] = []
+            nn_file = self.root / "nn_stall.npz"
+            nn_meta = self.root / "nn_stall.json"
+            real_nn = NeuralEngine(st, npz_file=nn_file, meta_file=nn_meta)
+            samples_before = int(real_nn.meta.get("stall_samples", 0))
 
             async def _fake_failover(_sid, **kw):
                 calls.append(dict(kw))
@@ -316,15 +333,88 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
                     )
                 return SimpleNamespace(id="m3", steps=[], output_text="Prompt v0 aktif ve 7 şablon hazır.")
 
+            async def _fake_create_safe_true(_client, _kw):
+                return SimpleNamespace(output_text='{"unexecuted_stall": true}')
+
             with (
                 patch.object(am, "_get_client", return_value=MagicMock()),
                 patch.object(am, "_match_zero_llm_fastpath", return_value=None),
                 patch.object(am, "_call_model_with_failover", side_effect=_fake_failover),
+                patch.object(am, "_create_safe", side_effect=_fake_create_safe_true),
+                patch("sysagent.neural.NeuralEngine", return_value=real_nn),
             ):
                 out = asyncio.run(am.run_turn("s-nudge", "promptlar ne durumda"))
             self.assertIn("Prompt v0", out)
             self.assertGreaterEqual(len(calls), 3)
             self.assertIn("inspect_self_component", str(calls[1]["input"]))
+            self.assertGreater(int(real_nn.meta.get("stall_samples", 0)), samples_before)
+
+            # 2) Judge returns false (intentional example) -> no nudge, original reply returned untouched
+            calls_false: list[dict[str, object]] = []
+            example_reply = "İşte örnek komut:\n```bash\ncat foo.txt\n```"
+
+            async def _fake_failover_example(_sid, **kw):
+                calls_false.append(dict(kw))
+                return SimpleNamespace(id="mx1", steps=[], output_text=example_reply)
+
+            async def _fake_create_safe_false(_client, _kw):
+                return SimpleNamespace(output_text='{"unexecuted_stall": false}')
+
+            with (
+                patch.object(am, "_get_client", return_value=MagicMock()),
+                patch.object(am, "_match_zero_llm_fastpath", return_value=None),
+                patch.object(am, "_call_model_with_failover", side_effect=_fake_failover_example),
+                patch.object(am, "_create_safe", side_effect=_fake_create_safe_false),
+                patch("sysagent.neural.NeuralEngine", return_value=real_nn),
+            ):
+                out_example = asyncio.run(am.run_turn("s-example", "örnek bash script yaz"))
+            self.assertEqual(out_example, example_reply)
+            self.assertEqual(len(calls_false), 1)
+
+            # 3) Reply without fenced shell block -> judge is not called
+            calls_plain: list[dict[str, object]] = []
+
+            async def _fake_failover_plain(_sid, **kw):
+                calls_plain.append(dict(kw))
+                return SimpleNamespace(id="mp1", steps=[], output_text="Her şey normal görünüyor.")
+
+            with (
+                patch.object(am, "_get_client", return_value=MagicMock()),
+                patch.object(am, "_match_zero_llm_fastpath", return_value=None),
+                patch.object(am, "_call_model_with_failover", side_effect=_fake_failover_plain),
+                patch.object(am, "_judge_unexecuted_shell_stall") as judge_spy,
+                patch("sysagent.neural.NeuralEngine", return_value=real_nn),
+            ):
+                out_plain = asyncio.run(am.run_turn("s-plain", "nasılsın"))
+            self.assertEqual(out_plain, "Her şey normal görünüyor.")
+            judge_spy.assert_not_called()
+
+            # 4) local-mind model uses LocalMind.run_gguf_inference(max_tokens=32, prefer_warm=True) without cloud
+            with (
+                patch.object(am, "_get_client", return_value=LocalMindClient(st)),
+                patch.object(am, "_create_safe") as cloud_spy,
+                patch.object(
+                    LocalMind,
+                    "run_gguf_inference",
+                    return_value='{"unexecuted_stall": true}',
+                ) as gguf_spy,
+                patch("sysagent.neural.NeuralEngine", return_value=real_nn),
+            ):
+                local_verdict = asyncio.run(
+                    am._judge_unexecuted_shell_stall(
+                        "local-mind",
+                        "promptlar ne durumda",
+                        "```bash\ncat prompts.py\n```",
+                        [],
+                    )
+                )
+            self.assertTrue(local_verdict)
+            cloud_spy.assert_not_called()
+            gguf_spy.assert_called_once()
+            _, gguf_kw = gguf_spy.call_args
+            self.assertEqual(gguf_kw.get("max_tokens"), 32)
+            self.assertTrue(gguf_kw.get("prefer_warm"))
+            self.assertTrue(gguf_kw.get("extra_system"))
 
 
 if __name__ == "__main__":

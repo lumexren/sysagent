@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -97,47 +98,12 @@ def build_system_instruction(
     return f"{base}{contract}\n{lang_rule}"
 
 
-def _looks_like_unexecuted_tool_stall(user_msg: str, reply_txt: str) -> bool:
-    """Detect short replies that print a fake runnable bash command instead of calling a tool."""
-    import re
-
+def _has_fenced_shell_block(reply_txt: str) -> bool:
+    """Detect whether a short reply contains a fenced shell code block."""
     txt = (reply_txt or "").strip()
-    if not txt or len(txt) > 900:
+    if not txt or len(txt) > 1200:
         return False
-    u_low = (user_msg or "").lower()
-    if any(
-        k in u_low
-        for k in (
-            "örnek",
-            "example",
-            "snippet",
-            "how to",
-            "nasıl yazar",
-            "komutu nedir",
-            "komut nedir",
-            "komut ver",
-            "script",
-            "kod örneği",
-        )
-    ):
-        return False
-    blocks = re.findall(
-        r"```(?:bash|sh|shell|zsh)?\s*\n(.*?)\n```", txt, flags=re.DOTALL | re.IGNORECASE
-    )
-    if not blocks:
-        return False
-    runnable_cmds = (
-        "cat", "head", "tail", "sed", "awk", "grep", "rg", "ls", "find",
-        "clear", "reset", "systemctl", "journalctl", "ps", "df", "free", "du",
-        "git", "python", "python3", "pytest",
-    )
-    for blk in blocks:
-        lines = [ln.strip() for ln in blk.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        if 1 <= len(lines) <= 4:
-            first_tok = lines[0].split(None, 1)[0].split("/")[-1].lower()
-            if first_tok in runnable_cmds:
-                return True
-    return False
+    return bool(re.search(r"```(?:bash|sh|shell|zsh)\s*\n\s*\S", txt, flags=re.IGNORECASE))
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -191,12 +157,21 @@ class AgentManager:
         words = low.split()
         if not words or len(words) > 7:
             return None
-        block_cues = (
-            "why", "fix", "add", "write", "edit",
-            "code", "analyze", "compare", "delete",
-        )
-        if any(c in low for c in block_cues):
+        dyn_cues = self.storage.get_learned_cues()
+        gate_cues = list(dyn_cues.get("action_req") or []) + list(dyn_cues.get("complex") or [])
+        if gate_cues and any(c in low for c in gate_cues):
             return None
+        try:
+            from .neural import NeuralEngine
+
+            eng = NeuralEngine(self.storage)
+            if int(eng.meta.get("epochs_trained", 0)) > 0:
+                unc = eng.predict_with_uncertainty(clean)
+                r_probs = eng.predict_role_probs(clean)
+                if unc.get("uncertain") or (r_probs.get("coding", 0.0) + r_probs.get("reasoning", 0.0)) >= 0.45:
+                    return None
+        except Exception:
+            pass
         try:
             from .local_mind import LocalMind
             from .self_learn import shadow_stats
@@ -210,6 +185,90 @@ class AgentManager:
         except Exception:
             pass
         return None
+
+    async def _judge_unexecuted_shell_stall(
+        self,
+        selected_model: str,
+        user_msg: str,
+        reply_txt: str,
+        recorded_tool_calls: list[dict[str, Any]],
+    ) -> bool:
+        """Ask the active model tier if a fenced shell block is an unexecuted stall vs an intentional example."""
+        if not _has_fenced_shell_block(reply_txt):
+            return False
+        judge_prompt = json.dumps(
+            {
+                "task": (
+                    "Determine whether `assistant_reply` stalled by printing a shell command for the user to run "
+                    "instead of executing a tool that can satisfy `user_request` directly, OR if the user intentionally "
+                    "asked for an example, explanation, or script. "
+                    'Respond ONLY with JSON: {"unexecuted_stall": true} or {"unexecuted_stall": false}.'
+                ),
+                "user_request": (user_msg or "")[:500],
+                "tools_already_called": [str(tc.get("name") or "") for tc in recorded_tool_calls[-6:]],
+                "assistant_reply": (reply_txt or "")[:900],
+            },
+            ensure_ascii=False,
+        )
+        raw: str | None = None
+        client = self._get_client()
+        if selected_model in {"local", "local-mind", "local_mind"} or type(client).__name__ == "LocalMindClient":
+            try:
+                from .local_mind import LocalMind
+
+                raw = await asyncio.to_thread(
+                    LocalMind(self.storage).run_gguf_inference,
+                    judge_prompt,
+                    extra_system='Classify strictly. Respond ONLY with JSON: {"unexecuted_stall": true} or {"unexecuted_stall": false}.',
+                    max_tokens=32,
+                    prefer_warm=True,
+                )
+            except Exception:
+                return False
+        else:
+            cb = get_circuit_breaker()
+            light_key = f"model:{self.settings.light_model}"
+            if not cb.allow(light_key):
+                return False
+            try:
+                resp = await self._create_safe(
+                    client,
+                    {
+                        "model": self.settings.light_model,
+                        "input": judge_prompt,
+                        "store": False,
+                    },
+                )
+                cb.record_success(light_key)
+                out_txt = getattr(resp, "output_text", None)
+                if not isinstance(out_txt, str):
+                    return False
+                raw = out_txt
+            except Exception:
+                cb.release_probe(light_key)
+                return False
+
+        if not isinstance(raw, str) or not raw.strip():
+            return False
+        m = re.search(r"\{.*?\}", raw, flags=re.DOTALL)
+        if not m:
+            return False
+        try:
+            parsed = json.loads(m.group(0))
+        except Exception:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        verdict = parsed.get("unexecuted_stall")
+        if not isinstance(verdict, bool):
+            return False
+        try:
+            from .neural import NeuralEngine
+
+            NeuralEngine(self.storage).online_stall_step(reply_txt, is_stall=verdict)
+        except Exception:
+            pass
+        return verdict
 
     def _get_client(self) -> genai.Client:
         return self.auth.get_client()
@@ -1131,18 +1190,21 @@ class AgentManager:
                                         except SyntaxError as exc:
                                             broken_py_err = f"{fp.name}: {exc}"
                                             break
-                    unexecuted_cmd_stall = _looks_like_unexecuted_tool_stall(user_message, text)
-                    should_nudge = (
-                        nudge_count < 3
-                        and (
-                            leaked_tool_json
-                            or unexecuted_cmd_stall
-                            or read_only_stalled
-                            or neural_stall
-                            or bool(broken_py_err)
-                            or any(cue in low_txt for cue in stall_cues)
-                        )
+                    base_nudge = (
+                        leaked_tool_json
+                        or read_only_stalled
+                        or neural_stall
+                        or bool(broken_py_err)
+                        or any(cue in low_txt for cue in stall_cues)
                     )
+                    unexecuted_cmd_stall = (
+                        await self._judge_unexecuted_shell_stall(
+                            selected_model, user_message, text, recorded_tool_calls
+                        )
+                        if (nudge_count == 0 and not base_nudge and _has_fenced_shell_block(text))
+                        else False
+                    )
+                    should_nudge = nudge_count < 3 and (base_nudge or unexecuted_cmd_stall)
                     if should_nudge:
                         nudge_count += 1
                         if leaked_tool_json:
@@ -1152,8 +1214,8 @@ class AgentManager:
                             )
                         elif unexecuted_cmd_stall:
                             nudge_msg = (
-                                "[System]: Do NOT output runnable bash commands like `cat` or `clear` for the user. "
-                                "Execute `inspect_self_component`, `read_file`, or `run_command` RIGHT NOW and report the real result."
+                                "[System]: Do NOT output a shell command for the user to run when you can perform the action directly. "
+                                "Invoke the appropriate tool (`inspect_self_component`, `read_file`, `run_command`, etc.) RIGHT NOW and report the real result."
                             )
                         elif broken_py_err:
                             nudge_msg = (

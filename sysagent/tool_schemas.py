@@ -528,6 +528,20 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
             "properties": {
                 "component": {
                     "type": "string",
+                    "enum": [
+                        "all",
+                        "prompts",
+                        "brain",
+                        "cortex",
+                        "neural",
+                        "evolve",
+                        "local_mind",
+                        "self",
+                        "guard",
+                        "notifications",
+                        "checkpoints",
+                        "codebase",
+                    ],
                     "description": (
                         "Target component: 'prompts', 'brain', 'cortex', 'neural', 'evolve', "
                         "'local_mind', 'guard', 'notifications', 'checkpoints', 'codebase', or 'all' (default 'all')."

@@ -695,7 +695,7 @@ class NeuralEngine:
         return ranked[: max(1, top_k)]
 
     def infer_arguments(self, text: str, tool_name: str) -> dict[str, Any]:
-        """Synthesize tool arguments from query cues and LocalMind's learned argument templates."""
+        """Synthesize tool arguments from learned safe_plans, LocalMind templates, and structural patterns."""
         import re
 
         low = (text or "").lower()
@@ -703,20 +703,38 @@ class NeuralEngine:
         try:
             from .local_mind import LocalMind
 
-            args.update(LocalMind(self.storage).predict_args(tool_name, text))
+            args.update(LocalMind(self.storage).extract_arguments(tool_name, text))
         except Exception:
             pass
 
+        plans = [
+            p
+            for p in (self.meta.get("safe_plans") or [])
+            if str(p.get("tool") or "") == tool_name and isinstance(p.get("args"), dict) and p.get("args")
+        ]
+        if plans and (text or "").strip():
+            q_vec = self.encode_features(text)[:TEXT_DIM]
+            q_norm = float(np.linalg.norm(q_vec))
+            if q_norm >= 1e-6:
+                best_plan: dict[str, Any] | None = None
+                best_sim = 0.0
+                for p in plans:
+                    p_vec = self.encode_features(str(p.get("text") or ""))[:TEXT_DIM]
+                    p_norm = float(np.linalg.norm(p_vec))
+                    if p_norm >= 1e-6:
+                        sim = float(np.dot(q_vec, p_vec) / (q_norm * p_norm))
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_plan = p
+                if best_plan is not None and best_sim >= 0.45:
+                    args.update(dict(best_plan["args"]))
+
         path_m = re.search(r"(~\/[^\s'\"]+|\/[a-zA-Z0-9._\-\/]+)", text or "")
         if path_m and tool_name in {"read_file", "list_directory", "search_files"}:
-            args.setdefault("path", path_m.group(1))
+            args["path"] = path_m.group(1)
         if tool_name == "list_processes":
-            if any(k in low for k in ("ram", "mem", "bellek")):
-                args["sort_by"] = "memory"
             args.setdefault("limit", 15)
         elif tool_name == "list_systemd_units":
-            if any(k in low for k in ("fail", "hata", "çöken", "broken")):
-                args["state"] = "failed"
             args.setdefault("limit", 25)
         elif tool_name == "read_journal_logs":
             num_m = re.search(r"\b(\d{1,3})\b", low)

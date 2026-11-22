@@ -1878,6 +1878,7 @@ class LocalMind:
         extra_system: str = "",
         mmproj: Path | None = None,
         images: list[dict[str, str]] | None = None,
+        max_tokens: int = 1024,
     ) -> str | None:
         import httpx
 
@@ -1903,7 +1904,7 @@ class LocalMind:
                         json={
                             "messages": messages,
                             "temperature": 0.2,
-                            "max_tokens": 1024,
+                            "max_tokens": max_tokens,
                         },
                         timeout=60,
                     )
@@ -1929,7 +1930,7 @@ class LocalMind:
                     res = llm.create_chat_completion(
                         messages=messages,
                         temperature=0.2,
-                        max_tokens=1024,
+                        max_tokens=max_tokens,
                     )
                     touch_warm_model()
                     choices = res.get("choices") or []
@@ -1961,7 +1962,7 @@ class LocalMind:
                         "-c",
                         "4096",
                         "-n",
-                        "1024",
+                        str(max_tokens),
                         "--temp",
                         "0.2",
                         "-no-cnv",
@@ -2005,6 +2006,8 @@ class LocalMind:
         history: list[dict[str, str]] | None = None,
         extra_system: str = "",
         images: list[dict[str, str]] | None = None,
+        max_tokens: int = 1024,
+        prefer_warm: bool = False,
     ) -> str | None:
         """Run fast single-pass local GPU-accelerated GGUF inference via task-routed specialists."""
         models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
@@ -2019,12 +2022,17 @@ class LocalMind:
             )
             mmproj = find_mmproj_for_model(specialist)
         else:
-            target_role = preferred_role or classify_task_role(prompt, storage=self.storage)
-            specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
-            if preferred_role is None:
-                specialist, _ = choose_model_with_hysteresis(
-                    specialist, target_role, prompt, classify_gguf_role
-                )
+            warm = get_warm_model_path() if prefer_warm and preferred_role is None else None
+            if warm is not None and warm.is_file() and classify_gguf_role(warm) != "embedding":
+                specialist = warm
+                target_role = classify_gguf_role(warm)
+            else:
+                target_role = preferred_role or classify_task_role(prompt, storage=self.storage)
+                specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
+                if preferred_role is None:
+                    specialist, _ = choose_model_with_hysteresis(
+                        specialist, target_role, prompt, classify_gguf_role
+                    )
             mmproj = find_mmproj_for_model(specialist) if classify_gguf_role(specialist) == "multimodal" else None
         final_out = self._run_single_gguf(
             specialist,
@@ -2034,6 +2042,7 @@ class LocalMind:
             extra_system=extra_system,
             mmproj=mmproj,
             images=images,
+            max_tokens=max_tokens,
         )
         if not final_out and not images:
             fallback = (
@@ -2048,6 +2057,7 @@ class LocalMind:
                     system_instruction,
                     history=history,
                     extra_system=extra_system,
+                    max_tokens=max_tokens,
                 )
         if final_out and not extra_system and len(prompt.strip()) >= 8:
             qa = self.weights.setdefault("qa_memory", [])
@@ -2505,7 +2515,6 @@ class LocalMind:
             return None
 
         draft = self._run_single_gguf(specialist, msg, system_instruction)
-        uncertain_markers = ("i don't know", "not sure", "cannot determine", "escalate_cloud")
         neural_uncertain = False
         if draft and self.storage is not None:
             try:
@@ -2518,7 +2527,7 @@ class LocalMind:
             draft
             and len(draft.strip()) >= 12
             and not neural_uncertain
-            and not any(u in draft.lower() for u in uncertain_markers)
+            and "escalate_cloud" not in draft.lower()
         )
         if draft_ok:
             return {"tier": f"local:{role}", "model": specialist.name, "reply": draft}

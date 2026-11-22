@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import json
 import os
 import shutil
@@ -672,57 +673,26 @@ def execute_tool(
             return json.dumps({"status": "reloaded", "plugin_tools": count})
 
         if name == "inspect_self_component":
-            raw_comp = str(arguments.get("component") or "all").strip().lower()
-            alias_comp = {
-                "thoughts": "brain",
-                "mind": "brain",
-                "cognitive": "brain",
-                "rules": "brain",
-                "flow": "cortex",
-                "dream": "cortex",
-                "healer": "cortex",
-                "habits": "cortex",
-                "resilience": "guard",
-                "self_guard": "guard",
-                "selfguard": "guard",
-                "breakers": "guard",
-                "quota": "guard",
-                "drift": "guard",
-                "eval": "guard",
-                "canary": "guard",
-                "autopsy": "guard",
-                "calibration": "guard",
-                "local": "local_mind",
-                "localmind": "local_mind",
-                "models": "local_mind",
-                "notif": "notifications",
-                "notification": "notifications",
-                "prompt": "prompts",
-                "prompts": "prompts",
-                "prompt_registry": "prompts",
-                "templates": "prompts",
-                "promptlar": "prompts",
-                "promptlari": "prompts",
-                "promptları": "prompts",
-                "promptların": "prompts",
-                "checkpoint": "checkpoints",
-                "checkpoints": "checkpoints",
-                "sessions": "checkpoints",
-                "session": "checkpoints",
-                "code": "codebase",
-                "codebase": "codebase",
-                "source": "codebase",
-                "modules": "codebase",
-                "git": "codebase",
-                "summary": "all",
-                "overview": "all",
-            }
-            comp = alias_comp.get(raw_comp, raw_comp)
-            if comp not in {
+            _CANONICAL_COMPONENTS = (
                 "brain", "cortex", "neural", "evolve", "local_mind", "self",
                 "guard", "notifications", "prompts", "checkpoints", "codebase", "all",
-            }:
-                comp = "all"
+            )
+            raw_comp = str(arguments.get("component") or "all").strip().lower()
+            norm = raw_comp.replace("-", "_").replace(" ", "_")
+            if norm in _CANONICAL_COMPONENTS:
+                comp = norm
+            else:
+                parts = {p for p in norm.split("_") if p}
+                comp = ""
+                for c in _CANONICAL_COMPONENTS:
+                    if c in {"all", "self"}:
+                        continue
+                    if c in parts or c.rstrip("s") in parts:
+                        comp = c
+                        break
+                if not comp:
+                    close = difflib.get_close_matches(norm, _CANONICAL_COMPONENTS, n=1, cutoff=0.6)
+                    comp = close[0] if close else "all"
             query_txt = str(arguments.get("query") or "").strip()
             refs = getattr(watcher, "runtime_refs", None) if watcher is not None else None
             refs = refs if isinstance(refs, dict) else {}
