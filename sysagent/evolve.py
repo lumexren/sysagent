@@ -1231,7 +1231,27 @@ class SelfEvolver:
             prompt_key = str(parsed["prompt_key"]).strip()
             new_template = str(parsed.get("new_template") or "")
             reason = str(parsed.get("reason") or "self-evolved from style/lessons feedback")
+            gate = registry.evaluate_prompt_candidate(
+                prompt_key,
+                new_template,
+                style_memories=style_memories,
+                lessons=lessons,
+            )
+            if not gate.get("passed"):
+                self.storage.add_brain_thought(
+                    "ignore",
+                    85,
+                    f"Prompt shadow gate rejected {prompt_key}: {gate.get('reason')} "
+                    f"({gate.get('candidate_score')} < {gate.get('active_score')})",
+                )
+                return {
+                    "status": "rejected_by_gate",
+                    "key": prompt_key,
+                    "reason": str(gate.get("reason") or "rejected"),
+                    "gate": gate,
+                }
             res = registry.update_prompt(prompt_key, new_template, reason=reason)
+            res["gate"] = gate
             if res.get("status") == "updated":
                 self.storage.add_lesson(
                     f"prompt_evolve:{prompt_key}",

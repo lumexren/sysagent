@@ -46,6 +46,7 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             patch("sysagent.local_mind.UNCERTAIN_FILE", ds / "uncertain_queries.jsonl"),
             patch("sysagent.local_mind.WEIGHTS_FILE", mods / "local_mind_weights.json"),
             patch("sysagent.local_mind.ROLE_ADAPTERS_FILE", mods / "role_adapters.json"),
+            patch("sysagent.local_mind.SEMANTIC_INDEX_FILE", mods / "semantic_index.json"),
             patch("sysagent.local_mind.LORA_TRAIN_FILE", ds / "lora_chatml.txt"),
             patch("sysagent.neural.NEURAL_NPZ_FILE", mods / "neural_engine.npz"),
             patch("sysagent.neural.NEURAL_META_FILE", mods / "neural_meta.json"),
@@ -58,6 +59,9 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
 
     @staticmethod
     def _reset_inference_state() -> None:
+        from sysagent import local_mind as lm_mod
+
+        lm_mod._EMBED_CACHE.clear()
         li_mod._LLAMA_SERVER_PROC = None
         li_mod._LLAMA_SERVER_MODEL = ""
         li_mod._LLAMA_SERVER_MMPROJ = ""
@@ -570,6 +574,185 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             self.assertEqual(res_peer["harvested_samples"], 1)
             self.assertEqual(res_peer["teachers_used"], ["local-peer"])
             peer_spy.assert_called_once()
+
+    def test_all_five_self_learning_and_resilience_upgrades(self) -> None:
+        from sysagent import local_mind as lm_mod
+        from sysagent.prompts import DEFAULT_PROMPTS, PromptRegistry
+        from sysagent.self_learn import run_local_self_play
+
+        with Storage(db_path=self.root / "five.db") as st:
+            lm = LocalMind(st)
+            fake_coder = self.mods / "OmniCoder-9B.Q4_K_M.gguf"
+            fake_coder.write_bytes(b"GGUF" + b"\x00" * 64)
+
+            # 1) Feature 1: Execution-Verified Local Self-Play (rewards working call, penalizes failing call)
+            sp_outputs = [
+                json.dumps(
+                    {
+                        "user": "kendi prompt durumunu kontrol et",
+                        "role": "reasoning",
+                        "tool": "inspect_self_component",
+                        "args": {"component": "prompts"},
+                        "reply": "Prompt durumları kontrol edildi.",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "user": "olmayan gizli dosyayı oku",
+                        "role": "general",
+                        "tool": "read_file",
+                        "args": {"path": str(self.root / "does_not_exist_12345.txt")},
+                        "reply": "Dosya okundu.",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+            with patch.object(LocalMind, "run_gguf_inference", side_effect=sp_outputs):
+                sp_res = run_local_self_play(st, max_rounds=2)
+            self.assertEqual(sp_res["status"], "ok")
+            self.assertEqual(sp_res["verified"], 1)
+            self.assertEqual(sp_res["generated"], 1)
+            self.assertEqual(sp_res["penalized"], 1)
+
+            # 2) Feature 2: Persistent Semantic Index & Hybrid RAG (dense vector + lesson retrieval)
+            lm = LocalMind(st)
+            lm.record_and_learn(
+                "gpu vram memory usage status",
+                [{"name": "inspect_self_component", "arguments": {"component": "local_mind"}}],
+                "VRAM usage is 4.3 GB / 12 GB.",
+                role="general",
+            )
+            lm.train()
+            st.add_lesson("vram_troubleshooting", "ekran kartı bellek taşması hatası", "unload_idle_servers ile VRAM boşalt.")
+            fake_emb = self.mods / "llama-nemotron-embed-1b-v2.Q4_K_M.gguf"
+            fake_emb.write_bytes(b"GGUF" + b"\x00" * 64)
+            fake_emb_json = json.dumps({"data": [{"embedding": [0.6, 0.8, 0.0, 0.0]}]})
+            with (
+                patch("sysagent.local_mind.shutil.which", return_value="/usr/bin/llama-embedding"),
+                patch(
+                    "sysagent.local_mind.subprocess.run",
+                    return_value=SimpleNamespace(returncode=0, stdout=fake_emb_json, stderr=""),
+                ),
+            ):
+                sync_res = lm.sync_semantic_index(max_new=4)
+                q_vec = lm.embed_text("ekran kartı vram durumu nedir")
+            self.assertGreaterEqual(sync_res["cached_vectors"], 1)
+            self.assertIsNotNone(q_vec)
+            self.assertTrue((self.mods / "semantic_index.json").is_file())
+            # Reload from disk after clearing in-memory cache
+            lm_mod._EMBED_CACHE.clear()
+            rag_hits = lm.retrieve_similar_examples("ekran kartı vram bellek taşması", top_k=3)
+            self.assertGreaterEqual(len(rag_hits), 1)
+
+            # 3) Feature 3: Tool-Error Self-Healing Loop in LocalMind & AgentManager.run_turn
+            lm.weights.setdefault("learned_arg_templates", {})["read_file"] = [
+                {"tokens": ["oku"], "args": {"path": "/nonexistent_bad_template_path"}}
+            ]
+            lm_mod._save_weights_file(lm.weights)
+
+            valid_target = self.root / "real_note.txt"
+            valid_target.write_text("self-healed content", encoding="utf-8")
+            watcher = SimpleNamespace(current_context="normal", _send_desktop_notification=MagicMock())
+            am = AgentManager(Settings(), watcher, st, PluginRegistry(), MagicMock(is_configured=True))
+            turn_steps = [
+                SimpleNamespace(
+                    id="h1",
+                    steps=[
+                        SimpleNamespace(
+                            type="function_call",
+                            id="c_bad",
+                            name="read_file",
+                            arguments={"path": "/nonexistent_bad_template_path"},
+                        )
+                    ],
+                    output_text="",
+                ),
+                SimpleNamespace(
+                    id="h2",
+                    steps=[
+                        SimpleNamespace(
+                            type="function_call",
+                            id="c_good",
+                            name="read_file",
+                            arguments={"path": str(valid_target)},
+                        )
+                    ],
+                    output_text="",
+                ),
+                SimpleNamespace(id="h3", steps=[], output_text="Not dosyası başarıyla okundu."),
+            ]
+            with (
+                patch.object(am, "_get_client", return_value=MagicMock()),
+                patch.object(am, "_match_zero_llm_fastpath", return_value=None),
+                patch.object(am, "_call_model_with_failover", side_effect=turn_steps),
+            ):
+                heal_out = asyncio.run(am.run_turn("s-heal", "real_note dosyasını oku"))
+            self.assertIn("başarıyla okundu", heal_out)
+            lm_after = LocalMind(st)
+            rf_templates = lm_after.weights.get("learned_arg_templates", {}).get("read_file", [])
+            self.assertFalse(any(t.get("args", {}).get("path") == "/nonexistent_bad_template_path" for t in rf_templates))
+            self.assertTrue(any(t.get("args", {}).get("path") == str(valid_target) for t in rf_templates))
+            lessons = st.list_lessons(limit=10)
+            self.assertTrue(any(str(l.get("context", "")).startswith("arg_repair:read_file->read_file") for l in lessons))
+
+            # 4) Feature 4: Step-Level Specialist Handoff in LocalMindClient
+            cli = LocalMindClient(st)
+            inter = cli.interactions
+            self.assertEqual(
+                inter._infer_step_specialist_role(
+                    "fix bug", [{"name": "edit_file", "result": '{"status": "ok"}'}], [], for_synthesis=False
+                ),
+                "coding",
+            )
+            self.assertEqual(
+                inter._infer_step_specialist_role(
+                    "check self", [{"name": "inspect_self_component", "result": '{"component": "brain"}'}], [], for_synthesis=True
+                ),
+                "reasoning",
+            )
+            self.assertEqual(
+                inter._infer_step_specialist_role(
+                    "read file", [{"name": "read_file", "result": '{"error": "File not found"}'}], [], for_synthesis=False
+                ),
+                "reasoning",
+            )
+            self.assertEqual(
+                inter._infer_step_specialist_role(
+                    "look", [{"name": "take_screenshot", "result": "{}"}], [{"mime_type": "image/png", "data": "abc"}], for_synthesis=False
+                ),
+                "multimodal",
+            )
+
+            # 5) Feature 5: Prompt Evolution A/B Shadow Eval Gate
+            reg = PromptRegistry(st)
+            st.set_memory("style:compact_units", "Always use compact numeric symbols like %74, 53°C, GB")
+            base_main = DEFAULT_PROMPTS["agent_main"]["template"]
+
+            # Identical template rejected
+            g_same = reg.evaluate_prompt_candidate("agent_main", base_main)
+            self.assertFalse(g_same["passed"])
+            self.assertEqual(g_same["reason"], "identical_to_active")
+
+            # Excessively shrunk template (> 40 chars so syntax valid, but < 55% of active length) rejected
+            g_shrunk = reg.update_prompt(
+                "agent_main",
+                "You are {agent_name}, a minimal Linux assistant that answers briefly.",
+                reason="shrunk",
+                enforce_shadow_gate=True,
+            )
+            self.assertEqual(g_shrunk["status"], "rejected_by_gate")
+            self.assertEqual(g_shrunk["reason"], "excessive_shrinkage")
+
+            # Candidate incorporating user style feedback passes A/B gate
+            improved_main = (
+                base_main
+                + "\n- Formatting preference: Always use compact numeric symbols like %74, 53°C, GB in telemetry."
+            )
+            g_good = reg.update_prompt(
+                "agent_main", improved_main, reason="incorporate compact_units style", enforce_shadow_gate=True
+            )
+            self.assertEqual(g_good["status"], "updated")
 
 
 if __name__ == "__main__":

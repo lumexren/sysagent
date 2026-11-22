@@ -504,6 +504,7 @@ class SelfMonitor:
         if sched.get("self_play_allowed") and self._cycle_count % 2 == 1:
             self_play = run_local_self_play(self.storage, max_rounds=1)
         local_stats = mind.train(run_lora=False)
+        semantic_sync = mind.sync_semantic_index(max_new=4)
         shadow = replay_shadow_history(self.storage)
         evaluate_graduation_arena(self.storage)
         predict_user_routine(self.storage)
@@ -572,6 +573,7 @@ class SelfMonitor:
             "pruned": pruned,
             "skill_questions": skill_questions,
             "local_mind": local_stats,
+            "semantic_index": semantic_sync,
             "self_guard": self_guard_res,
         }
 

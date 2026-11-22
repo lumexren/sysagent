@@ -214,6 +214,47 @@ class _LocalMindInteractions:
 
         return f"{name}:{_json.dumps(args or {}, sort_keys=True, ensure_ascii=False)}"
 
+    def _infer_step_specialist_role(
+        self,
+        user_query: str,
+        tool_items: list[Any],
+        extracted_images: list[dict[str, str]],
+        for_synthesis: bool = False,
+    ) -> str | None:
+        """Select the optimal specialist role for the current multi-step phase (tool continuation vs synthesis)."""
+        if extracted_images:
+            return "multimodal"
+        last_tools = {
+            str(it.get("name") or "")
+            for it in (tool_items or [])
+            if isinstance(it, dict) and it.get("name")
+        }
+        has_error = any(
+            '"error"' in str(it.get("result") or "").lower()
+            or '"exit_code": 1' in str(it.get("result") or "").lower()
+            for it in (tool_items or [])
+            if isinstance(it, dict)
+        )
+        coding_tools = {"edit_file", "write_file", "run_command", "forge_skill"}
+        if for_synthesis:
+            if last_tools & coding_tools:
+                return "coding"
+            if has_error or (last_tools & {"inspect_self_component"}):
+                return "reasoning"
+            return None
+        if has_error:
+            return "coding" if (last_tools & coding_tools) else "reasoning"
+        if last_tools & coding_tools:
+            return "coding"
+        if last_tools & {"inspect_self_component"}:
+            return "reasoning"
+        if last_tools & {"search_files", "read_file", "list_directory"}:
+            from .local_mind import classify_task_role
+
+            if classify_task_role(user_query, storage=self.mind.storage) == "coding":
+                return "coding"
+        return None
+
     def create(
         self,
         *,
@@ -282,7 +323,12 @@ class _LocalMindInteractions:
                     }
                 )
 
-            mm_role = "multimodal" if extracted_images else None
+            step_tool_role = self._infer_step_specialist_role(
+                orig_q, sanitized_input, extracted_images, for_synthesis=False
+            )
+            step_synth_role = self._infer_step_specialist_role(
+                orig_q, sanitized_input, extracted_images, for_synthesis=True
+            )
             prior_tmsgs = list(
                 self._turn_messages.get(prev_id) or ([{"role": "user", "content": orig_q}] if orig_q else [])
             )
@@ -295,7 +341,7 @@ class _LocalMindInteractions:
                     orig_q,
                     tools=selected_tools,
                     system_instruction=sys_inst,
-                    preferred_role=mm_role,
+                    preferred_role=step_tool_role,
                     history=prev_hist,
                     on_delta=on_delta,
                     images=extracted_images or None,
@@ -350,7 +396,7 @@ class _LocalMindInteractions:
                 reply = self.mind.stream_gguf_inference(
                     summary_prompt,
                     system_instruction=sys_inst,
-                    preferred_role=mm_role,
+                    preferred_role=step_synth_role,
                     history=prev_hist,
                     on_delta=on_delta,
                     images=extracted_images or None,
@@ -359,7 +405,7 @@ class _LocalMindInteractions:
                 reply = self.mind.run_gguf_inference(
                     summary_prompt,
                     system_instruction=sys_inst,
-                    preferred_role=mm_role,
+                    preferred_role=step_synth_role,
                     history=prev_hist,
                     images=extracted_images or None,
                 )

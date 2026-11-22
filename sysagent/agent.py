@@ -710,6 +710,7 @@ class AgentManager:
         batch_id = f"{session_id}:{uuid.uuid4().hex[:6]}"
         had_failure = False
         recorded_tool_calls: list[dict[str, Any]] = []
+        turn_failed_calls: list[dict[str, Any]] = []
 
         async def _emit(payload: dict[str, Any]) -> None:
             if emit:
@@ -962,6 +963,21 @@ class AgentManager:
                             and isinstance(parsed_res, dict)
                             and parsed_res.get("exit_code") not in (None, 0)
                         )
+                        if is_err or cmd_nonzero:
+                            recorded_tool_calls[-1]["failed"] = True
+                            turn_failed_calls.append(
+                                {
+                                    "name": call.name,
+                                    "arguments": dict(args or {}),
+                                    "error": str(result_payload)[:160],
+                                }
+                            )
+                            try:
+                                from .local_mind import LocalMind
+
+                                LocalMind(self.storage).prune_failed_arg_template(call.name, dict(args or {}))
+                            except Exception:
+                                pass
                         if is_err:
                             cb.record_failure(f"tool:{call.name}", str(result_payload)[:120])
                             had_failure = True
@@ -976,9 +992,26 @@ class AgentManager:
                                 pass
                         else:
                             cb.record_success(f"tool:{call.name}")
+                            if not cmd_nonzero and turn_failed_calls:
+                                prev_fail = turn_failed_calls.pop()
+                                try:
+                                    from .local_mind import LocalMind
+
+                                    LocalMind(self.storage).record_arg_repair(
+                                        user_message,
+                                        str(prev_fail.get("name") or ""),
+                                        dict(prev_fail.get("arguments") or {}),
+                                        str(prev_fail.get("error") or ""),
+                                        call.name,
+                                        dict(args or {}),
+                                    )
+                                except Exception:
+                                    pass
+                                if not turn_failed_calls:
+                                    had_failure = False
                             if len(recorded_tool_calls) >= 2:
                                 prev_tc = recorded_tool_calls[-2].get("name")
-                                if prev_tc and prev_tc != call.name:
+                                if prev_tc and prev_tc != call.name and not recorded_tool_calls[-2].get("failed"):
                                     try:
                                         from .neural import NeuralEngine
 
@@ -1249,8 +1282,13 @@ class AgentManager:
                         if not text.startswith("[Local Offline Mode]"):
                             from .local_mind import LocalMind
 
+                            clean_tool_calls = [
+                                {"name": tc["name"], "arguments": tc.get("arguments", {})}
+                                for tc in recorded_tool_calls
+                                if not tc.get("failed")
+                            ]
                             LocalMind(self.storage).record_and_learn(
-                                user_message, recorded_tool_calls, text
+                                user_message, clean_tool_calls, text
                             )
                             _FAST_PATH_READONLY = {
                                 "system_status", "list_processes", "list_systemd_units", "list_directory",
@@ -1258,16 +1296,16 @@ class AgentManager:
                                 "list_audit_log", "get_app_usage", "read_journal",
                             }
                             if (
-                                len(recorded_tool_calls) == 1
-                                and recorded_tool_calls[0].get("name") in _FAST_PATH_READONLY
+                                len(clean_tool_calls) == 1
+                                and clean_tool_calls[0].get("name") in _FAST_PATH_READONLY
                             ):
                                 try:
                                     from .neural import NeuralEngine
 
                                     NeuralEngine(self.storage).record_safe_plan(
                                         user_message,
-                                        str(recorded_tool_calls[0]["name"]),
-                                        dict(recorded_tool_calls[0].get("arguments") or {}),
+                                        str(clean_tool_calls[0]["name"]),
+                                        dict(clean_tool_calls[0].get("arguments") or {}),
                                     )
                                 except Exception:
                                     pass

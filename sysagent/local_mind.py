@@ -26,6 +26,7 @@ DISTILLED_FILE = DATASET_DIR / "distilled_turns.jsonl"
 UNCERTAIN_FILE = DATASET_DIR / "uncertain_queries.jsonl"
 WEIGHTS_FILE = MODELS_DIR / "local_mind_weights.json"
 ROLE_ADAPTERS_FILE = MODELS_DIR / "role_adapters.json"
+SEMANTIC_INDEX_FILE = MODELS_DIR / "semantic_index.json"
 LORA_TRAIN_FILE = DATASET_DIR / "lora_chatml.txt"
 
 SPECIALIST_ROLES: tuple[str, ...] = (
@@ -375,6 +376,33 @@ from .local_inference import (
 )
 
 _EMBED_CACHE: dict[str, list[float]] = {}
+
+
+def _load_embed_cache() -> dict[str, list[float]]:
+    """Lazily populate `_EMBED_CACHE` from persistent `SEMANTIC_INDEX_FILE` on disk."""
+    if _EMBED_CACHE or not SEMANTIC_INDEX_FILE.is_file():
+        return _EMBED_CACHE
+    try:
+        raw = json.loads(SEMANTIC_INDEX_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            for k, v in list(raw.items())[-384:]:
+                if isinstance(k, str) and isinstance(v, list) and v:
+                    _EMBED_CACHE[k] = [float(x) for x in v]
+    except Exception:
+        pass
+    return _EMBED_CACHE
+
+
+def _save_embed_cache() -> None:
+    """Persist `_EMBED_CACHE` atomically to `SEMANTIC_INDEX_FILE`."""
+    try:
+        SEMANTIC_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        items = dict(list(_EMBED_CACHE.items())[-384:])
+        tmp = SEMANTIC_INDEX_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, SEMANTIC_INDEX_FILE)
+    except Exception:
+        pass
 
 
 def _dense_cosine(vec_a: list[float], vec_b: list[float]) -> float:
@@ -773,6 +801,75 @@ class LocalMind:
             NeuralEngine(self.storage).online_step(user_text, wrong_tool, reward=-1.0)
         except Exception:
             pass
+
+    def prune_failed_arg_template(self, tool_name: str, bad_args: dict[str, Any]) -> int:
+        """Remove a failing argument template for `tool_name` from learned_arg_templates."""
+        if not tool_name or not isinstance(bad_args, dict) or not bad_args:
+            return 0
+        templates_map = self.weights.get("learned_arg_templates")
+        if not isinstance(templates_map, dict):
+            return 0
+        bucket = templates_map.get(tool_name)
+        if not isinstance(bucket, list) or not bucket:
+            return 0
+        kept = [item for item in bucket if not (isinstance(item, dict) and item.get("args") == bad_args)]
+        removed = len(bucket) - len(kept)
+        if removed > 0:
+            templates_map[tool_name] = kept
+            self.weights["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                _save_weights_file(self.weights)
+            except Exception:
+                pass
+        return removed
+
+    def record_arg_repair(
+        self,
+        user_text: str,
+        failed_tool: str,
+        failed_args: dict[str, Any],
+        error_snippet: str,
+        working_tool: str,
+        working_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Learn from an in-turn tool error recovery by pruning bad args, saving good args, and logging a lesson."""
+        pruned = self.prune_failed_arg_template(failed_tool, failed_args)
+        toks = _tokenize(user_text)[:16]
+        if working_tool and isinstance(working_args, dict) and working_args:
+            templates_map = self.weights.setdefault("learned_arg_templates", {})
+            bucket: list[dict[str, Any]] = templates_map.setdefault(working_tool, [])
+            bucket[:] = [it for it in bucket if not (isinstance(it, dict) and it.get("args") == working_args)]
+            bucket.append({"tokens": toks, "args": dict(working_args)})
+            if len(bucket) > 10:
+                del bucket[:-10]
+            self.weights["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                _save_weights_file(self.weights)
+            except Exception:
+                pass
+        if failed_tool and working_tool and failed_tool != working_tool:
+            self.penalize_tool(user_text, failed_tool)
+        try:
+            from .neural import NeuralEngine
+
+            NeuralEngine(self.storage).online_step(user_text, working_tool, reward=1.3)
+        except Exception:
+            pass
+        if self.storage is not None and failed_tool and working_tool:
+            try:
+                self.storage.add_lesson(
+                    f"arg_repair:{failed_tool}->{working_tool}",
+                    f"Failed {failed_tool}({json.dumps(failed_args or {}, ensure_ascii=False)[:100]}): {(error_snippet or '')[:80]}",
+                    f"Use {working_tool} with {json.dumps(working_args or {}, ensure_ascii=False)[:120]}",
+                )
+            except Exception:
+                pass
+        return {
+            "repaired": True,
+            "from_tool": failed_tool,
+            "to_tool": working_tool,
+            "pruned_templates": pruned,
+        }
 
     def train(self, run_lora: bool = False) -> dict[str, Any]:
         """Full training pass over seed curriculum + distilled JSONL + SQLite chat history, rules, and lessons."""
@@ -2081,6 +2178,7 @@ class LocalMind:
         clean = (text or "").strip()
         if not clean:
             return None
+        _load_embed_cache()
         cache_key = clean[:300]
         if cache_key in _EMBED_CACHE:
             return _EMBED_CACHE[cache_key]
@@ -2102,13 +2200,56 @@ class LocalMind:
                     data = parsed.get("data") or []
                     if data and isinstance(data[0], dict) and isinstance(data[0].get("embedding"), list):
                         vec = [float(x) for x in data[0]["embedding"]]
-                        if len(_EMBED_CACHE) >= 256:
+                        if len(_EMBED_CACHE) >= 384:
                             _EMBED_CACHE.pop(next(iter(_EMBED_CACHE)), None)
                         _EMBED_CACHE[cache_key] = vec
+                        _save_embed_cache()
                         return vec
         except Exception:
             pass
         return None
+
+    def sync_semantic_index(self, max_new: int = 6) -> dict[str, Any]:
+        """Incrementally index QA memory, lessons, and checkpoints into persistent `SEMANTIC_INDEX_FILE`."""
+        _load_embed_cache()
+        candidates: list[str] = []
+        for item in (self.weights.get("qa_memory") or [])[-60:]:
+            u_txt = str(item.get("user") or "").strip()[:300]
+            if len(u_txt) >= 6 and u_txt not in candidates:
+                candidates.append(u_txt)
+        if self.storage is not None:
+            try:
+                for les in self.storage.list_lessons(limit=20):
+                    ctx = str(les.get("context") or "")
+                    if ctx.startswith("_internal:"):
+                        continue
+                    l_txt = f"{ctx} {les.get('insight', '')}".strip()[:300]
+                    if len(l_txt) >= 6 and l_txt not in candidates:
+                        candidates.append(l_txt)
+            except Exception:
+                pass
+            try:
+                for cp in self.storage.list_session_checkpoints(limit=15):
+                    c_txt = f"{cp.get('topic', '')} {cp.get('summary', '')}".strip()[:300]
+                    if len(c_txt) >= 6 and c_txt not in candidates:
+                        candidates.append(c_txt)
+            except Exception:
+                pass
+
+        newly_embedded = 0
+        if find_gguf_model("embedding") and shutil.which("llama-embedding"):
+            for txt in candidates:
+                if newly_embedded >= max_new:
+                    break
+                if txt not in _EMBED_CACHE and self.embed_text(txt) is not None:
+                    newly_embedded += 1
+        if _EMBED_CACHE:
+            _save_embed_cache()
+        return {
+            "cached_vectors": len(_EMBED_CACHE),
+            "newly_embedded": newly_embedded,
+            "candidates": len(candidates),
+        }
 
     def semantic_similarity(
         self, text_a: str, text_b: str, use_gpu_embed: bool = False
@@ -2118,6 +2259,7 @@ class LocalMind:
         toks_b = _tokenize(text_b)
         if not toks_a or not toks_b:
             return 0.0
+        _load_embed_cache()
         idf: dict[str, float] = self.weights.get("idf", {})
         va = {t: cnt * idf.get(t, 1.0) for t, cnt in Counter(toks_a).items()}
         vb = {t: cnt * idf.get(t, 1.0) for t, cnt in Counter(toks_b).items()}
@@ -2133,29 +2275,85 @@ class LocalMind:
     def retrieve_similar_examples(
         self, query: str, top_k: int = 3, preferred_role: str | None = None
     ) -> list[dict[str, Any]]:
-        """Retrieve top-K most similar past teacher turns for Role-Aware Few-Shot RAG."""
+        """Retrieve top-K most similar past teacher turns & lessons using TF-IDF + persistent dense & Neural vectors."""
         q_toks = _tokenize(query)
         if not q_toks:
             return []
+        _load_embed_cache()
         target_role = preferred_role or classify_task_role(query)
-        q_dense = _EMBED_CACHE.get(query.strip()[:300])
+        q_key = query.strip()[:300]
+        q_dense = _EMBED_CACHE.get(q_key)
+        q_neural: list[float] | None = None
+        eng: Any = None
+        try:
+            from .neural import TEXT_DIM, NeuralEngine
+
+            eng = NeuralEngine(self.storage)
+            q_neural = [float(x) for x in eng.encode_features(query)[:TEXT_DIM]]
+        except Exception:
+            q_neural = None
+
         idf: dict[str, float] = self.weights.get("idf", {})
         q_vec = {t: cnt * idf.get(t, 1.0) for t, cnt in Counter(q_toks).items()}
         scored: list[tuple[float, dict[str, Any]]] = []
         for item in self.weights.get("qa_memory", []):
-            u_str = item.get("user", "")
+            u_str = str(item.get("user") or "")
+            if not u_str:
+                continue
             u_vec = {
                 t: cnt * idf.get(t, 1.0)
                 for t, cnt in Counter(_tokenize(u_str)).items()
             }
             sim = _cosine_sim(q_vec, u_vec)
-            u_dense = _EMBED_CACHE.get(u_str.strip()[:300]) if q_dense else None
+            u_dense = _EMBED_CACHE.get(u_str.strip()[:300])
             if q_dense and u_dense:
-                sim = 0.5 * _dense_cosine(q_dense, u_dense) + 0.5 * sim
+                sim = max(sim, 0.6 * _dense_cosine(q_dense, u_dense) + 0.4 * sim)
+            elif q_neural is not None and eng is not None:
+                try:
+                    u_neural = [float(x) for x in eng.encode_features(u_str)[: len(q_neural)]]
+                    sim = max(sim, 0.55 * _dense_cosine(q_neural, u_neural) + 0.45 * sim)
+                except Exception:
+                    pass
             if item.get("role") == target_role and sim > 0.05:
                 sim += 0.08
             if sim > 0.1:
                 scored.append((sim, item))
+
+        if self.storage is not None:
+            try:
+                for les in self.storage.list_lessons(limit=20):
+                    ctx = str(les.get("context") or "")
+                    if ctx.startswith("_internal:"):
+                        continue
+                    ins = str(les.get("insight") or "").strip()
+                    res = str(les.get("resolution") or "").strip()
+                    if not ins or not res:
+                        continue
+                    l_text = f"{ctx} {ins}".strip()
+                    l_vec = {
+                        t: cnt * idf.get(t, 1.0)
+                        for t, cnt in Counter(_tokenize(l_text)).items()
+                    }
+                    l_sim = _cosine_sim(q_vec, l_vec)
+                    l_dense = _EMBED_CACHE.get(l_text[:300])
+                    if q_dense and l_dense:
+                        l_sim = max(l_sim, 0.6 * _dense_cosine(q_dense, l_dense) + 0.4 * l_sim)
+                    if l_sim > 0.18:
+                        scored.append(
+                            (
+                                l_sim,
+                                {
+                                    "role": target_role,
+                                    "user": ins[:240],
+                                    "tool_calls": [],
+                                    "reply": res[:400],
+                                    "source": "lesson",
+                                },
+                            )
+                        )
+            except Exception:
+                pass
+
         scored.sort(key=lambda x: x[0], reverse=True)
         return [it for _, it in scored[:top_k]]
 
@@ -2647,13 +2845,14 @@ class LocalMind:
         elif preferred_role:
             specialist = (
                 find_gguf_model(preferred_role, strict=True)
+                or find_gguf_model(preferred_role)
                 or find_gguf_model("general", strict=True)
                 or models[0]
             )
             mmproj = find_mmproj_for_model(specialist) if classify_gguf_role(specialist) == "multimodal" else None
         else:
             role_guess = classify_task_role(prompt, storage=self.storage)
-            if role_guess in {"coding", "multimodal"}:
+            if role_guess in {"coding", "reasoning", "multimodal"}:
                 specialist = (
                     find_gguf_model(role_guess, strict=True)
                     or find_gguf_model("general", strict=True)

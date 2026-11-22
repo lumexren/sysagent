@@ -39,10 +39,16 @@ _RUNTIME_TUNING_KEY = "_internal:runtime_tuning"
 _SAFE_SELF_PLAY_TOOLS = frozenset(
     {
         "system_status",
+        "inspect_self_component",
         "list_directory",
+        "read_file",
         "read_journal_logs",
+        "list_systemd_units",
         "search_files",
         "recall_memories",
+        "search_memory_and_history",
+        "kg_query",
+        "read_clipboard",
         "list_events",
         "get_app_usage",
         "list_automations",
@@ -825,81 +831,157 @@ def compute_adaptive_schedule(watcher: Any, storage: Storage) -> dict[str, Any]:
 
 
 def run_local_self_play(storage: Storage, max_rounds: int = 1) -> dict[str, Any]:
-    """Zero-cloud offline training round where local specialists generate and execute-verify a safe sample."""
+    """Zero-cloud offline training gym where local specialists generate and execute-verify safe tool calls."""
     try:
+        from .config import get_settings
         from .local_mind import LocalMind, find_gguf_model
+        from .neural import NeuralEngine
+        from .tools import execute_tool
+        from .watcher import SystemWatcher
 
         mind = LocalMind(storage)
         if not (find_gguf_model("reasoning", strict=True) or find_gguf_model("coding")):
-            return {"status": "skipped", "generated": 0, "verified": 0}
+            return {"status": "skipped", "generated": 0, "verified": 0, "penalized": 0}
         focus = mind.weakest_specialist_role()
         prof = discover_system_profile(storage, seed=False).get("summary", "Linux")
-        user_examples = mind.sample_user_utterances(limit=4)
+        schema_map = mind._build_tool_schema_map()
+        curr = mind.build_distillation_curriculum(tool_limit=10)
+        safe_weak = [t for t in curr["underrepresented_tools"] if t in _SAFE_SELF_PLAY_TOOLS][:5]
+        if not safe_weak:
+            safe_weak = sorted(_SAFE_SELF_PLAY_TOOLS)[:5]
+        tool_sigs = mind._format_tool_signatures(schema_map, safe_weak)
+        user_examples = curr["user_examples"][:4]
         lang_ctx = (
             f"Recent user language examples: {json.dumps(user_examples, ensure_ascii=False)}\n"
             if user_examples
             else ""
         )
+        seen_queries: set[str] = {
+            " ".join(str(e.get("user") or "").lower().split())
+            for e in mind._load_distilled_entries(limit=600)
+            if e.get("user")
+        }
+        watcher = SystemWatcher(get_settings(), storage=storage)
         generated = 0
         verified = 0
+        penalized = 0
         for _ in range(max(1, max_rounds)):
             prompt = (
                 f"System environment: {prof}\nFocus specialist role: {focus}\n"
+                f"Safe read-only tool schemas: {json.dumps(tool_sigs, ensure_ascii=False)}\n"
                 f"{lang_ctx}"
                 "Generate ONE realistic user query (matching the language style of recent user examples) "
-                "and its safe read-only Linux assistant answer as valid JSON:\n"
-                '{"user": "...", "tool": "system_status|list_directory|read_journal_logs|search_files|recall_memories", "args": {}, "reply": "..."}'
+                "and its safe read-only Linux assistant tool call(s) + reply as valid JSON:\n"
+                '{"user": "...", "role": "'
+                + focus
+                + '", "tool": "tool_name", "args": {}, '
+                '"tool_calls": [{"name": "tool_name", "arguments": {}}], "reply": "..."}'
             )
             raw = mind.run_gguf_inference(
-                prompt, "Respond ONLY with valid JSON for local training.", preferred_role="reasoning"
+                prompt,
+                "Respond ONLY with valid JSON for local training.",
+                preferred_role="reasoning",
+                extra_system="Respond ONLY with valid JSON matching the requested schema.",
+                max_tokens=360,
+                prefer_warm=True,
             )
             if not raw:
                 continue
             idx = raw.find("{")
             if idx == -1:
                 continue
-            parsed, _ = json.JSONDecoder().raw_decode(raw[idx:])
-            if isinstance(parsed, dict) and parsed.get("user") and parsed.get("reply"):
-                tname = str(parsed.get("tool") or "").strip()
-                targs = dict(parsed.get("args") or {})
-                if tname:
-                    if tname not in _SAFE_SELF_PLAY_TOOLS:
-                        continue
-                    try:
-                        from .config import get_settings
-                        from .tools import execute_tool
-                        from .watcher import SystemWatcher
+            try:
+                parsed, _ = json.JSONDecoder().raw_decode(raw[idx:])
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
 
-                        watcher = SystemWatcher(get_settings(), storage=storage)
-                        raw_out = execute_tool(tname, targs, watcher=watcher, storage=storage)
-                        out_str = raw_out if isinstance(raw_out, str) else json.dumps(raw_out, ensure_ascii=False)
-                        if not out_str or out_str.startswith(("Error", "Tool error")):
-                            continue
+            raw_user = str(parsed.get("user") or "").strip()
+            raw_tool = str(parsed.get("tool") or "").strip()
+            raw_args = parsed.get("args") if isinstance(parsed.get("args"), dict) else {}
+            validated = mind._validate_distilled_sample(parsed, schema_map, seen_queries)
+            if validated is None:
+                if raw_user and raw_tool in _SAFE_SELF_PLAY_TOOLS:
+                    mind.penalize_tool(raw_user, raw_tool)
+                    mind.prune_failed_arg_template(raw_tool, dict(raw_args))
+                    try:
+                        NeuralEngine(storage).online_step(raw_user, raw_tool, reward=-1.0)
+                    except Exception:
+                        pass
+                    penalized += 1
+                continue
+
+            tcalls = validated["tool_calls"]
+            if tcalls and any(tc["name"] not in _SAFE_SELF_PLAY_TOOLS for tc in tcalls):
+                continue
+
+            exec_ok = True
+            for tc in tcalls:
+                tname = tc["name"]
+                targs = dict(tc.get("arguments") or {})
+                try:
+                    raw_out = execute_tool(tname, targs, watcher=watcher, storage=storage)
+                    out_str = raw_out if isinstance(raw_out, str) else json.dumps(raw_out, ensure_ascii=False)
+                    has_err = (not out_str) or out_str.startswith(("Error", "Tool error"))
+                    if not has_err and out_str.lstrip().startswith("{"):
                         try:
                             out_obj = json.loads(out_str)
                             if isinstance(out_obj, dict) and out_obj.get("error"):
-                                continue
+                                has_err = True
                         except Exception:
                             pass
-                        verified += 1
-                    except Exception:
-                        continue
-                tcalls = [{"name": tname, "arguments": targs}] if tname else []
-                mind.record_and_learn(str(parsed["user"]), tcalls, str(parsed["reply"]))
-                if tname:
-                    try:
-                        from .neural import NeuralEngine
+                    if has_err:
+                        exec_ok = False
+                        mind.penalize_tool(validated["user"], tname)
+                        mind.prune_failed_arg_template(tname, targs)
+                        try:
+                            NeuralEngine(storage).online_step(validated["user"], tname, reward=-1.0)
+                        except Exception:
+                            pass
+                        penalized += 1
+                        break
+                except Exception:
+                    exec_ok = False
+                    mind.penalize_tool(validated["user"], tname)
+                    mind.prune_failed_arg_template(tname, targs)
+                    penalized += 1
+                    break
 
-                        NeuralEngine(storage).online_step(str(parsed["user"]), tname, reward=1.2)
-                    except Exception:
-                        pass
-                generated += 1
+            if not exec_ok:
+                continue
+
+            if tcalls:
+                verified += 1
+            mind.record_and_learn(validated["user"], tcalls, validated["reply"], role=validated["role"])
+            if tcalls:
+                try:
+                    eng = NeuralEngine(storage)
+                    eng.online_step(validated["user"], tcalls[0]["name"], reward=1.2)
+                    if len(tcalls) == 1:
+                        eng.record_safe_plan(
+                            validated["user"],
+                            tcalls[0]["name"],
+                            dict(tcalls[0].get("arguments") or {}),
+                        )
+                    elif len(tcalls) >= 2:
+                        storage.record_workflow(validated["user"][:140], tcalls)
+                except Exception:
+                    pass
+            generated += 1
         if generated:
             prev = int(_load_json_memory(storage, _SELF_PLAY_KEY, 0))
             _save_json_memory(storage, _SELF_PLAY_KEY, prev + generated)
-        return {"status": "ok" if generated else "skipped", "generated": generated, "verified": verified, "role": focus}
+        return {
+            "status": "ok" if (generated or penalized) else "skipped",
+            "generated": generated,
+            "verified": verified,
+            "penalized": penalized,
+            "role": focus,
+            "target_tools": safe_weak,
+        }
     except Exception:
-        return {"status": "error", "generated": 0, "verified": 0}
+        return {"status": "error", "generated": 0, "verified": 0, "penalized": 0}
 
 
 def shadow_stats(storage: Storage) -> dict[str, Any]:

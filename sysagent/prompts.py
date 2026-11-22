@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .storage import Storage
@@ -175,14 +176,118 @@ class PromptRegistry:
         except Exception:
             return str(DEFAULT_PROMPTS[key]["template"]).format(**kwargs)
 
+    def evaluate_prompt_candidate(
+        self,
+        key: str,
+        candidate_template: str,
+        style_memories: list[dict[str, Any]] | None = None,
+        lessons: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Run an A/B shadow benchmark comparing `candidate_template` against the currently active prompt."""
+        ok, err = validate_prompt_template(key, candidate_template)
+        if not ok:
+            return {
+                "passed": False,
+                "reason": f"invalid_template:{err}",
+                "active_score": 1.0,
+                "candidate_score": 0.0,
+            }
+        active_template = self.get_template(key)
+        cand_clean = (candidate_template or "").strip()
+        act_clean = (active_template or "").strip()
+        if cand_clean == act_clean:
+            return {
+                "passed": False,
+                "reason": "identical_to_active",
+                "active_score": 1.0,
+                "candidate_score": 1.0,
+            }
+        if act_clean and len(cand_clean) < int(len(act_clean) * 0.55):
+            return {
+                "passed": False,
+                "reason": "excessive_shrinkage",
+                "active_score": 1.0,
+                "candidate_score": round(len(cand_clean) / max(1, len(act_clean)), 4),
+            }
+
+        eff_styles = style_memories
+        eff_lessons = lessons
+        if self.storage is not None:
+            if eff_styles is None:
+                try:
+                    eff_styles = [
+                        {"key": m["key"], "value": m["value"]}
+                        for m in self.storage.list_memories()
+                        if str(m.get("key", "")).startswith("style:")
+                    ]
+                except Exception:
+                    eff_styles = []
+            if eff_lessons is None:
+                try:
+                    eff_lessons = [
+                        {"resolution": l.get("resolution", "")}
+                        for l in self.storage.list_lessons(limit=12)
+                        if not str(l.get("context", "")).startswith("_internal:")
+                    ]
+                except Exception:
+                    eff_lessons = []
+
+        feedback_blob = " ".join(
+            [str(s.get("value") or "") for s in (eff_styles or []) if isinstance(s, dict)]
+            + [str(l.get("resolution") or "") for l in (eff_lessons or []) if isinstance(l, dict)]
+        ).lower()
+        feedback_tokens = set(re.findall(r"\w{4,}", feedback_blob))
+
+        def _score_template(tmpl: str) -> float:
+            low = tmpl.lower()
+            score = 0.60
+            if key == "agent_main":
+                if "tool" in low or "inspect_self_component" in low:
+                    score += 0.20
+            else:
+                if "json" in low or "{" in tmpl:
+                    score += 0.20
+            if feedback_tokens:
+                tmpl_tokens = set(re.findall(r"\w{4,}", low))
+                overlap = len(feedback_tokens & tmpl_tokens) / max(1, len(feedback_tokens))
+                score += 0.20 * overlap
+            else:
+                score += 0.15
+            if len(tmpl) > 4500:
+                score -= min(0.25, (len(tmpl) - 4500) / 4000.0)
+            return max(0.0, min(1.0, score))
+
+        act_score = round(_score_template(act_clean), 4)
+        cand_score = round(_score_template(cand_clean), 4)
+        passed = cand_score >= act_score
+        return {
+            "passed": passed,
+            "reason": "passed_ab_gate" if passed else "lower_ab_score",
+            "active_score": act_score,
+            "candidate_score": cand_score,
+        }
+
     def update_prompt(
-        self, key: str, new_template: str, reason: str = "manual"
+        self,
+        key: str,
+        new_template: str,
+        reason: str = "manual",
+        enforce_shadow_gate: bool = False,
     ) -> dict[str, Any]:
         if self.storage is None:
             raise RuntimeError("Storage is required to persist prompt updates.")
         ok, err = validate_prompt_template(key, new_template)
         if not ok:
             return {"status": "invalid", "key": key, "error": err}
+        if enforce_shadow_gate:
+            gate = self.evaluate_prompt_candidate(key, new_template)
+            if not gate.get("passed"):
+                return {
+                    "status": "rejected_by_gate",
+                    "key": key,
+                    "reason": str(gate.get("reason") or "rejected"),
+                    "gate": gate,
+                }
         ver = self.storage.save_prompt_version(key, new_template.strip(), reason)
         return {"status": "updated", "key": key, "version": ver}
 
