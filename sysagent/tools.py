@@ -760,12 +760,19 @@ def execute_tool(
                 }
 
             if comp in {"codebase", "all"}:
+                from .evolve_ast import analyze_symbol_blast_radius
                 from .self_ops import get_live_codebase_summary
 
-                out["codebase"] = {
+                cb_info: dict[str, Any] = {
                     "summary": get_live_codebase_summary(),
                     "package_dir": str(Path(__file__).resolve().parent),
                 }
+                if query_txt and comp == "codebase":
+                    try:
+                        cb_info["blast_radius"] = analyze_symbol_blast_radius(query_txt, storage=storage)
+                    except Exception:
+                        pass
+                out["codebase"] = cb_info
 
             if comp in {"brain", "all"}:
                 thoughts = storage.list_brain_thoughts(limit=6)
@@ -824,6 +831,12 @@ def execute_tool(
                 }
                 if comp == "cortex" and habits:
                     cortex_info["habits"] = habits[:3]
+                try:
+                    from .self_learn import analyze_causal_digital_twin
+
+                    cortex_info["digital_twin"] = analyze_causal_digital_twin(storage, watcher)
+                except Exception:
+                    pass
                 out["cortex"] = cortex_info
 
             if comp in {"neural", "all"}:

@@ -21,7 +21,13 @@ from .plugins import PluginRegistry
 from .prompts import DEFAULT_PROMPTS, PromptRegistry
 from .safety import SAFE_TOOLS, assess_tool_call, compute_dry_run_preview, is_auto_trust_allowed
 from .self_ops import ToolCache, choose_model, detect_style_feedback, scrub_secrets, select_relevant_tools
-from .self_resilience import ContextBudgeter, build_recovery_hint, get_circuit_breaker, get_quota_governor
+from .self_resilience import (
+    ContextBudgeter,
+    build_recovery_hint,
+    get_circuit_breaker,
+    get_quota_governor,
+    verify_written_file,
+)
 from .storage import Storage
 from .tools import TOOL_DECLARATIONS, execute_tool, get_all_tool_declarations
 from .watcher import SystemWatcher
@@ -269,6 +275,84 @@ class AgentManager:
         except Exception:
             pass
         return verdict
+
+    def verify_and_transactional_rollback(
+        self,
+        recorded_tool_calls: list[dict[str, Any]],
+        batch_id: str,
+        user_message: str = "",
+    ) -> dict[str, Any]:
+        """Verify mutated files in the current turn and auto-rollback broken edits to their pre-turn checkpoint."""
+        checked: set[str] = set()
+        for tc in reversed(recorded_tool_calls):
+            if tc.get("failed") or tc.get("rolled_back"):
+                continue
+            tname = str(tc.get("name") or "")
+            if tname not in {"write_file", "edit_file"}:
+                continue
+            fp_str = str((tc.get("arguments") or {}).get("path") or "").strip()
+            if not fp_str or fp_str in checked:
+                continue
+            checked.add(fp_str)
+            fp = Path(fp_str).expanduser()
+            if not fp.is_file():
+                continue
+            ver = verify_written_file(fp)
+            if ver.get("ok", True):
+                continue
+
+            err_msg = str(ver.get("error") or "verification_failed")
+            restored = False
+            try:
+                resolved_fp = str(fp.resolve())
+            except Exception:
+                resolved_fp = str(fp)
+            try:
+                batch_items = self.storage.get_undoable_batch(batch_id)
+                matching = [
+                    it
+                    for it in batch_items
+                    if str(it.get("target_path")) in {str(fp), resolved_fp}
+                ]
+                for item in matching:
+                    target = Path(str(item["target_path"]))
+                    if item.get("existed"):
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(item.get("backup_content") or "", encoding="utf-8")
+                    elif target.exists():
+                        target.unlink()
+                    self.storage.mark_undone(int(item["id"]))
+                    restored = True
+            except Exception:
+                pass
+
+            tc["failed"] = True
+            tc["rolled_back"] = True
+            try:
+                self.storage.add_lesson(
+                    f"tx_rollback:{fp.name}",
+                    f"Broken {tname} on {fp.name}: {err_msg[:120]}",
+                    "Transactional rollback restored clean state; verify syntax before saving.",
+                )
+            except Exception:
+                pass
+            if user_message:
+                try:
+                    from .local_mind import LocalMind
+
+                    LocalMind(self.storage).prune_failed_arg_template(
+                        tname, dict(tc.get("arguments") or {})
+                    )
+                except Exception:
+                    pass
+            return {
+                "rolled_back": True,
+                "restored": restored,
+                "file": fp.name,
+                "path": str(fp),
+                "error": err_msg,
+            }
+        return {"rolled_back": False}
 
     def _get_client(self) -> genai.Client:
         return self.auth.get_client()
@@ -1210,19 +1294,13 @@ class AgentManager:
                         pass
                     broken_py_err = ""
                     if has_mutated and nudge_count < 3:
-                        from pathlib import Path as _Path
-
-                        for tc in reversed(recorded_tool_calls):
-                            if tc.get("name") in {"write_file", "edit_file"}:
-                                fp_str = str((tc.get("arguments") or {}).get("path") or "")
-                                if fp_str.endswith(".py"):
-                                    fp = _Path(fp_str).expanduser()
-                                    if fp.is_file():
-                                        try:
-                                            compile(fp.read_text(encoding="utf-8", errors="replace"), str(fp), "exec")
-                                        except SyntaxError as exc:
-                                            broken_py_err = f"{fp.name}: {exc}"
-                                            break
+                        tx_res = self.verify_and_transactional_rollback(
+                            recorded_tool_calls, batch_id, user_message=user_message
+                        )
+                        if tx_res.get("rolled_back"):
+                            broken_py_err = (
+                                f"{tx_res['file']} (auto-rolled back to clean state): {tx_res['error']}"
+                            )
                     base_nudge = (
                         leaked_tool_json
                         or read_only_stalled
@@ -1252,8 +1330,9 @@ class AgentManager:
                             )
                         elif broken_py_err:
                             nudge_msg = (
-                                f"[System]: SyntaxError detected in modified file ({broken_py_err}). "
-                                "Fix this syntax error right now before finishing."
+                                f"[System]: Transactional verification failed ({broken_py_err}). "
+                                "The broken edit was rolled back to its clean pre-turn checkpoint. "
+                                "Apply a valid alternative implementation (Branch B) right now before finishing."
                             )
                         else:
                             nudge_msg = (

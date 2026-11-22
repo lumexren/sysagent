@@ -24,6 +24,7 @@ DATASET_DIR = DATA_DIR / "dataset"
 MODELS_DIR = DATA_DIR / "models"
 DISTILLED_FILE = DATASET_DIR / "distilled_turns.jsonl"
 UNCERTAIN_FILE = DATASET_DIR / "uncertain_queries.jsonl"
+PREFERENCE_FILE = DATASET_DIR / "preference_pairs.jsonl"
 WEIGHTS_FILE = MODELS_DIR / "local_mind_weights.json"
 ROLE_ADAPTERS_FILE = MODELS_DIR / "role_adapters.json"
 SEMANTIC_INDEX_FILE = MODELS_DIR / "semantic_index.json"
@@ -864,11 +865,203 @@ class LocalMind:
                 )
             except Exception:
                 pass
+        if failed_tool and working_tool:
+            self.record_preference_pair(
+                user_text,
+                chosen_tool=working_tool,
+                chosen_args=dict(working_args or {}),
+                rejected_tool=failed_tool,
+                rejected_args=dict(failed_args or {}),
+                reason=error_snippet[:120],
+            )
         return {
             "repaired": True,
             "from_tool": failed_tool,
             "to_tool": working_tool,
             "pruned_templates": pruned,
+        }
+
+    def record_preference_pair(
+        self,
+        user_text: str,
+        chosen_tool: str,
+        chosen_args: dict[str, Any],
+        rejected_tool: str,
+        rejected_args: dict[str, Any],
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Record an Online DPO / Contrastive preference pair (chosen vs rejected action) and update centroids & NeuralEngine."""
+        u_clean = (user_text or "").strip()
+        if not u_clean or not chosen_tool or not rejected_tool:
+            return {"recorded": False}
+        pair = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "user": u_clean[:400],
+            "chosen": {"tool": chosen_tool, "args": dict(chosen_args or {})},
+            "rejected": {"tool": rejected_tool, "args": dict(rejected_args or {})},
+            "reason": (reason or "")[:160],
+        }
+        try:
+            PREFERENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with PREFERENCE_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+        toks = _tokenize(u_clean)
+        if toks and chosen_tool != rejected_tool:
+            centroids: dict[str, dict[str, float]] = self.weights.setdefault("tool_centroids", {})
+            c_vec = centroids.setdefault(chosen_tool, {})
+            r_vec = centroids.get(rejected_tool) or {}
+            for tok in toks:
+                c_vec[tok] = round(c_vec.get(tok, 0.0) + 0.30, 4)
+                if tok in r_vec:
+                    nv = max(0.0, round(r_vec[tok] - 0.30, 4))
+                    if nv == 0.0:
+                        r_vec.pop(tok, None)
+                    else:
+                        r_vec[tok] = nv
+            try:
+                _save_weights_file(self.weights)
+            except Exception:
+                pass
+
+        dpo_res: dict[str, Any] = {}
+        if chosen_tool != rejected_tool:
+            try:
+                from .neural import NeuralEngine
+
+                dpo_res = NeuralEngine(self.storage).online_preference_step(
+                    u_clean, chosen_tool, rejected_tool
+                )
+            except Exception:
+                pass
+        return {"recorded": True, "pair": pair, "neural_dpo": dpo_res}
+
+    def retrieve_contrastive_hints(self, query: str, top_k: int = 2) -> list[dict[str, Any]]:
+        """Retrieve top-K matching `(chosen vs rejected)` preference pairs for Contrastive Few-Shot guidance."""
+        if not PREFERENCE_FILE.is_file():
+            return []
+        q_toks = _tokenize(query)
+        if not q_toks:
+            return []
+        idf: dict[str, float] = self.weights.get("idf", {})
+        q_vec = {t: cnt * idf.get(t, 1.0) for t, cnt in Counter(q_toks).items()}
+        scored: list[tuple[float, dict[str, Any]]] = []
+        try:
+            lines = PREFERENCE_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-120:]
+            for ln in lines:
+                if not ln.strip():
+                    continue
+                item = json.loads(ln)
+                if not isinstance(item, dict) or not item.get("user"):
+                    continue
+                u_vec = {
+                    t: cnt * idf.get(t, 1.0)
+                    for t, cnt in Counter(_tokenize(str(item["user"]))).items()
+                }
+                sim = _cosine_sim(q_vec, u_vec)
+                if sim >= 0.18:
+                    scored.append((sim, item))
+        except Exception:
+            return []
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [it for _, it in scored[:top_k]]
+
+    def local_actor_critic_review(
+        self,
+        user_request: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Critique a proposed tool call using schema rules, contrastive preference memory, and the 4B reasoning slot."""
+        schema_map = self._build_tool_schema_map()
+        spec = schema_map.get(tool_name)
+        if spec is None:
+            return {
+                "approved": False,
+                "risk": "high",
+                "critique": f"Unknown tool '{tool_name}'.",
+                "suggested_tool": None,
+                "suggested_args": {},
+            }
+        req = spec.get("required") or []
+        props = spec.get("properties") or {}
+        missing = [rk for rk in req if rk not in (tool_args or {}) or (tool_args or {}).get(rk) in {None, ""}]
+        if missing:
+            return {
+                "approved": False,
+                "risk": "medium",
+                "critique": f"Missing required parameter(s) for '{tool_name}': {missing}",
+                "suggested_tool": tool_name,
+                "suggested_args": dict(tool_args or {}),
+            }
+
+        for k, val in (tool_args or {}).items():
+            pdef = props.get(k)
+            if (
+                isinstance(pdef, dict)
+                and isinstance(pdef.get("enum"), list)
+                and pdef["enum"]
+                and val not in pdef["enum"]
+            ):
+                return {
+                    "approved": False,
+                    "risk": "medium",
+                    "critique": f"Invalid enum value '{val}' for '{tool_name}.{k}' (allowed: {pdef['enum']}).",
+                    "suggested_tool": tool_name,
+                    "suggested_args": dict(tool_args or {}),
+                }
+
+        for pair in self.retrieve_contrastive_hints(user_request, top_k=2):
+            rej = pair.get("rejected") or {}
+            cho = pair.get("chosen") or {}
+            if rej.get("tool") == tool_name and rej.get("args") == (tool_args or {}):
+                return {
+                    "approved": False,
+                    "risk": "medium",
+                    "critique": f"Matches previously rejected action ({pair.get('reason') or 'past failure'}). Prefer {cho.get('tool')}.",
+                    "suggested_tool": cho.get("tool"),
+                    "suggested_args": dict(cho.get("args") or {}),
+                }
+
+        reasoner = find_gguf_model("reasoning", strict=True)
+        if reasoner is not None and tool_name in {"edit_file", "write_file", "run_command", "trash_file"}:
+            critic_prompt = json.dumps(
+                {
+                    "task": "Review whether this tool call safely and accurately satisfies user_request. Respond ONLY JSON: {\"approved\": true/false, \"risk\": \"low|medium|high\", \"critique\": \"...\"}",
+                    "user_request": (user_request or "")[:300],
+                    "tool": tool_name,
+                    "args": tool_args,
+                },
+                ensure_ascii=False,
+            )
+            raw = self._run_single_gguf(
+                reasoner,
+                critic_prompt,
+                extra_system='Respond ONLY with JSON: {"approved": true, "risk": "low", "critique": "ok"}',
+                max_tokens=64,
+            )
+            if isinstance(raw, str) and "{" in raw:
+                try:
+                    parsed, _ = json.JSONDecoder().raw_decode(raw[raw.find("{") :])
+                    if isinstance(parsed, dict) and isinstance(parsed.get("approved"), bool):
+                        return {
+                            "approved": bool(parsed["approved"]),
+                            "risk": str(parsed.get("risk") or "low"),
+                            "critique": str(parsed.get("critique") or ""),
+                            "suggested_tool": tool_name,
+                            "suggested_args": dict(tool_args or {}),
+                        }
+                except Exception:
+                    pass
+
+        return {
+            "approved": True,
+            "risk": "low",
+            "critique": "passed_schema_and_contrastive_checks",
+            "suggested_tool": tool_name,
+            "suggested_args": dict(tool_args or {}),
         }
 
     def train(self, run_lora: bool = False) -> dict[str, Any]:
@@ -2417,6 +2610,16 @@ class LocalMind:
             ]
             if ex_lines:
                 ex_block = "\n\nPast learned examples:\n" + "\n---\n".join(ex_lines)
+        contrastive = self.retrieve_contrastive_hints(prompt, top_k=2) if not extra_system else []
+        if contrastive:
+            c_lines = [
+                f"For '{c['user'][:80]}': DO `{c['chosen']['tool']}({json.dumps(c['chosen'].get('args') or {}, ensure_ascii=False)})`, "
+                f"NOT `{c['rejected']['tool']}({json.dumps(c['rejected'].get('args') or {}, ensure_ascii=False)})`"
+                for c in contrastive
+                if isinstance(c.get("chosen"), dict) and isinstance(c.get("rejected"), dict)
+            ]
+            if c_lines:
+                ex_block += "\n\nContrastive preferences:\n" + "\n".join(c_lines)
         from .config import get_settings
 
         agent_name = get_settings().agent_name

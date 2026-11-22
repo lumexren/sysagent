@@ -1750,3 +1750,140 @@ def evaluate_graduation_arena(storage: Storage) -> dict[str, Any]:
     if graduated != prev_saved:
         _save_json_memory(storage, "_internal:graduated_tools", graduated[-32:])
     return {"graduated": graduated, "candidates": candidates}
+
+
+_TWIN_HISTORY: list[dict[str, Any]] = []
+
+
+def analyze_causal_digital_twin(
+    storage: Storage | None = None,
+    watcher: Any = None,
+    snapshots: list[dict[str, Any]] | None = None,
+    leak_threshold_mb_per_min: float = 5.0,
+) -> dict[str, Any]:
+    """Model per-process memory leak slopes (`d(RSS)/dt`), OOM ETA, and multi-hop causal anomaly chains."""
+    now_ts = time.time()
+    mem = psutil.virtual_memory()
+    total_mb = round(mem.total / (1024 * 1024), 1)
+    avail_mb = round(mem.available / (1024 * 1024), 1)
+    ram_pct = round(float(mem.percent), 1)
+
+    if snapshots is None:
+        proc_list: list[dict[str, Any]] = []
+        try:
+            for p in psutil.process_iter(["pid", "name", "memory_info", "cpu_percent"]):
+                try:
+                    minfo = p.info.get("memory_info")
+                    rss_mb = round((minfo.rss / (1024 * 1024)), 2) if minfo else 0.0
+                    if rss_mb >= 20.0:
+                        proc_list.append(
+                            {
+                                "pid": int(p.info["pid"]),
+                                "name": str(p.info.get("name") or "proc"),
+                                "rss_mb": rss_mb,
+                                "cpu_percent": float(p.info.get("cpu_percent") or 0.0),
+                            }
+                        )
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            pass
+        proc_list.sort(key=lambda x: x["rss_mb"], reverse=True)
+        cur_snap = {
+            "ts": now_ts,
+            "ram_percent": ram_pct,
+            "avail_ram_mb": avail_mb,
+            "total_ram_mb": total_mb,
+            "processes": proc_list[:25],
+        }
+        _TWIN_HISTORY.append(cur_snap)
+        if len(_TWIN_HISTORY) > 30:
+            del _TWIN_HISTORY[:-30]
+        history = list(_TWIN_HISTORY)
+    else:
+        history = list(snapshots)
+        if history:
+            last_s = history[-1]
+            avail_mb = float(last_s.get("avail_ram_mb", avail_mb))
+            ram_pct = float(last_s.get("ram_percent", ram_pct))
+
+    leaks: list[dict[str, Any]] = []
+    causal_chains: list[dict[str, Any]] = []
+
+    if len(history) >= 2:
+        t_first = float(history[0].get("ts") or 0.0)
+        t_last = float(history[-1].get("ts") or 0.0)
+        dt_min = max(0.05, (t_last - t_first) / 60.0)
+        series_by_proc: dict[tuple[int, str], list[float]] = {}
+        for snap in history:
+            for pr in snap.get("processes") or []:
+                key = (int(pr.get("pid", 0)), str(pr.get("name") or "proc"))
+                series_by_proc.setdefault(key, []).append(float(pr.get("rss_mb") or 0.0))
+
+        for (pid, pname), rss_vals in series_by_proc.items():
+            if len(rss_vals) < 2:
+                continue
+            delta_mb = rss_vals[-1] - rss_vals[0]
+            slope = round(delta_mb / dt_min, 2)
+            non_decreasing = all(rss_vals[i] <= rss_vals[i + 1] + 0.5 for i in range(len(rss_vals) - 1))
+            if delta_mb >= 10.0 and slope >= leak_threshold_mb_per_min and non_decreasing:
+                eta_min = round(max(1.0, avail_mb / max(0.1, slope)), 1)
+                leak_entry = {
+                    "pid": pid,
+                    "name": pname,
+                    "rss_start_mb": round(rss_vals[0], 1),
+                    "rss_current_mb": round(rss_vals[-1], 1),
+                    "delta_mb": round(delta_mb, 1),
+                    "slope_mb_per_min": slope,
+                    "oom_eta_min": eta_min,
+                }
+                leaks.append(leak_entry)
+                chain_str = (
+                    f"Process {pname} (PID {pid}) leaking +{slope} MB/min "
+                    f"-> RAM {ram_pct}% ({round(avail_mb, 0)} MB free) "
+                    f"-> OOM exhaustion in ~{eta_min} min"
+                )
+                remediation = f"Inspect or restart PID {pid} (`ps -p {pid} -o pid,rss,cmd` / `kill -15 {pid}`)"
+                causal_chains.append(
+                    {
+                        "root_cause": f"memory_leak:{pname}:{pid}",
+                        "rate": f"+{slope} MB/min",
+                        "chain": chain_str,
+                        "oom_eta_min": eta_min,
+                        "remediation": remediation,
+                    }
+                )
+                if storage is not None:
+                    try:
+                        storage.add_kg_edge(
+                            f"leak:{pname}:{pid}",
+                            "causes",
+                            f"oom_risk_in_{int(eta_min)}m",
+                        )
+                    except Exception:
+                        pass
+
+    leaks.sort(key=lambda x: x["slope_mb_per_min"], reverse=True)
+    if storage is not None and watcher is not None:
+        try:
+            for link in build_causal_timeline(storage, watcher):
+                causal_chains.append(
+                    {
+                        "root_cause": link["cause"],
+                        "rate": f"lag={link['lag_sec']}s",
+                        "chain": f"{link['cause']} -> {link['effect']}",
+                        "oom_eta_min": None,
+                        "remediation": f"Review recent action `{link['cause']}`",
+                    }
+                )
+        except Exception:
+            pass
+
+    return {
+        "snapshots_count": len(history),
+        "ram_percent": ram_pct,
+        "avail_ram_mb": avail_mb,
+        "memory_leaks": leaks[:5],
+        "causal_chains": causal_chains[:6],
+        "healthy": len(leaks) == 0,
+    }

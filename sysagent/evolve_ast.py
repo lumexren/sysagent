@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+from collections import defaultdict
+from pathlib import Path
 import re
 import string
 from typing import Any
@@ -289,4 +291,198 @@ def extract_ast_focus_slice(
         "focus_symbol": getattr(target_node, "name", None),
         "start_line": s_line,
         "end_line": e_line,
+    }
+
+
+def build_codebase_call_graph(
+    pkg_dir: Path | None = None,
+    storage: Any = None,
+    sync_kg: bool = False,
+) -> dict[str, Any]:
+    """Scan `sysagent/*.py` and `tests/*.py` via AST to build a cross-module call graph and test coverage map."""
+    pdir = pkg_dir or Path(__file__).resolve().parent
+    tdir = pdir.parent / "tests"
+    definitions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    call_graph: dict[str, set[str]] = defaultdict(set)
+    reverse_callers: dict[str, set[str]] = defaultdict(set)
+    module_calls: dict[str, set[str]] = defaultdict(set)
+    test_coverage_map: dict[str, set[str]] = defaultdict(set)
+
+    def _collect_calls_in_node(node: ast.AST) -> set[str]:
+        called: set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                if isinstance(sub.func, ast.Name):
+                    called.add(sub.func.id)
+                elif isinstance(sub.func, ast.Attribute):
+                    called.add(sub.func.attr)
+                for arg in sub.args:
+                    if isinstance(arg, ast.Name):
+                        called.add(arg.id)
+                    elif isinstance(arg, ast.Attribute):
+                        called.add(arg.attr)
+        return called
+
+    for pyf in sorted(pdir.glob("*.py")):
+        try:
+            src = pyf.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(src)
+        except Exception:
+            continue
+        mod_name = pyf.name
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definitions[node.name].append(
+                    {
+                        "file": mod_name,
+                        "kind": "function",
+                        "line": node.lineno,
+                        "sig": format_func_sig(node),
+                    }
+                )
+            elif isinstance(node, ast.ClassDef):
+                definitions[node.name].append(
+                    {
+                        "file": mod_name,
+                        "kind": "class",
+                        "line": node.lineno,
+                        "sig": node.name,
+                    }
+                )
+                for m in node.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for key in (m.name, f"{node.name}.{m.name}"):
+                            definitions[key].append(
+                                {
+                                    "file": mod_name,
+                                    "kind": "method",
+                                    "class": node.name,
+                                    "line": m.lineno,
+                                    "sig": f"{node.name}.{format_func_sig(m)}",
+                                }
+                            )
+
+    known_symbols = set(definitions.keys())
+
+    for pyf in sorted(pdir.glob("*.py")):
+        try:
+            src = pyf.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(src)
+        except Exception:
+            continue
+        mod_name = pyf.name
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                caller_id = f"{mod_name}:{node.name}"
+                for callee in _collect_calls_in_node(node):
+                    if callee in known_symbols and callee != node.name:
+                        call_graph[caller_id].add(callee)
+                        reverse_callers[callee].add(caller_id)
+                        module_calls[mod_name].add(callee)
+            elif isinstance(node, ast.ClassDef):
+                for m in node.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        caller_id = f"{mod_name}:{node.name}.{m.name}"
+                        for callee in _collect_calls_in_node(m):
+                            if callee in known_symbols and callee != m.name:
+                                call_graph[caller_id].add(callee)
+                                reverse_callers[callee].add(caller_id)
+                                module_calls[mod_name].add(callee)
+
+    if tdir.is_dir():
+        for tf in sorted(tdir.glob("test_*.py")):
+            if tf.name == "test_auto_coverage.py":
+                continue
+            try:
+                tsrc = tf.read_text(encoding="utf-8", errors="replace")
+                ttree = ast.parse(tsrc)
+            except Exception:
+                continue
+            called_in_test = _collect_calls_in_node(ttree)
+            referenced_names = {
+                n.id for n in ast.walk(ttree) if isinstance(n, ast.Name) and n.id in known_symbols
+            }
+            for sym in called_in_test | referenced_names:
+                if sym in known_symbols:
+                    test_coverage_map[sym].add(tf.name)
+
+    if sync_kg and storage is not None and hasattr(storage, "add_kg_edge"):
+        try:
+            for callee, callers in list(reverse_callers.items())[:120]:
+                for c in sorted(callers)[:4]:
+                    storage.add_kg_edge(c, "calls", callee)
+            for sym, tfiles in list(test_coverage_map.items())[:120]:
+                for tf_name in sorted(tfiles)[:3]:
+                    storage.add_kg_edge(tf_name, "tests_symbol", sym)
+        except Exception:
+            pass
+
+    return {
+        "definitions": dict(definitions),
+        "call_graph": {k: sorted(v) for k, v in call_graph.items()},
+        "reverse_callers": {k: sorted(v) for k, v in reverse_callers.items()},
+        "module_calls": {k: sorted(v) for k, v in module_calls.items()},
+        "test_coverage_map": {k: sorted(v) for k, v in test_coverage_map.items()},
+        "symbol_count": len(definitions),
+    }
+
+
+def analyze_symbol_blast_radius(
+    symbol_or_file: str,
+    pkg_dir: Path | None = None,
+    storage: Any = None,
+) -> dict[str, Any]:
+    """Compute direct callers, transitively affected modules, and covering unit tests for a symbol or module."""
+    target = (symbol_or_file or "").strip()
+    graph = build_codebase_call_graph(pkg_dir=pkg_dir, storage=storage, sync_kg=False)
+    defs = graph["definitions"]
+    rev = graph["reverse_callers"]
+    tmap = graph["test_coverage_map"]
+
+    target_symbols: list[str] = []
+    defined_in: list[dict[str, Any]] = []
+    if target.endswith(".py"):
+        mod_base = Path(target).name
+        for sym, locs in defs.items():
+            if "." in sym:
+                continue
+            for loc in locs:
+                if loc.get("file") == mod_base:
+                    target_symbols.append(sym)
+                    defined_in.append(loc)
+    else:
+        short_sym = target.split(".")[-1]
+        for key in dict.fromkeys([target, short_sym]):
+            if key in defs:
+                target_symbols.append(key)
+                defined_in.extend(defs[key])
+
+    direct_callers: set[str] = set()
+    affected_modules: set[str] = {str(loc.get("file")) for loc in defined_in if loc.get("file")}
+    covering_tests: set[str] = set()
+
+    for sym in target_symbols:
+        for caller in rev.get(sym, []):
+            direct_callers.add(caller)
+            c_mod = caller.split(":", 1)[0]
+            if c_mod:
+                affected_modules.add(c_mod)
+            caller_fn = caller.split(":", 1)[-1].split(".")[-1]
+            for tfile in tmap.get(caller_fn, []):
+                covering_tests.add(tfile)
+            for hop2 in rev.get(caller_fn, []):
+                h2_mod = hop2.split(":", 1)[0]
+                if h2_mod:
+                    affected_modules.add(h2_mod)
+        for tfile in tmap.get(sym, []):
+            covering_tests.add(tfile)
+
+    risk_score = round(min(1.0, (len(direct_callers) + 2 * len(affected_modules)) / 18.0), 3)
+    return {
+        "target": target,
+        "defined_in": defined_in[:12],
+        "direct_callers": sorted(direct_callers)[:25],
+        "affected_modules": sorted(affected_modules),
+        "covering_tests": sorted(covering_tests),
+        "risk_score": risk_score,
     }

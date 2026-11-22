@@ -44,6 +44,7 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             patch("sysagent.local_mind.MODELS_DIR", mods),
             patch("sysagent.local_mind.DISTILLED_FILE", ds / "distilled_turns.jsonl"),
             patch("sysagent.local_mind.UNCERTAIN_FILE", ds / "uncertain_queries.jsonl"),
+            patch("sysagent.local_mind.PREFERENCE_FILE", ds / "preference_pairs.jsonl"),
             patch("sysagent.local_mind.WEIGHTS_FILE", mods / "local_mind_weights.json"),
             patch("sysagent.local_mind.ROLE_ADAPTERS_FILE", mods / "role_adapters.json"),
             patch("sysagent.local_mind.SEMANTIC_INDEX_FILE", mods / "semantic_index.json"),
@@ -67,6 +68,10 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
         li_mod._LLAMA_SERVER_MMPROJ = ""
         li_mod._LLAMA_SERVER_URL = ""
         li_mod._LLAMA_SERVER_LAST_USED = 0.0
+        li_mod._AUX_SERVER_PROC = None
+        li_mod._AUX_SERVER_MODEL = ""
+        li_mod._AUX_SERVER_URL = ""
+        li_mod._AUX_SERVER_LAST_USED = 0.0
         li_mod._LLAMA_CPP_INSTANCE = None
         li_mod._LLAMA_CPP_MODEL_PATH = None
 
@@ -753,6 +758,132 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
                 "agent_main", improved_main, reason="incorporate compact_units style", enforce_shadow_gate=True
             )
             self.assertEqual(g_good["status"], "updated")
+
+    def test_five_next_gen_architectural_features(self) -> None:
+        from sysagent.evolve_ast import analyze_symbol_blast_radius
+        from sysagent.local_inference import can_fit_dual_slot, get_runtime_memory_status
+        from sysagent.self_learn import analyze_causal_digital_twin
+
+        with Storage(db_path=self.root / "nextgen.db") as st:
+            lm = LocalMind(st)
+            lm.train()
+
+            # 1) Dual-Slot VRAM Orchestrator + Local Actor-Critic
+            prim_gguf = self.mods / "DeepSeek-V4-Pro-Qwen3.5-9B-MTP-Q4_K_M.gguf"
+            aux_gguf = self.mods / "SkillGym-Qwen3.5-4B.Q4_K_M.gguf"
+            prim_gguf.write_bytes(b"GGUF" + b"\x00" * 1024)
+            aux_gguf.write_bytes(b"GGUF" + b"\x00" * 512)
+            with patch(
+                "sysagent.local_inference.get_vram_info",
+                return_value={"available": True, "free_mb": 6200, "used_mb": 6088, "total_mb": 12288, "source": "nvidia"},
+            ):
+                self.assertTrue(can_fit_dual_slot(prim_gguf, aux_gguf))
+                rt_status = get_runtime_memory_status()
+                self.assertIn("aux_warm_model", rt_status)
+                self.assertIn("dual_slot_active", rt_status)
+
+            # Actor-Critic catches missing required param and invalid enum
+            c_missing = lm.local_actor_critic_review("read hosts", "read_file", {})
+            self.assertFalse(c_missing["approved"])
+            self.assertIn("Missing required", c_missing["critique"])
+
+            c_bad_enum = lm.local_actor_critic_review("check self", "inspect_self_component", {"component": "invalid_xyz"})
+            self.assertFalse(c_bad_enum["approved"])
+            self.assertIn("Invalid enum", c_bad_enum["critique"])
+
+            c_ok = lm.local_actor_critic_review("check prompts", "inspect_self_component", {"component": "prompts"})
+            self.assertTrue(c_ok["approved"])
+
+            # 2) Live AST Codebase Call-Graph & Blast-Radius Engine
+            blast = analyze_symbol_blast_radius("execute_tool", storage=st)
+            self.assertEqual(blast["target"], "execute_tool")
+            self.assertTrue(any(d.get("file") == "tools.py" for d in blast["defined_in"]))
+            self.assertIn("agent.py", blast["affected_modules"])
+            self.assertGreaterEqual(len(blast["covering_tests"]), 1)
+
+            isp_cb = json.loads(
+                execute_tool("inspect_self_component", {"component": "codebase", "query": "execute_tool"}, None, st)
+            )
+            self.assertIn("blast_radius", isp_cb["codebase"])
+            self.assertEqual(isp_cb["codebase"]["blast_radius"]["target"], "execute_tool")
+
+            # 3) Transactional Tree-of-Actions & Auto-Rollback on broken edit
+            target_py = self.root / "tx_demo.py"
+            original_code = "def compute_val() -> int:\n    return 42\n"
+            target_py.write_text(original_code, encoding="utf-8")
+            batch_id = "tx-test-batch-1"
+            # Perform broken edit via execute_tool so audit_log backup is recorded
+            execute_tool(
+                "edit_file",
+                {"path": str(target_py), "target": "return 42", "replacement": "return (42"},
+                None,
+                st,
+                batch_id=batch_id,
+            )
+            self.assertIn("return (42", target_py.read_text(encoding="utf-8"))
+
+            watcher = SimpleNamespace(current_context="normal", _send_desktop_notification=MagicMock())
+            am = AgentManager(Settings(), watcher, st, PluginRegistry(), MagicMock(is_configured=True))
+            recorded_calls = [{"name": "edit_file", "arguments": {"path": str(target_py)}}]
+            tx_res = am.verify_and_transactional_rollback(recorded_calls, batch_id, user_message="edit tx_demo.py")
+            self.assertTrue(tx_res["rolled_back"])
+            self.assertTrue(tx_res["restored"])
+            # File automatically rolled back to clean original code
+            self.assertEqual(target_py.read_text(encoding="utf-8"), original_code)
+            self.assertTrue(recorded_calls[0].get("rolled_back"))
+
+            # 4) Online DPO / Contrastive Preference Memory
+            dpo_out = lm.record_preference_pair(
+                "promptlar ne durumda",
+                chosen_tool="inspect_self_component",
+                chosen_args={"component": "prompts"},
+                rejected_tool="list_directory",
+                rejected_args={"path": "/home/eren/Projects/sysagent"},
+                reason="Use inspect_self_component for prompt inspection instead of list_directory",
+            )
+            self.assertTrue(dpo_out["recorded"])
+            self.assertTrue(dpo_out["neural_dpo"].get("updated"))
+            self.assertGreater(
+                dpo_out["neural_dpo"]["margin_after"],
+                dpo_out["neural_dpo"]["margin_before"],
+            )
+            c_hints = lm.retrieve_contrastive_hints("promptlar ne durumda kontrol et", top_k=2)
+            self.assertGreaterEqual(len(c_hints), 1)
+            self.assertEqual(c_hints[0]["chosen"]["tool"], "inspect_self_component")
+            # Actor-critic blocks repeating the exact rejected action
+            c_repeat = lm.local_actor_critic_review(
+                "promptlar ne durumda", "list_directory", {"path": "/home/eren/Projects/sysagent"}
+            )
+            self.assertFalse(c_repeat["approved"])
+            self.assertEqual(c_repeat["suggested_tool"], "inspect_self_component")
+
+            # 5) Causal Digital Twin & Process Memory-Leak / Root-Cause Engine
+            synthetic_snaps = [
+                {
+                    "ts": 1000.0,
+                    "ram_percent": 62.0,
+                    "avail_ram_mb": 4000.0,
+                    "total_ram_mb": 16000.0,
+                    "processes": [{"pid": 9991, "name": "leaky_worker", "rss_mb": 400.0, "cpu_percent": 12.0}],
+                },
+                {
+                    "ts": 1120.0,  # +2 minutes
+                    "ram_percent": 65.0,
+                    "avail_ram_mb": 3920.0,
+                    "total_ram_mb": 16000.0,
+                    "processes": [{"pid": 9991, "name": "leaky_worker", "rss_mb": 480.0, "cpu_percent": 14.0}],
+                },
+            ]
+            twin = analyze_causal_digital_twin(st, watcher=None, snapshots=synthetic_snaps)
+            self.assertFalse(twin["healthy"])
+            self.assertEqual(len(twin["memory_leaks"]), 1)
+            leak = twin["memory_leaks"][0]
+            self.assertEqual(leak["name"], "leaky_worker")
+            self.assertEqual(leak["slope_mb_per_min"], 40.0)
+            self.assertEqual(leak["oom_eta_min"], 98.0)
+            self.assertTrue(any("leaky_worker" in c["chain"] for c in twin["causal_chains"]))
+            kg_edges = st.query_kg("leak:leaky_worker:9991")
+            self.assertTrue(any(e.get("relation") == "causes" for e in kg_edges))
 
 
 if __name__ == "__main__":

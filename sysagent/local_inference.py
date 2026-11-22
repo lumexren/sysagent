@@ -19,11 +19,16 @@ _LLAMA_SERVER_MODEL: str = ""
 _LLAMA_SERVER_MMPROJ: str = ""
 _LLAMA_SERVER_URL: str = ""
 _LLAMA_SERVER_LAST_USED: float = 0.0
+_AUX_SERVER_PROC: subprocess.Popen[Any] | None = None
+_AUX_SERVER_MODEL: str = ""
+_AUX_SERVER_URL: str = ""
+_AUX_SERVER_LAST_USED: float = 0.0
 _LLAMA_CPP_INSTANCE: Any = None
 _LLAMA_CPP_MODEL_PATH: str | None = None
 _ATEXIT_REGISTERED: bool = False
 _INFERENCE_LOCK = threading.RLock()
 _VRAM_CACHE: tuple[float, dict[str, Any]] = (0.0, {})
+_AUX_SLOT_MAX_MB: int = 3300
 
 
 def inference_lock() -> threading.RLock:
@@ -76,6 +81,64 @@ def get_warm_model_idle_sec() -> float | None:
     if get_warm_model_path() is None or _LLAMA_SERVER_LAST_USED <= 0.0:
         return None
     return round(max(0.0, time.monotonic() - _LLAMA_SERVER_LAST_USED), 1)
+
+
+def get_aux_warm_model_path() -> Path | None:
+    """Return Path of the secondary/auxiliary warm GGUF slot (port 8770), if active."""
+    if _AUX_SERVER_PROC is not None and _AUX_SERVER_PROC.poll() is None and _AUX_SERVER_MODEL:
+        return Path(_AUX_SERVER_MODEL)
+    return None
+
+
+def get_aux_warm_model_name() -> str | None:
+    """Return basename of the secondary warm GGUF model, if active."""
+    aux = get_aux_warm_model_path()
+    return aux.name if aux is not None else (Path(_AUX_SERVER_MODEL).name if _AUX_SERVER_MODEL else None)
+
+
+def _release_aux_warm_model() -> bool:
+    """Release only the secondary/auxiliary llama-server slot."""
+    global _AUX_SERVER_PROC, _AUX_SERVER_MODEL, _AUX_SERVER_URL, _AUX_SERVER_LAST_USED
+    with _INFERENCE_LOCK:
+        if _AUX_SERVER_PROC is None:
+            _AUX_SERVER_MODEL = ""
+            _AUX_SERVER_URL = ""
+            return False
+        if _AUX_SERVER_PROC.poll() is None:
+            _AUX_SERVER_PROC.terminate()
+            try:
+                _AUX_SERVER_PROC.wait(timeout=3)
+            except Exception:
+                _AUX_SERVER_PROC.kill()
+                try:
+                    _AUX_SERVER_PROC.wait(timeout=2)
+                except Exception:
+                    pass
+        _AUX_SERVER_PROC = None
+        _AUX_SERVER_MODEL = ""
+        _AUX_SERVER_URL = ""
+        _AUX_SERVER_LAST_USED = 0.0
+        return True
+
+
+def can_fit_dual_slot(primary_gguf: Path | None, aux_gguf: Path, headroom_mb: int = 640) -> bool:
+    """Return True if primary + auxiliary GGUF models can co-reside in GPU VRAM simultaneously."""
+    if not aux_gguf.is_file() or not _has_ram_for_gguf(aux_gguf, min_headroom_gb=1.2):
+        return False
+    aux_mb = int(aux_gguf.stat().st_size / (1024 * 1024))
+    if aux_mb > _AUX_SLOT_MAX_MB:
+        return False
+    vram = get_vram_info()
+    if not vram.get("available") or int(vram.get("total_mb", 0)) < 8000:
+        return False
+    free_mb = int(vram.get("free_mb", 0))
+    cur_aux = get_aux_warm_model_path()
+    if cur_aux is not None and cur_aux.is_file() and cur_aux != aux_gguf:
+        free_mb += int(cur_aux.stat().st_size / (1024 * 1024))
+    if primary_gguf is not None and get_warm_model_path() is None and primary_gguf.is_file():
+        prim_mb = int(primary_gguf.stat().st_size / (1024 * 1024))
+        return free_mb >= (prim_mb + aux_mb + headroom_mb)
+    return free_mb >= (aux_mb + headroom_mb)
 
 
 def get_vram_info(ttl_sec: float = 3.0) -> dict[str, Any]:
@@ -159,20 +222,24 @@ def get_runtime_memory_status() -> dict[str, Any]:
     except ValueError:
         hyst = 90.0
     warm = get_warm_model_path()
+    aux = get_aux_warm_model_path()
+    vram = get_vram_info()
     return {
         "warm_model": warm.name if warm is not None else None,
+        "aux_warm_model": aux.name if aux is not None else None,
         "warm_mmproj": Path(_LLAMA_SERVER_MMPROJ).name if (_LLAMA_SERVER_MMPROJ and warm is not None) else None,
         "idle_sec": get_warm_model_idle_sec(),
-        "vram": get_vram_info(),
+        "vram": vram,
+        "dual_slot_active": bool(warm is not None and aux is not None),
         "hysteresis_sec": hyst,
     }
 
 
 def _release_all_warm_models() -> bool:
-    """Immediately release any warm llama-server process and in-process Llama instance (strict single-slot RAM guard)."""
+    """Immediately release any warm primary/auxiliary llama-server processes and in-process Llama instance."""
     global _LLAMA_SERVER_PROC, _LLAMA_SERVER_MODEL, _LLAMA_SERVER_MMPROJ, _LLAMA_SERVER_URL, _LLAMA_CPP_INSTANCE, _LLAMA_CPP_MODEL_PATH
     with _INFERENCE_LOCK:
-        unloaded = False
+        unloaded = _release_aux_warm_model()
         if _LLAMA_SERVER_PROC is not None:
             if _LLAMA_SERVER_PROC.poll() is None:
                 _LLAMA_SERVER_PROC.terminate()
@@ -319,8 +386,10 @@ def unload_idle_servers(idle_sec: float = 120.0) -> bool:
         _INFERENCE_LOCK.release()
 
 
-def ensure_llama_server(gguf: Path, mmproj: Path | None = None) -> str | None:
-    """Lazily start or reuse a warm `llama-server` process for fast GPU inference (with optional mmproj vision projector)."""
+def ensure_llama_server(
+    gguf: Path, mmproj: Path | None = None, allow_dual_slot: bool = True
+) -> str | None:
+    """Lazily start or reuse a warm `llama-server` process (supports Dual-Slot VRAM co-residency for compact models)."""
     import httpx
 
     server_bin = shutil.which("llama-server")
@@ -328,9 +397,10 @@ def ensure_llama_server(gguf: Path, mmproj: Path | None = None) -> str | None:
         return None
 
     mmproj_str = str(mmproj) if (mmproj is not None and mmproj.is_file()) else ""
-    global _LLAMA_SERVER_PROC, _LLAMA_SERVER_MODEL, _LLAMA_SERVER_MMPROJ, _LLAMA_SERVER_URL, _LLAMA_SERVER_LAST_USED, _ATEXIT_REGISTERED
+    global _LLAMA_SERVER_PROC, _LLAMA_SERVER_MODEL, _LLAMA_SERVER_MMPROJ, _LLAMA_SERVER_URL, _LLAMA_SERVER_LAST_USED
+    global _AUX_SERVER_PROC, _AUX_SERVER_MODEL, _AUX_SERVER_URL, _AUX_SERVER_LAST_USED, _ATEXIT_REGISTERED
     with _INFERENCE_LOCK:
-        _LLAMA_SERVER_LAST_USED = time.monotonic()
+        now = time.monotonic()
         if (
             _LLAMA_SERVER_PROC is not None
             and _LLAMA_SERVER_PROC.poll() is None
@@ -338,8 +408,75 @@ def ensure_llama_server(gguf: Path, mmproj: Path | None = None) -> str | None:
             and (mmproj is None or mmproj_str == _LLAMA_SERVER_MMPROJ)
             and _LLAMA_SERVER_URL
         ):
+            _LLAMA_SERVER_LAST_USED = now
             return _LLAMA_SERVER_URL
 
+        if (
+            mmproj is None
+            and _AUX_SERVER_PROC is not None
+            and _AUX_SERVER_PROC.poll() is None
+            and str(gguf) == _AUX_SERVER_MODEL
+            and _AUX_SERVER_URL
+        ):
+            _AUX_SERVER_LAST_USED = now
+            return _AUX_SERVER_URL
+
+        primary_warm = get_warm_model_path()
+        gguf_mb = int(gguf.stat().st_size / (1024 * 1024))
+        use_aux_slot = (
+            allow_dual_slot
+            and mmproj is None
+            and primary_warm is not None
+            and primary_warm != gguf
+            and gguf_mb <= _AUX_SLOT_MAX_MB
+            and can_fit_dual_slot(primary_warm, gguf)
+        )
+
+        if use_aux_slot:
+            _release_aux_warm_model()
+            port = _pick_server_port(8770)
+            base_url = f"http://127.0.0.1:{port}"
+            ctx_size = os.environ.get("SYSAGENT_LOCAL_CTX", "4096").strip() or "4096"
+            cmd = [
+                server_bin,
+                "-m",
+                str(gguf),
+                "-ngl",
+                "99",
+                "-c",
+                ctx_size,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ]
+            _AUX_SERVER_PROC = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            _AUX_SERVER_MODEL = str(gguf)
+            _AUX_SERVER_URL = base_url
+            if not _ATEXIT_REGISTERED:
+                atexit.register(_release_all_warm_models)
+                _ATEXIT_REGISTERED = True
+            for _ in range(60):
+                if _AUX_SERVER_PROC.poll() is not None:
+                    _release_aux_warm_model()
+                    return None
+                try:
+                    r = httpx.get(f"{base_url}/health", timeout=0.6)
+                    if r.status_code == 200:
+                        _AUX_SERVER_LAST_USED = time.monotonic()
+                        return base_url
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            _release_aux_warm_model()
+            return None
+
+        _LLAMA_SERVER_LAST_USED = now
         _release_all_warm_models()
         fit_ok, _ = can_fit_gguf_model(gguf, mmproj=mmproj)
         if not fit_ok:

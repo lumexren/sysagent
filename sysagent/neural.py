@@ -847,6 +847,50 @@ class NeuralEngine:
         self.weights["b_trans"] -= lr * dlogits.sum(axis=0)
         self._save()
 
+    def online_preference_step(
+        self,
+        text: str,
+        chosen_tool: str,
+        rejected_tool: str,
+        margin: float = 0.65,
+        lr: float = 0.045,
+    ) -> dict[str, Any]:
+        """Pairwise DPO / Margin-Ranking update pushing chosen_tool logit above rejected_tool by >= margin."""
+        self._detach_for_write()
+        classes = list(self.meta.get("tool_classes") or [])
+        if (
+            not chosen_tool
+            or not rejected_tool
+            or chosen_tool == rejected_tool
+            or chosen_tool not in classes
+            or rejected_tool not in classes
+        ):
+            return {"updated": False, "reason": "invalid_or_same_tool"}
+
+        X = self.encode_features(text).reshape(1, -1)
+        h2 = self._forward(X)["h2"]
+        logits = (h2 @ self.weights["W_tool"] + self.weights["b_tool"])[0]
+        c_idx = classes.index(chosen_tool)
+        r_idx = classes.index(rejected_tool)
+        diff_before = float(logits[c_idx] - logits[r_idx])
+        sig = float(_sigmoid(np.array([diff_before - margin], dtype=np.float32))[0])
+        grad = max(0.05, float(1.0 - sig))
+        h_vec = h2[0]
+        self.weights["W_tool"][:, c_idx] += lr * grad * h_vec
+        self.weights["b_tool"][c_idx] += lr * grad
+        self.weights["W_tool"][:, r_idx] -= lr * grad * h_vec
+        self.weights["b_tool"][r_idx] -= lr * grad
+        self.meta["preference_pairs_trained"] = int(self.meta.get("preference_pairs_trained", 0)) + 1
+        self._save()
+        logits_after = (h2 @ self.weights["W_tool"] + self.weights["b_tool"])[0]
+        diff_after = float(logits_after[c_idx] - logits_after[r_idx])
+        return {
+            "updated": True,
+            "margin_before": round(diff_before, 4),
+            "margin_after": round(diff_after, 4),
+            "pairs_trained": int(self.meta["preference_pairs_trained"]),
+        }
+
 
     def sync_associative_memory(self) -> int:
         """Encode memories, lessons, KG edges, and brain rules into the associative vector store."""
