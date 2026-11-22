@@ -127,9 +127,14 @@ class SelfGuard:
         self.last_canary: dict[str, Any] | None = None
         self.last_calibration: dict[str, Any] | None = None
         self.last_profile: dict[str, Any] | None = None
+        self.last_eval: dict[str, Any] | None = None
+        self.last_drift: dict[str, Any] | None = None
 
     def on_startup(self) -> dict[str, Any]:
         """Run crash autopsy if the previous daemon run exited uncleanly, then write the boot marker."""
+        from .self_resilience import record_boot_module_hashes
+
+        record_boot_module_hashes()
         crashed = self.marker_file.is_file()
         autopsy = self.run_crash_autopsy() if crashed else {"crashed": False}
         self.marker_file.parent.mkdir(parents=True, exist_ok=True)
@@ -358,11 +363,45 @@ class SelfGuard:
             )
         return candidates
 
+    def run_eval_gate(self) -> dict[str, Any]:
+        """Run deterministic Self-Eval Regression Gate against LocalMind and safety rules."""
+        from .local_mind import LocalMind
+        from .self_resilience import evaluate_self_gate
+
+        res = evaluate_self_gate(LocalMind(self.storage), self.storage)
+        self.last_eval = res
+        return res
+
+    def run_drift_audit(self) -> dict[str, Any]:
+        """Run integrity, stale-module, SQLite WAL/quick_check, and git drift audit."""
+        from .self_resilience import run_integrity_and_drift_audit
+
+        res = run_integrity_and_drift_audit(self.storage)
+        self.last_drift = res
+        return res
+
+    def get_resilience_status(self) -> dict[str, Any]:
+        """Return live circuit breaker states, quota governor metrics, eval gate, and drift audit."""
+        from .self_resilience import get_circuit_breaker, get_quota_governor
+
+        return {
+            "circuit_breaker": get_circuit_breaker().snapshot(),
+            "quota": get_quota_governor().get_status(),
+            "eval_gate": self.last_eval,
+            "drift": self.last_drift,
+        }
+
     def get_status(self) -> dict[str, Any]:
+        from .self_resilience import get_circuit_breaker, get_quota_governor
+
         return {
             "autopsy": self.last_autopsy,
             "calibration": self.last_calibration or self.calibrate_thresholds(),
             "canary": self.last_canary or self.run_canary_probes(),
             "profile": self.last_profile or self.run_memory_profiler(),
+            "eval_gate": self.last_eval or self.run_eval_gate(),
+            "drift": self.last_drift or self.run_drift_audit(),
+            "circuit_breaker": get_circuit_breaker().snapshot(),
+            "quota": get_quota_governor().get_status(),
             "skill_candidates": self.synthesize_skill_candidates(),
         }

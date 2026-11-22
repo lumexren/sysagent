@@ -814,6 +814,7 @@ class LocalMind:
                 lora_status = f"error:{exc}"
 
         prev_cb_hash = self.weights.get("codebase_train_hash")
+        prev_weights = dict(self.weights) if self.weights.get("tool_centroids") else {}
         self.weights = {
             "version": 1,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -833,6 +834,18 @@ class LocalMind:
         }
         if prev_cb_hash:
             self.weights["codebase_train_hash"] = prev_cb_hash
+        try:
+            from .self_resilience import evaluate_self_gate
+
+            gate = evaluate_self_gate(self, self.storage)
+            if gate.get("regressed") and prev_weights:
+                self.weights = prev_weights
+                if self.storage is not None:
+                    self.storage.add_brain_thought(
+                        "warn", 90, f"SelfEvalGate rolled back LocalMind weights (score={gate.get('score')} < baseline={gate.get('baseline')})"
+                    )
+        except Exception:
+            pass
         try:
             _save_weights_file(self.weights)
         except Exception:
@@ -1060,7 +1073,13 @@ class LocalMind:
     def distill_from_teachers(self, count_per_teacher: int = 2) -> dict[str, Any]:
         """Multi-Teacher Knowledge Distillation: query diverse cloud teachers via `agy` to feed LocalMind."""
         from .auth import _find_agy_cli
+        from .self_resilience import get_quota_governor
         from .tools import TOOL_DECLARATIONS
+
+        gov = get_quota_governor()
+        allowed_q, q_reason = gov.allow_background("distill")
+        if not allowed_q:
+            return {"status": "deferred", "reason": q_reason}
 
         agy_bin = _find_agy_cli()
         if not agy_bin:
@@ -1124,6 +1143,7 @@ class LocalMind:
                 '{"samples": [{"user": "user request", "tool": "tool_name_or_null", "args": {}, "reply": "concise plain text answer without backticks"}]}'
             )
             try:
+                gov.record_background_call("distill", teacher)
                 proc = subprocess.run(
                     [
                         agy_bin,

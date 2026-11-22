@@ -19,7 +19,8 @@ from .i18n import t
 from .plugins import PluginRegistry
 from .prompts import DEFAULT_PROMPTS, PromptRegistry
 from .safety import SAFE_TOOLS, assess_tool_call, compute_dry_run_preview, is_auto_trust_allowed
-from .self_ops import ToolCache, choose_model, detect_style_feedback, scrub_secrets, select_relevant_tools, truncate_tool_output
+from .self_ops import ToolCache, choose_model, detect_style_feedback, scrub_secrets, select_relevant_tools
+from .self_resilience import ContextBudgeter, build_recovery_hint, get_circuit_breaker, get_quota_governor
 from .storage import Storage
 from .tools import TOOL_DECLARATIONS, execute_tool, get_all_tool_declarations
 from .watcher import SystemWatcher
@@ -363,19 +364,21 @@ class AgentManager:
             if on_delta is not None:
                 local_kwargs["on_delta"] = on_delta
             return await asyncio.to_thread(local_client.interactions.create, **local_kwargs)
+        cb = get_circuit_breaker()
+        gov = get_quota_governor()
         try:
+            if not cb.allow(f"model:{model}"):
+                raise RuntimeError(f"Circuit open for model {model}")
             self.storage.record_model_request(model)
-            return await self._create_safe(client, kwargs)
+            out = await self._create_safe(client, kwargs)
+            cb.record_success(f"model:{model}")
+            return out
         except Exception as exc:
             msg = str(exc).lower()
-            is_quota_or_net = any(
+            is_quota = any(k in msg for k in ("429", "resource_exhausted", "quota", "403", "billing"))
+            is_quota_or_net = is_quota or any(
                 k in msg
                 for k in (
-                    "429",
-                    "resource_exhausted",
-                    "quota",
-                    "403",
-                    "billing",
                     "connection",
                     "unreachable",
                     "timed out",
@@ -383,26 +386,35 @@ class AgentManager:
                     "name or service not known",
                     "temporary failure",
                     "agy cli error",
+                    "circuit open for model",
                 )
             ) or isinstance(exc, (OSError, TimeoutError, asyncio.TimeoutError))
             if not is_quota_or_net:
                 raise
+            if is_quota:
+                gov.record_rate_limit(model)
+            if "circuit open" not in msg:
+                cb.record_failure(f"model:{model}", str(exc)[:120])
             if self.auth.rotate_key():
                 try:
                     client = self._get_client()
                     self.storage.record_model_request(model)
-                    return await self._create_safe(client, kwargs)
+                    out = await self._create_safe(client, kwargs)
+                    cb.record_success(f"model:{model}")
+                    return out
                 except Exception:
                     pass
-            if model != self.settings.light_model:
+            if model != self.settings.light_model and cb.allow(f"model:{self.settings.light_model}"):
                 try:
                     fallback = self.settings.light_model
                     self._session_models[session_id] = fallback
                     kwargs["model"] = fallback
                     self.storage.record_model_request(fallback)
-                    return await self._create_safe(client, kwargs)
-                except Exception:
-                    pass
+                    out = await self._create_safe(client, kwargs)
+                    cb.record_success(f"model:{fallback}")
+                    return out
+                except Exception as fb_exc:
+                    cb.record_failure(f"model:{self.settings.light_model}", str(fb_exc)[:120])
             local_client = getattr(self, "_local_client", None)
             if local_client is None:
                 from .local_mind import LocalMindClient
@@ -456,7 +468,7 @@ class AgentManager:
                         if isinstance(raw_out, str) and '"error":' not in raw_out:
                             self.storage.upsert_session(session_id, None)
                             self.storage.add_message(session_id, "user", user_message)
-                            summary = f"[{plan['tool']}] {truncate_tool_output(scrub_secrets(raw_out), max_chars=2400)}"
+                            summary = f"[{plan['tool']}] {ContextBudgeter.budget_tool_output(self.storage, plan['tool'], scrub_secrets(raw_out), max_chars=2400)}"
                             self.storage.add_message(session_id, "assistant", summary)
                             if emit:
                                 await emit({"type": "assistant_message", "text": summary})
@@ -557,7 +569,7 @@ class AgentManager:
                 batch_id,
             )
             await _emit({"type": "tool_result", "name": t_name, "approved": True})
-            reply_text = f"[{t_name} | 0-token fast-path]\n{truncate_tool_output(str(raw_res), max_chars=2500)}"
+            reply_text = f"[{t_name} | 0-token fast-path]\n{ContextBudgeter.budget_tool_output(self.storage, t_name, scrub_secrets(str(raw_res)), max_chars=2500)}"
             self.storage.add_message(session_id, "assistant", reply_text)
             await _emit({"type": "assistant_message", "text": reply_text})
             return reply_text
@@ -786,9 +798,15 @@ class AgentManager:
                             ensure_ascii=False,
                         )
                 elif approved:
+                    cb = get_circuit_breaker()
                     cached = self._tool_cache.get(call.name, args)
                     if cached is not None:
                         result_payload = cached
+                    elif not cb.allow(f"tool:{call.name}"):
+                        result_payload = json.dumps(
+                            {"error": f"Circuit open for tool '{call.name}' after repeated failures; cooling down."}
+                        )
+                        had_failure = True
                     else:
                         t0 = time.monotonic()
                         result_payload = await asyncio.to_thread(
@@ -803,7 +821,14 @@ class AgentManager:
                         )
                         elapsed_ms = (time.monotonic() - t0) * 1000.0
                         is_err = isinstance(result_payload, str) and '"error":' in result_payload
+                        cmd_nonzero = (
+                            call.name == "run_command"
+                            and isinstance(result_payload, str)
+                            and '"returncode":' in result_payload
+                            and '"returncode": 0' not in result_payload
+                        )
                         if is_err:
+                            cb.record_failure(f"tool:{call.name}", str(result_payload)[:120])
                             had_failure = True
                             from .self_learn import record_immunity_pattern
 
@@ -814,18 +839,26 @@ class AgentManager:
                                 NeuralEngine(self.storage).online_step(user_message, call.name, reward=-0.8)
                             except Exception:
                                 pass
-                        elif len(recorded_tool_calls) >= 2:
-                            prev_tc = recorded_tool_calls[-2].get("name")
-                            if prev_tc and prev_tc != call.name:
-                                try:
-                                    from .neural import NeuralEngine
+                        else:
+                            cb.record_success(f"tool:{call.name}")
+                            if len(recorded_tool_calls) >= 2:
+                                prev_tc = recorded_tool_calls[-2].get("name")
+                                if prev_tc and prev_tc != call.name:
+                                    try:
+                                        from .neural import NeuralEngine
 
-                                    NeuralEngine(self.storage).online_transition_step(user_message, str(prev_tc), call.name)
-                                except Exception:
-                                    pass
+                                        NeuralEngine(self.storage).online_transition_step(user_message, str(prev_tc), call.name)
+                                    except Exception:
+                                        pass
                         self.storage.record_tool_metric(call.name, elapsed_ms, is_err)
+                        if (is_err or cmd_nonzero) and isinstance(result_payload, str):
+                            hint = build_recovery_hint(self.storage, call.name, args, result_payload)
+                            if hint:
+                                result_payload = f"{result_payload}\n{hint}"
                         if isinstance(result_payload, str):
-                            result_payload = truncate_tool_output(scrub_secrets(result_payload), max_chars=4000)
+                            result_payload = ContextBudgeter.budget_tool_output(
+                                self.storage, call.name, scrub_secrets(result_payload), max_chars=4000
+                            )
                         if call.name in {"write_file", "edit_file", "trash_file", "undo_last_action", "undo_batch_actions", "run_command", "forge_skill"}:
                             self._tool_cache.invalidate_all()
                             if call.name in {"undo_last_action", "undo_batch_actions"}:

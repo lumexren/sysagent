@@ -167,10 +167,14 @@ def select_relevant_tools(
         except Exception:
             pass
     known_builtins = builtin_names or {str(d.get("name") or "") for d in all_tools if d.get("name")}
+    from .self_resilience import get_circuit_breaker
+
+    cb = get_circuit_breaker()
     return [
         decl
         for decl in all_tools
-        if decl.get("name") in selected or decl.get("name") not in known_builtins
+        if (decl.get("name") in selected or decl.get("name") not in known_builtins)
+        and (decl.get("name") in CORE_TOOLS or not cb.is_open(f"tool:{decl.get('name')}"))
     ]
 
 
@@ -517,6 +521,8 @@ class SelfMonitor:
                     "canary": sg.run_canary_probes(),
                     "profile": sg.run_memory_profiler(),
                     "calibration": sg.calibrate_thresholds(),
+                    "eval_gate": sg.run_eval_gate(),
+                    "drift": sg.run_drift_audit(),
                 }
             except Exception:
                 pass

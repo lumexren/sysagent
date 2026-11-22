@@ -1203,7 +1203,7 @@ def _cmd_self(
     loc = locale_override or get_settings().locale
     hdrs = _auth_headers()
     try:
-        if action in {"canary", "calibrate", "profile"}:
+        if action in {"canary", "calibrate", "profile", "eval"}:
             try:
                 resp = ipc_post(f"{base_url}/api/self/{action}", headers=hdrs, timeout=15)
                 resp.raise_for_status()
@@ -1217,8 +1217,28 @@ def _cmd_self(
                         "canary": sg.run_canary_probes,
                         "calibrate": sg.calibrate_thresholds,
                         "profile": sg.run_memory_profiler,
+                        "eval": sg.run_eval_gate,
                     }[action]
                     data = fn()
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return
+
+        if action in {"drift", "breakers", "quota"}:
+            try:
+                resp = ipc_get(f"{base_url}/api/self/{action}", headers=hdrs, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                from .self_guard import SelfGuard
+
+                with Storage() as st:
+                    sg = SelfGuard(get_settings(), st)
+                    if action == "drift":
+                        data = sg.run_drift_audit()
+                    else:
+                        data = sg.get_resilience_status().get(
+                            "circuit_breaker" if action == "breakers" else "quota", {}
+                        )
             print(json.dumps(data, indent=2, ensure_ascii=False))
             return
 
@@ -1315,8 +1335,8 @@ def main() -> None:
     cortex_parser = sub.add_parser("cortex", help="Neural+Brain Cortex: status, dream cycle, predictive heal, habits, flow")
     cortex_parser.add_argument("cortex_action", nargs="?", default="status", choices=["status", "dream", "heal", "habits", "flow"])
     cortex_parser.add_argument("cortex_arg", nargs="?", default=None, help="Optional flow mode (deep_focus|meeting_media|idle_maintenance|normal|auto)")
-    self_parser = sub.add_parser("self", help="Self-Autopsy, Self-Canary, Self-Calibration, Self-Profiler, and Self-Skills")
-    self_parser.add_argument("self_action", nargs="?", default="status", choices=["status", "canary", "calibrate", "profile", "autopsy", "skills"])
+    self_parser = sub.add_parser("self", help="Self-Autopsy, Self-Canary, Self-Calibration, Self-Profiler, Eval, Drift, Breakers, Quota, and Self-Skills")
+    self_parser.add_argument("self_action", nargs="?", default="status", choices=["status", "canary", "calibrate", "profile", "autopsy", "skills", "eval", "drift", "breakers", "quota"])
 
     locale_override: str | None = None
     raw_argv = sys.argv[1:]

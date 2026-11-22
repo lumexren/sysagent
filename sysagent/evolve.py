@@ -152,6 +152,9 @@ class SelfEvolver:
         loop = asyncio.get_running_loop()
 
         async def _run_with_heartbeat(target_model: str, active_client: Any) -> str:
+            from .self_resilience import get_quota_governor
+
+            get_quota_governor().record_background_call("evolve", target_model)
             self.storage.record_model_request(target_model)
             task = asyncio.create_task(asyncio.to_thread(_call_with_client, active_client, target_model))
             task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
@@ -194,6 +197,10 @@ class SelfEvolver:
         except Exception as exc:
             msg = str(exc).lower()
             is_quota = "429" in msg or "resource_exhausted" in msg or "quota" in msg
+            if is_quota:
+                from .self_resilience import get_quota_governor
+
+                get_quota_governor().record_rate_limit(model)
             if is_quota and self.agent.auth.rotate_key():
                 await _detail(emit_event, f"Key rotated after rate limit on {model}, retrying...")
                 return await _run_with_heartbeat(model, self.agent._get_client())
@@ -398,6 +405,12 @@ class SelfEvolver:
             flow = getattr(cortex, "last_flow", None) or {}
             if flow.get("suppress_low_priority"):
                 return {"status": "deferred", "reason": f"cortex_flow:{flow.get('mode', 'focus')}"}
+        if not force:
+            from .self_resilience import get_quota_governor
+
+            allowed_q, q_reason = get_quota_governor().allow_background("evolve")
+            if not allowed_q:
+                return {"status": "deferred", "reason": q_reason}
         async with self._evolve_lock:
             prev_hash = self._last_codebase_hash
             try:

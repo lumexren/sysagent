@@ -569,6 +569,30 @@ async def api_self_profile() -> dict[str, Any]:
     return await asyncio.to_thread(self_guard.run_memory_profiler)
 
 
+@router.post("/api/self/eval")
+async def api_self_eval() -> dict[str, Any]:
+    return await asyncio.to_thread(self_guard.run_eval_gate)
+
+
+@router.get("/api/self/drift")
+async def api_self_drift() -> dict[str, Any]:
+    return await asyncio.to_thread(self_guard.run_drift_audit)
+
+
+@router.get("/api/self/breakers")
+async def api_self_breakers() -> dict[str, Any]:
+    from .self_resilience import get_circuit_breaker
+
+    return {"breakers": get_circuit_breaker().snapshot()}
+
+
+@router.get("/api/self/quota")
+async def api_self_quota() -> dict[str, Any]:
+    from .self_resilience import get_quota_governor
+
+    return get_quota_governor().get_status()
+
+
 @router.get("/api/prompts")
 async def api_list_prompts() -> dict[str, Any]:
     return {"prompts": PromptRegistry(storage).list_status()}

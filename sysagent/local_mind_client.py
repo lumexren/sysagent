@@ -110,7 +110,10 @@ class _LocalMindInteractions:
         new_id = f"local-{uuid.uuid4().hex[:10]}"
         on_delta = kwargs.pop("on_delta", None)
         sys_inst = system_instruction or ""
-        prev_hist = list(self._history.get(previous_interaction_id or "", []))
+        from .self_resilience import ContextBudgeter
+
+        raw_hist = list(self._history.get(previous_interaction_id or "", []))
+        prev_hist = ContextBudgeter.compact_history(raw_hist, max_chars=2400, keep_recent=4)
 
         if "Respond ONLY with valid JSON" in sys_inst or "Respond ONLY with JSON" in sys_inst:
             json_reply = '{"decision": "ignore", "confidence": 85, "thought": "Offline local mode: no critical action required."}'
@@ -137,7 +140,7 @@ class _LocalMindInteractions:
                 )
             if not reply:
                 reply = self.mind.synthesize_reply(orig_q, tool_results=input, system_instruction=sys_inst)
-            self._history[new_id] = (prev_hist + [{"role": "user", "content": orig_q}, {"role": "assistant", "content": reply}])[-8:]
+            self._history[new_id] = (raw_hist + [{"role": "user", "content": orig_q}, {"role": "assistant", "content": reply}])[-16:]
             return self._emit_text(new_id, reply, stream)
 
         user_text = str(input or "")
@@ -229,7 +232,7 @@ class _LocalMindInteractions:
 
         if not reply:
             reply = self.mind.synthesize_reply(user_text, tool_results=None, system_instruction=sys_inst)
-        self._history[new_id] = (prev_hist + [{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])[-8:]
+        self._history[new_id] = (raw_hist + [{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])[-16:]
         return self._emit_text(new_id, reply, stream)
 
 

@@ -111,6 +111,9 @@ class CognitiveBrain:
                 msg = str(exc)
                 if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower():
                     self._cooldown_until = time.monotonic() + 900
+                    from .self_resilience import get_quota_governor
+
+                    get_quota_governor().record_rate_limit("brain")
                 self.storage.add_brain_thought("ignore", 0, f"Brain cycle error: {exc}")
             backoff = min(4, self._consecutive_ignores)
             await asyncio.sleep(max(30, self.settings.brain_interval_sec) * (2**backoff if backoff else 1))
@@ -119,6 +122,12 @@ class CognitiveBrain:
         """Run one cognitive evaluation cycle. Returns summary dict."""
         if not force and time.monotonic() < self._cooldown_until:
             return {"status": "skipped", "reason": "quota_cooldown"}
+        if not force:
+            from .self_resilience import get_quota_governor
+
+            allowed_q, q_reason = get_quota_governor().allow_background("brain")
+            if not allowed_q:
+                return {"status": "deferred", "reason": q_reason}
 
         events = self.watcher.get_events(limit=15)
         notable = [
@@ -256,6 +265,9 @@ class CognitiveBrain:
             question = None
             suggested_rule = None
         else:
+            from .self_resilience import get_quota_governor
+
+            get_quota_governor().record_background_call("brain", self.settings.light_model)
             interaction = await self.agent.auth.call_interactions(
                 self.storage,
                 model=self.settings.light_model,

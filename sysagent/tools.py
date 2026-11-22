@@ -105,10 +105,18 @@ def execute_tool(
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(str(arguments["content"]), encoding="utf-8")
             storage.record_file_backup("write_file", str(p), existed, backup, batch_id=batch_id)
-            return json.dumps(
-                {"status": "ok", "path": str(p), "bytes": p.stat().st_size, "batch_id": batch_id},
-                ensure_ascii=False,
-            )
+            from .self_resilience import verify_written_file
+
+            res_obj: dict[str, Any] = {
+                "status": "ok",
+                "path": str(p),
+                "bytes": p.stat().st_size,
+                "batch_id": batch_id,
+            }
+            ver = verify_written_file(p)
+            if ver.get("kind") != "skipped":
+                res_obj["verification"] = ver
+            return json.dumps(res_obj, ensure_ascii=False)
 
         if name == "edit_file":
             p = _resolve(arguments["path"])
@@ -126,10 +134,19 @@ def execute_tool(
             updated = backup.replace(target, replacement)
             p.write_text(updated, encoding="utf-8")
             storage.record_file_backup("edit_file", str(p), True, backup, batch_id=batch_id)
-            return json.dumps(
-                {"status": "ok", "path": str(p), "replacements": count, "bytes": p.stat().st_size, "batch_id": batch_id},
-                ensure_ascii=False,
-            )
+            from .self_resilience import verify_written_file
+
+            res_obj = {
+                "status": "ok",
+                "path": str(p),
+                "replacements": count,
+                "bytes": p.stat().st_size,
+                "batch_id": batch_id,
+            }
+            ver = verify_written_file(p)
+            if ver.get("kind") != "skipped":
+                res_obj["verification"] = ver
+            return json.dumps(res_obj, ensure_ascii=False)
 
         if name == "list_directory":
             p = _resolve(arguments["path"])
