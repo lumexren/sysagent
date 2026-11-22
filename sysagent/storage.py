@@ -258,11 +258,25 @@ class Storage(_BrainStorageMixin):
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS session_checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    files_json TEXT NOT NULL DEFAULT '[]',
+                    commands_json TEXT NOT NULL DEFAULT '[]',
+                    decisions_json TEXT NOT NULL DEFAULT '[]',
+                    cwd TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_audit_undo ON audit_log(undone, action, batch_id);
                 CREATE INDEX IF NOT EXISTS idx_activity_bucket ON activity_log(hour_bucket, category);
                 CREATE INDEX IF NOT EXISTS idx_proposals_status ON evolve_proposals(status, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_prompts_key_active ON prompt_versions(prompt_key, active, version DESC);
+                CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, id DESC);
                 """
             )
             for alter_sql in (
@@ -500,7 +514,157 @@ class Storage(_BrainStorageMixin):
     def delete_session(self, session_id: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_checkpoints WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
+    @staticmethod
+    def _decode_checkpoint_row(row: sqlite3.Row) -> dict[str, Any]:
+        import json as _json
+
+        d = dict(row)
+        for col, out_k in (
+            ("files_json", "files"),
+            ("commands_json", "commands"),
+            ("decisions_json", "decisions"),
+        ):
+            raw = d.pop(col, "[]")
+            try:
+                val = _json.loads(raw)
+                d[out_k] = val if isinstance(val, list) else []
+            except Exception:
+                d[out_k] = []
+        return d
+
+    def save_session_checkpoint(
+        self,
+        session_id: str,
+        topic: str,
+        summary: str,
+        files: list[str] | None = None,
+        commands: list[str] | None = None,
+        decisions: list[str] | None = None,
+        cwd: str = "",
+        model: str = "",
+    ) -> int:
+        """Store a structured cross-session semantic checkpoint and prune beyond the latest 200 rows."""
+        import json as _json
+
+        files_l = [str(f)[:200] for f in (files or []) if str(f).strip()][:16]
+        cmds_l = [str(c)[:200] for c in (commands or []) if str(c).strip()][:12]
+        decs_l = [str(x)[:200] for x in (decisions or []) if str(x).strip()][:10]
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO session_checkpoints
+                (session_id, topic, summary, files_json, commands_json, decisions_json, cwd, model, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id.strip(),
+                    (topic or "").strip()[:160],
+                    (summary or "").strip()[:800],
+                    _json.dumps(files_l, ensure_ascii=False),
+                    _json.dumps(cmds_l, ensure_ascii=False),
+                    _json.dumps(decs_l, ensure_ascii=False),
+                    (cwd or "").strip()[:260],
+                    (model or "").strip()[:80],
+                    _now_iso(),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM session_checkpoints WHERE id NOT IN "
+                "(SELECT id FROM session_checkpoints ORDER BY id DESC LIMIT 200)"
+            )
+            return int(cur.lastrowid)
+
+    def list_session_checkpoints(
+        self, limit: int = 20, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List recent semantic checkpoints, optionally filtered by `session_id`."""
+        with self._lock, self._connect() as conn:
+            if session_id:
+                rows = conn.execute(
+                    "SELECT * FROM session_checkpoints WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                    (session_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM session_checkpoints ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [self._decode_checkpoint_row(r) for r in rows]
+
+    def search_session_checkpoints(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Search saved checkpoints across topic, summary, files, commands, and decisions."""
+        import re
+
+        q_low = " ".join((query or "").lower().split())
+        if not q_low:
+            return self.list_session_checkpoints(limit=limit)
+        q_tokens = set(re.findall(r"\w{2,}", q_low))
+        rows = self.list_session_checkpoints(limit=200)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        total_rows = max(1, len(rows))
+        q_tris = {t[i : i + 3] for t in q_tokens if len(t) >= 4 for i in range(len(t) - 2)}
+        for idx, cp in enumerate(rows):
+            hay = " ".join(
+                [
+                    str(cp.get("session_id") or ""),
+                    str(cp.get("topic") or ""),
+                    str(cp.get("summary") or ""),
+                    " ".join(cp.get("files") or []),
+                    " ".join(cp.get("commands") or []),
+                    " ".join(cp.get("decisions") or []),
+                    str(cp.get("cwd") or ""),
+                ]
+            ).lower()
+            if not hay.strip():
+                continue
+            score = 0.0
+            if q_low in hay:
+                score += 2.0
+            if q_low in str(cp.get("topic") or "").lower():
+                score += 1.5
+            hay_tokens = set(re.findall(r"\w{2,}", hay))
+            if q_tokens and hay_tokens:
+                score += (len(q_tokens & hay_tokens) / len(q_tokens)) * 2.5
+                if q_tris:
+                    h_tris = {t[i : i + 3] for t in hay_tokens if len(t) >= 4 for i in range(len(t) - 2)}
+                    if h_tris:
+                        score += (len(q_tris & h_tris) / len(q_tris)) * 1.2
+            if score > 0.15:
+                recency = (total_rows - idx) / total_rows * 0.25
+                scored.append((score + recency, cp))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        out: list[dict[str, Any]] = []
+        seen_sids: set[str] = set()
+        for _, cp in scored:
+            sid = str(cp.get("session_id") or "")
+            if sid in seen_sids:
+                continue
+            seen_sids.add(sid)
+            out.append(cp)
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
+    def format_checkpoint_context(cp: dict[str, Any] | None) -> str:
+        """Render a compact one-line working-memory summary from a session checkpoint dict."""
+        if not isinstance(cp, dict):
+            return ""
+        parts = [f"Topic: {cp.get('topic', '')}"]
+        if cp.get("cwd"):
+            parts.append(f"CWD: {cp['cwd']}")
+        if cp.get("files"):
+            parts.append(f"Files: {', '.join(str(x) for x in cp['files'][:6])}")
+        if cp.get("commands"):
+            parts.append(f"Commands: {', '.join(str(x) for x in cp['commands'][:4])}")
+        if cp.get("decisions"):
+            parts.append(f"Decisions: {'; '.join(str(x) for x in cp['decisions'][:4])}")
+        if cp.get("summary"):
+            parts.append(f"Summary: {str(cp['summary'])[:280]}")
+        return " | ".join(parts)
 
 
     def create_automation(

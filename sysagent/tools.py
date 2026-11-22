@@ -811,8 +811,8 @@ def execute_tool(
                 }
 
             if comp in {"local_mind", "self", "all"}:
-                from .local_inference import get_warm_model_name
-                from .local_mind import find_all_gguf_models
+                from .local_inference import get_runtime_memory_status
+                from .local_mind import find_all_gguf_models, find_gguf_model, find_mmproj_for_model
                 from .self_guard import get_calibration
                 from .self_learn import learn_status_summary, predict_user_routine
 
@@ -824,8 +824,16 @@ def execute_tool(
                     "shadow": lsum.get("shadow"),
                     "roadmap_top": (lsum.get("roadmap") or [])[:3],
                 }
+                rt_mem = get_runtime_memory_status()
+                mm_model = find_gguf_model("multimodal", strict=True) or find_gguf_model("multimodal")
+                mmproj_path = find_mmproj_for_model(mm_model)
                 out["local_mind"] = {
-                    "warm_model": get_warm_model_name(),
+                    "warm_model": rt_mem.get("warm_model"),
+                    "warm_idle_sec": rt_mem.get("idle_sec"),
+                    "hysteresis_sec": rt_mem.get("hysteresis_sec"),
+                    "vram": rt_mem.get("vram"),
+                    "vision_ready": bool(mm_model is not None and mmproj_path is not None),
+                    "mmproj_file": mmproj_path.name if mmproj_path is not None else None,
                     "backend": os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto"),
                     "installed_gguf": [p.name for p in find_all_gguf_models()[:6]],
                     "calibration": get_calibration(storage),

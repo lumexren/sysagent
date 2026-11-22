@@ -260,6 +260,84 @@ async def api_session_messages(session_id: str) -> dict[str, Any]:
     return {"messages": storage.get_messages(session_id)}
 
 
+@router.get("/api/checkpoints")
+async def api_checkpoints(q: str = "", limit: int = 12) -> dict[str, Any]:
+    lim = min(50, max(1, int(limit)))
+    if q.strip():
+        cps = await asyncio.to_thread(storage.search_session_checkpoints, q.strip(), lim)
+    else:
+        cps = await asyncio.to_thread(storage.list_session_checkpoints, lim)
+    return {"checkpoints": cps}
+
+
+@router.post("/api/sessions/resume")
+async def api_sessions_resume(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = body or {}
+    query = str(payload.get("query") or payload.get("topic") or "").strip()
+    req_sid = str(payload.get("session_id") or "").strip()
+
+    matched_sid: str | None = None
+    best_cp: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] = []
+
+    if req_sid:
+        sessions = await asyncio.to_thread(storage.list_sessions, 60)
+        matched_sid = next(
+            (s["session_id"] for s in sessions if s["session_id"] == req_sid),
+            None,
+        ) or next(
+            (s["session_id"] for s in sessions if s["session_id"].startswith(req_sid)),
+            None,
+        )
+
+    if matched_sid is None and query:
+        sessions = await asyncio.to_thread(storage.list_sessions, 60)
+        matched_sid = next(
+            (s["session_id"] for s in sessions if s["session_id"] == query or s["session_id"].startswith(query)),
+            None,
+        )
+        if matched_sid is None:
+            candidates = await asyncio.to_thread(storage.search_session_checkpoints, query, 5)
+            if candidates:
+                best_cp = candidates[0]
+                matched_sid = str(best_cp["session_id"])
+            else:
+                q_low = query.lower()
+                for s in sessions:
+                    if q_low in str(s.get("title") or "").lower():
+                        matched_sid = str(s["session_id"])
+                        break
+    elif matched_sid is None:
+        candidates = await asyncio.to_thread(storage.list_session_checkpoints, 5)
+        if candidates:
+            best_cp = candidates[0]
+            matched_sid = str(best_cp["session_id"])
+
+    if not matched_sid:
+        return {
+            "found": False,
+            "session_id": None,
+            "checkpoint": None,
+            "messages": [],
+            "context_preview": "",
+            "candidates": candidates,
+        }
+
+    if best_cp is None:
+        cp_rows = await asyncio.to_thread(storage.list_session_checkpoints, 1, matched_sid)
+        best_cp = cp_rows[0] if cp_rows else None
+    msgs = await asyncio.to_thread(storage.get_messages, matched_sid, 12)
+    preview = Storage.format_checkpoint_context(best_cp) if best_cp else ""
+    return {
+        "found": True,
+        "session_id": matched_sid,
+        "checkpoint": best_cp,
+        "messages": msgs,
+        "context_preview": preview,
+        "candidates": candidates,
+    }
+
+
 @router.get("/api/memories")
 async def api_memories() -> dict[str, Any]:
     return {"memories": storage.list_memories()}

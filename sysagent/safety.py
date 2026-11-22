@@ -405,6 +405,69 @@ def compute_dry_run_preview(tool_name: str, arguments: dict[str, Any]) -> str:
     return ""
 
 
+def compute_approval_diff(
+    tool_name: str, arguments: dict[str, Any], max_lines: int = 200
+) -> str:
+    """Compute a unified diff string for file/plugin-mutating approval prompts."""
+    import difflib
+    from pathlib import Path
+    from .config import DATA_DIR
+
+    orig = ""
+    new_txt = ""
+    label = "file"
+
+    if tool_name == "edit_file":
+        p = Path(str(arguments.get("path", ""))).expanduser()
+        label = p.name or "file"
+        target = str(arguments.get("target", ""))
+        replacement = str(arguments.get("replacement", ""))
+        if p.is_file():
+            orig_file = p.read_text(encoding="utf-8", errors="replace")
+            if target and target in orig_file:
+                orig = orig_file
+                new_txt = orig_file.replace(target, replacement)
+            else:
+                orig = target
+                new_txt = replacement
+        else:
+            orig = target
+            new_txt = replacement
+    elif tool_name == "write_file":
+        p = Path(str(arguments.get("path", ""))).expanduser()
+        label = p.name or "file"
+        orig = p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+        new_txt = str(arguments.get("content", ""))
+    elif tool_name == "forge_skill":
+        tname = str(arguments.get("tool_name", "")).strip()
+        label = f"{tname or 'skill'}.py"
+        p = DATA_DIR / "plugins" / label
+        orig = p.read_text(encoding="utf-8", errors="replace") if (tname and p.is_file()) else ""
+        new_txt = str(arguments.get("python_code", ""))
+    else:
+        return ""
+
+    if orig == new_txt:
+        return ""
+
+    diff_lines = list(
+        difflib.unified_diff(
+            orig.splitlines(),
+            new_txt.splitlines(),
+            fromfile=f"a/{label}",
+            tofile=f"b/{label}",
+            n=3,
+            lineterm="",
+        )
+    )
+    if not diff_lines:
+        return ""
+    if len(diff_lines) > max_lines:
+        extra = len(diff_lines) - max_lines
+        diff_lines = [*diff_lines[:max_lines], f"... (+{extra} more diff lines)"]
+    return "\n".join(diff_lines)
+
+
 # Commands that can run arbitrary code or destroy data: approving them 3 times must never silence the prompt.
 NEVER_AUTO_TRUST = frozenset(
     {

@@ -348,9 +348,13 @@ SEED_CURRICULUM: list[dict[str, Any]] = [
 from .local_inference import (
     _has_ram_for_gguf as _has_ram_for_gguf,
     _release_all_warm_models as _release_all_warm_models,
+    can_fit_gguf_model,
+    choose_model_with_hysteresis,
     ensure_llama_server,
     get_llama_cpp_model,
+    get_runtime_memory_status,
     get_warm_model_name,
+    get_warm_model_path,
     unload_idle_servers as unload_idle_servers,
 )
 
@@ -474,6 +478,96 @@ _ROLE_ALIASES: dict[str, set[str]] = {
     "multimodal": {"multimodal"},
     "embedding": {"embedding"},
 }
+
+
+_IMAGE_EXTS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+_GENERIC_GGUF_TOKENS: frozenset[str] = frozenset(
+    {"mmproj", "gguf", "q2", "q3", "q4", "q5", "q6", "q8", "k", "m", "s", "l", "f16", "bf16", "iq", "0"}
+)
+
+
+def _gguf_name_tokens(path: Path) -> set[str]:
+    stem = path.stem.lower()
+    parts = [p for p in re.split(r"[-_\s]+", stem) if p]
+    return {p for p in parts if p not in _GENERIC_GGUF_TOKENS and not (len(p) == 1 and p.isdigit())}
+
+
+def find_mmproj_for_model(gguf: Path | None) -> Path | None:
+    """Locate a matching `mmproj-*.gguf` vision projector for `gguf` in its folder or MODELS_DIR."""
+    if gguf is None:
+        return None
+    dirs: list[Path] = []
+    if gguf.parent.is_dir():
+        dirs.append(gguf.parent)
+    if MODELS_DIR.is_dir() and MODELS_DIR not in dirs:
+        dirs.append(MODELS_DIR)
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for d in dirs:
+        for p in sorted(d.glob("*.gguf")):
+            rp = p.resolve()
+            if rp not in seen and "mmproj" in p.name.lower() and p.is_file():
+                seen.add(rp)
+                candidates.append(p)
+    if not candidates:
+        return None
+
+    m_toks = _gguf_name_tokens(gguf)
+    best: Path | None = None
+    best_score = 0
+    for cand in candidates:
+        score = len(m_toks & _gguf_name_tokens(cand))
+        if score > best_score:
+            best_score = score
+            best = cand
+    if best is not None and best_score >= 2:
+        return best
+    if classify_gguf_role(gguf) == "multimodal" and len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def extract_inline_images(
+    text: str, max_images: int = 3, max_bytes: int = 4 * 1024 * 1024
+) -> tuple[str, list[dict[str, str]]]:
+    """Extract `[Attached image `<path>`]` attachments into base64 payloads for vision GGUF inference."""
+    import base64
+    import mimetypes
+
+    raw = text or ""
+    if "[Attached image `" not in raw:
+        return raw, []
+    images: list[dict[str, str]] = []
+    seen: set[Path] = set()
+    for match in re.finditer(r"\[Attached image `([^`]+)`\]", raw):
+        if len(images) >= max_images:
+            break
+        try:
+            p = Path(match.group(1)).expanduser().resolve()
+        except Exception:
+            continue
+        if p in seen or not p.is_file():
+            continue
+        if p.suffix.lower() not in _IMAGE_EXTS:
+            continue
+        try:
+            data = p.read_bytes()
+        except Exception:
+            continue
+        if not data or len(data) > max_bytes:
+            continue
+        seen.add(p)
+        mime, _ = mimetypes.guess_type(str(p))
+        if not mime or not mime.startswith("image/"):
+            mime = "image/png"
+        images.append(
+            {
+                "path": str(p),
+                "mime_type": mime,
+                "data": base64.b64encode(data).decode("ascii"),
+            }
+        )
+    return raw, images
 
 
 def find_gguf_model(preferred_role: str | None = None, strict: bool = False) -> Path | None:
@@ -947,6 +1041,9 @@ class LocalMind:
                 )
             except Exception:
                 pass
+        mm_model = find_gguf_model("multimodal", strict=True) or find_gguf_model("multimodal")
+        mmproj_path = find_mmproj_for_model(mm_model)
+        rt_mem = get_runtime_memory_status()
         return {
             "weights_file": str(WEIGHTS_FILE),
             "dataset_file": str(DISTILLED_FILE),
@@ -972,7 +1069,64 @@ class LocalMind:
             "llama_finetune_available": bool(shutil.which("llama-finetune")),
             "lora_status": self.weights.get("lora_status", "none"),
             "warm_model": get_warm_model_name(),
+            "vision_ready": bool(mm_model is not None and mmproj_path is not None),
+            "mmproj_file": mmproj_path.name if mmproj_path is not None else None,
+            "runtime": rt_mem,
             "neural": self._neural_status(),
+        }
+
+    def prewarm_for_routine(self, watcher: Any = None, cortex: Any = None) -> dict[str, Any]:
+        """Preload the likely GGUF specialist model if user routine and free VRAM/RAM headroom permit."""
+        if os.environ.get("SYSAGENT_ROUTINE_PRELOAD", "true").strip().lower() in {"0", "false", "no", "off"}:
+            return {"status": "disabled"}
+        if cortex is not None:
+            flow = getattr(cortex, "last_flow", None) or {}
+            mode = str(flow.get("mode") or "normal")
+            if flow.get("suppress_low_priority") or mode in {"deep_focus", "meeting_media"}:
+                return {"status": "deferred", "reason": f"cortex_flow:{mode}"}
+        warm = get_warm_model_path()
+        if warm is not None:
+            return {"status": "kept_warm", "model": warm.name}
+        if self.storage is None:
+            return {"status": "skipped", "reason": "no_storage"}
+
+        from .self_learn import predict_user_routine
+
+        routine = predict_user_routine(self.storage)
+        if not routine:
+            return {"status": "skipped", "reason": "no_routine"}
+        role = str(routine.get("likely_role") or "general")
+        top_app = str(routine.get("top_app") or "").lower()
+        if role == "general" and any(
+            k in top_app for k in ("code", "cursor", "nvim", "vim", "pycharm", "kitty", "alacritty", "konsole", "tmux")
+        ):
+            role = "coding"
+
+        if watcher is not None and hasattr(watcher, "get_health_snapshot"):
+            try:
+                snap = watcher.get_health_snapshot() or {}
+                if float(snap.get("cpu_percent", 0.0) or 0.0) >= 65.0:
+                    return {"status": "deferred", "reason": "high_cpu"}
+            except Exception:
+                pass
+
+        cand = find_gguf_model(role, strict=True) or find_gguf_model(role)
+        if cand is None:
+            return {"status": "skipped", "reason": f"no_model:{role}"}
+        mm = find_mmproj_for_model(cand) if role == "multimodal" else None
+        fit_ok, fit_mode = can_fit_gguf_model(cand, mmproj=mm, min_ram_gb=3.0, min_vram_headroom_mb=768)
+        if not (fit_ok and fit_mode in {"full_vram", "ram_only"}):
+            return {
+                "status": "skipped",
+                "reason": fit_mode if not fit_ok else f"fit:{fit_mode}",
+                "model": cand.name,
+            }
+        srv = self._ensure_llama_server(cand, mmproj=mm)
+        return {
+            "status": "prewarmed" if srv else "failed",
+            "model": cand.name,
+            "role": role,
+            "fit_mode": fit_mode,
         }
 
     def _neural_status(self) -> dict[str, Any]:
@@ -1569,9 +1723,9 @@ class LocalMind:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [it for _, it in scored[:top_k]]
 
-    def _ensure_llama_server(self, gguf: Path) -> str | None:
+    def _ensure_llama_server(self, gguf: Path, mmproj: Path | None = None) -> str | None:
         """Lazily start or reuse a warm `llama-server` process on 127.0.0.1:8769 for fast GPU inference."""
-        return ensure_llama_server(gguf)
+        return ensure_llama_server(gguf, mmproj=mmproj)
 
     def _get_llama_cpp_model(self, gguf: Path) -> Any | None:
         """Lazily load and cache a llama_cpp.Llama instance with full GPU offload."""
@@ -1584,7 +1738,8 @@ class LocalMind:
         system_instruction: str = "",
         history: list[dict[str, str]] | None = None,
         extra_system: str = "",
-    ) -> tuple[str, list[dict[str, str]]]:
+        images: list[dict[str, str]] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
         examples = self.retrieve_similar_examples(prompt, top_k=2) if not extra_system else []
         role_hint = ""
         if ROLE_ADAPTERS_FILE.is_file():
@@ -1624,13 +1779,26 @@ class LocalMind:
             sys_msg = "\n".join(
                 p for p in (base_sys, role_hint, ctx_hint, extra_system.strip(), ex_block.strip()[:500]) if p
             )
-        messages: list[dict[str, str]] = [{"role": "system", "content": sys_msg}]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": sys_msg}]
         for turn in (history or [])[-6:]:
             r = str(turn.get("role") or "")
             c = str(turn.get("content") or "").strip()
             if r in {"user", "assistant"} and c:
                 messages.append({"role": r, "content": c[:800]})
-        messages.append({"role": "user", "content": prompt.strip()})
+        if images:
+            content_parts: list[dict[str, Any]] = [
+                {"type": "text", "text": prompt.strip() or "Analyze the attached image(s)."}
+            ]
+            for img in images:
+                b64 = str(img.get("data") or "").strip()
+                mime = str(img.get("mime_type") or "image/png").strip() or "image/png"
+                if b64:
+                    content_parts.append(
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                    )
+            messages.append({"role": "user", "content": content_parts})
+        else:
+            messages.append({"role": "user", "content": prompt.strip()})
         return sys_msg, messages
 
     def _run_single_gguf(
@@ -1640,18 +1808,25 @@ class LocalMind:
         system_instruction: str = "",
         history: list[dict[str, str]] | None = None,
         extra_system: str = "",
+        mmproj: Path | None = None,
+        images: list[dict[str, str]] | None = None,
     ) -> str | None:
         import httpx
 
         sys_msg, messages = self._build_gguf_messages(
-            gguf, prompt, system_instruction, history=history, extra_system=extra_system
+            gguf,
+            prompt,
+            system_instruction,
+            history=history,
+            extra_system=extra_system,
+            images=images,
         )
 
         def _try_server() -> str | None:
             from .local_inference import inference_lock, touch_warm_model
 
             with inference_lock():
-                srv_url = self._ensure_llama_server(gguf)
+                srv_url = self._ensure_llama_server(gguf, mmproj=mmproj)
                 if not srv_url:
                     return None
                 try:
@@ -1739,7 +1914,9 @@ class LocalMind:
             return None
 
         backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
-        if backend in {"llama_cpp", "llama-cpp", "python"}:
+        if images:
+            order: tuple[Any, ...] = (_try_server,)
+        elif backend in {"llama_cpp", "llama-cpp", "python"}:
             order = (_try_llama_cpp, _try_server, _try_cli)
         elif backend in {"llama_cli", "llama-cli", "cli"}:
             order = (_try_cli, _try_server)
@@ -1759,21 +1936,38 @@ class LocalMind:
         preferred_role: str | None = None,
         history: list[dict[str, str]] | None = None,
         extra_system: str = "",
+        images: list[dict[str, str]] | None = None,
     ) -> str | None:
         """Run fast single-pass local GPU-accelerated GGUF inference via task-routed specialists."""
         models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
         if not models:
             return None
-        target_role = preferred_role or classify_task_role(prompt, storage=self.storage)
-        specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
+        if images:
+            target_role = "multimodal"
+            specialist = (
+                find_gguf_model("multimodal", strict=True)
+                or find_gguf_model("multimodal")
+                or models[0]
+            )
+            mmproj = find_mmproj_for_model(specialist)
+        else:
+            target_role = preferred_role or classify_task_role(prompt, storage=self.storage)
+            specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
+            if preferred_role is None:
+                specialist, _ = choose_model_with_hysteresis(
+                    specialist, target_role, prompt, classify_gguf_role
+                )
+            mmproj = find_mmproj_for_model(specialist) if classify_gguf_role(specialist) == "multimodal" else None
         final_out = self._run_single_gguf(
             specialist,
             prompt,
             system_instruction,
             history=history,
             extra_system=extra_system,
+            mmproj=mmproj,
+            images=images,
         )
-        if not final_out:
+        if not final_out and not images:
             fallback = (
                 find_gguf_model("chat", strict=True)
                 or find_gguf_model("general", strict=True)
@@ -1802,6 +1996,7 @@ class LocalMind:
         history: list[dict[str, str]] | None = None,
         extra_system: str = "",
         on_delta: Callable[[str], None] | None = None,
+        images: list[dict[str, str]] | None = None,
     ) -> str | None:
         """Stream visible tokens live from warm llama-server SSE while suppressing <think> blocks."""
         if on_delta is None:
@@ -1811,23 +2006,43 @@ class LocalMind:
                 preferred_role=preferred_role,
                 history=history,
                 extra_system=extra_system,
+                images=images,
             )
         models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
         if not models:
             return None
-        target_role = preferred_role or classify_task_role(prompt, storage=self.storage)
-        specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
+        if images:
+            target_role = "multimodal"
+            specialist = (
+                find_gguf_model("multimodal", strict=True)
+                or find_gguf_model("multimodal")
+                or models[0]
+            )
+            mmproj = find_mmproj_for_model(specialist)
+        else:
+            target_role = preferred_role or classify_task_role(prompt, storage=self.storage)
+            specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
+            if preferred_role is None:
+                specialist, _ = choose_model_with_hysteresis(
+                    specialist, target_role, prompt, classify_gguf_role
+                )
+            mmproj = find_mmproj_for_model(specialist) if classify_gguf_role(specialist) == "multimodal" else None
         backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
         if backend not in {"llama_cli", "llama-cli", "cli", "llama_cpp", "llama-cpp", "python"}:
             from .local_inference import inference_lock, touch_warm_model
 
             with inference_lock():
-                srv_url = self._ensure_llama_server(specialist)
+                srv_url = self._ensure_llama_server(specialist, mmproj=mmproj)
                 if srv_url:
                     import httpx
 
                     _, messages = self._build_gguf_messages(
-                        specialist, prompt, system_instruction, history=history, extra_system=extra_system
+                        specialist,
+                        prompt,
+                        system_instruction,
+                        history=history,
+                        extra_system=extra_system,
+                        images=images,
                     )
                     filt = _ThinkStreamFilter()
                     collected: list[str] = []
@@ -1898,6 +2113,7 @@ class LocalMind:
             preferred_role=preferred_role,
             history=history,
             extra_system=extra_system,
+            images=images,
         )
         if fallback_out:
             on_delta(fallback_out)
@@ -1911,6 +2127,7 @@ class LocalMind:
         preferred_role: str | None = None,
         history: list[dict[str, str]] | None = None,
         on_delta: Callable[[str], None] | None = None,
+        images: list[dict[str, str]] | None = None,
     ) -> dict[str, Any] | None:
         """Run native OpenAI-compatible function calling (`tool_choice=auto`) on warm llama-server."""
         backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
@@ -1920,12 +2137,20 @@ class LocalMind:
         if not models:
             return None
 
-        if preferred_role:
+        if images:
+            specialist = (
+                find_gguf_model("multimodal", strict=True)
+                or find_gguf_model("multimodal")
+                or models[0]
+            )
+            mmproj = find_mmproj_for_model(specialist)
+        elif preferred_role:
             specialist = (
                 find_gguf_model(preferred_role, strict=True)
                 or find_gguf_model("general", strict=True)
                 or models[0]
             )
+            mmproj = find_mmproj_for_model(specialist) if classify_gguf_role(specialist) == "multimodal" else None
         else:
             role_guess = classify_task_role(prompt, storage=self.storage)
             if role_guess in {"coding", "multimodal"}:
@@ -1941,6 +2166,10 @@ class LocalMind:
                     or find_gguf_model("chat", strict=True)
                     or models[0]
                 )
+            specialist, _ = choose_model_with_hysteresis(
+                specialist, role_guess, prompt, classify_gguf_role
+            )
+            mmproj = find_mmproj_for_model(specialist) if classify_gguf_role(specialist) == "multimodal" else None
 
         oai_tools = [
             {
@@ -1956,13 +2185,18 @@ class LocalMind:
         ]
         allowed_names = {str(t["function"]["name"]) for t in oai_tools}
         _, messages = self._build_gguf_messages(
-            specialist, prompt, system_instruction, history=history, extra_system=""
+            specialist,
+            prompt,
+            system_instruction,
+            history=history,
+            extra_system="",
+            images=images,
         )
 
         from .local_inference import inference_lock, touch_warm_model
 
         with inference_lock():
-            srv_url = self._ensure_llama_server(specialist)
+            srv_url = self._ensure_llama_server(specialist, mmproj=mmproj)
             if not srv_url:
                 return None
 
@@ -2099,6 +2333,22 @@ class LocalMind:
         low = msg.lower()
         models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
         if not models:
+            return None
+
+        _, inline_imgs = extract_inline_images(msg)
+        if inline_imgs:
+            vision_model = find_gguf_model("multimodal", strict=True) or find_gguf_model("multimodal")
+            mmproj = find_mmproj_for_model(vision_model)
+            if vision_model is not None and mmproj is not None:
+                v_reply = self._run_single_gguf(
+                    vision_model,
+                    msg,
+                    system_instruction,
+                    mmproj=mmproj,
+                    images=inline_imgs,
+                )
+                if v_reply and len(v_reply.strip()) >= 4:
+                    return {"tier": "local:multimodal", "model": vision_model.name, "reply": v_reply}
             return None
 
         role = classify_task_role(msg)

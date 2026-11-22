@@ -512,6 +512,14 @@ class SelfMonitor:
             pruned_synapses = eng.prune_weak_synapses()
         except Exception:
             pass
+        routine_prewarm: dict[str, Any] = {"status": "skipped"}
+        try:
+            if not unloaded_vram and neural_world.get("proactive_hint") != "unload_idle_vram":
+                routine_prewarm = mind.prewarm_for_routine(
+                    watcher=self.watcher, cortex=getattr(self, "cortex", None)
+                )
+        except Exception:
+            pass
         self_guard_res: dict[str, Any] = {}
         sg = getattr(self, "self_guard", None)
         if sg is not None:
@@ -538,6 +546,7 @@ class SelfMonitor:
             "auto_coverage_added": auto_cov.get("added", 0),
             "shadow": shadow,
             "neural_world": neural_world,
+            "routine_prewarm": routine_prewarm,
             "assoc_synced": assoc_synced,
             "pruned_synapses": pruned_synapses,
             "batch_resolved": batch_resolved,

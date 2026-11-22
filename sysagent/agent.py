@@ -247,6 +247,43 @@ class AgentManager:
             if not had_failure and len(tool_calls) >= 2:
                 self.storage.record_workflow(user_message[:140], tool_calls)
 
+            if tool_calls or len(user_message.strip()) >= 24:
+                try:
+                    import re as _re
+
+                    touched_files: list[str] = []
+                    run_cmds: list[str] = []
+                    for tc in tool_calls:
+                        tname = str(tc.get("name") or "")
+                        targs = tc.get("arguments") or {}
+                        if isinstance(targs, dict):
+                            fpath = targs.get("path")
+                            if fpath and str(fpath) not in touched_files:
+                                touched_files.append(str(fpath))
+                            cmd_v = targs.get("command")
+                            if tname == "run_command" and cmd_v and str(cmd_v) not in run_cmds:
+                                run_cmds.append(str(cmd_v)[:140])
+                    cwd_m = _re.match(
+                        r"^\[cwd:\s*([^\]]+)\]\s*(.*)$", user_message.strip(), flags=_re.DOTALL
+                    )
+                    cp_cwd = cwd_m.group(1).strip() if cwd_m else ""
+                    clean_msg = (cwd_m.group(2) if cwd_m else user_message).strip()
+                    cp_topic = " ".join(clean_msg.split())[:100] or "Session turn"
+                    cp_summary = " ".join((assistant_reply or "").split())[:280]
+                    cp_model = self._session_models.get(session_id, "")
+                    self.storage.save_session_checkpoint(
+                        session_id=session_id,
+                        topic=cp_topic,
+                        summary=cp_summary,
+                        files=touched_files,
+                        commands=run_cmds,
+                        decisions=[t.get("name", "") for t in tool_calls[:5] if t.get("name")],
+                        cwd=cp_cwd,
+                        model=cp_model,
+                    )
+                except Exception:
+                    pass
+
             if (
                 len(user_message.strip()) < 18
                 or assistant_reply.startswith("[Local Offline Mode]")
@@ -537,6 +574,15 @@ class AgentManager:
             )
         except Exception:
             pass
+        if not prev_id:
+            try:
+                cps = self.storage.list_session_checkpoints(limit=1, session_id=session_id)
+                if cps:
+                    cp_ctx = Storage.format_checkpoint_context(cps[0])
+                    if cp_ctx:
+                        system_instruction += f"\nActive session checkpoint:\n{cp_ctx}\n"
+            except Exception:
+                pass
         self.storage.upsert_session(session_id, prev_id, title=user_message[:60])
         self.storage.add_message(session_id, "user", user_message)
         self.storage.record_activity("prompt", user_message[:80])
@@ -655,8 +701,9 @@ class AgentManager:
                     )
                     loc = locale or self.settings.locale
                     preview = compute_dry_run_preview(call.name, args)
-                    from .safety import neural_risk_note
+                    from .safety import compute_approval_diff, neural_risk_note
 
+                    diff_text = compute_approval_diff(call.name, args)
                     n_warn = neural_risk_note(call.name, args, self.storage)
                     parts_body = [assessment.reason]
                     if preview:
@@ -688,6 +735,7 @@ class AgentManager:
                                 "reason": assessment.reason,
                                 "risk_level": assessment.risk_level,
                                 "preview": preview,
+                                "diff": diff_text,
                             }
                         )
                     try:

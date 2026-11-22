@@ -108,8 +108,37 @@ def _read_clipboard_text() -> str:
     return ""
 
 
+_IMAGE_ATTACH_EXTS: frozenset[str] = frozenset(
+    {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+)
+
+
+def _format_colored_diff(diff_text: str, max_lines: int | None = None) -> tuple[str, int]:
+    """Colorize a unified diff string for terminal display and return `(rendered, hidden_lines)`."""
+    lines = (diff_text or "").splitlines()
+    if not lines:
+        return "", 0
+    hidden = 0
+    if max_lines is not None and len(lines) > max_lines:
+        hidden = len(lines) - max_lines
+        lines = lines[:max_lines]
+    rendered: list[str] = []
+    for ln in lines:
+        if ln.startswith(("+++", "---")):
+            rendered.append(f"  \033[1m{ln}\033[0m")
+        elif ln.startswith("@@"):
+            rendered.append(f"  \033[36m{ln}\033[0m")
+        elif ln.startswith("+"):
+            rendered.append(f"  \033[32m{ln}\033[0m")
+        elif ln.startswith("-"):
+            rendered.append(f"  \033[31m{ln}\033[0m")
+        else:
+            rendered.append(f"  \033[90m{ln}\033[0m")
+    return "\n".join(rendered), hidden
+
+
 def _expand_at_paths(text: str, cwd: Path, max_lines: int = 120) -> tuple[str, list[str]]:
-    """Expand @path tokens in user prompts into attached file snippets or directory listings."""
+    """Expand @path tokens in user prompts into attached file snippets, image markers, or directory listings."""
     pattern = re.compile(r"(?<!\S)@([^\s,;'\"]+)")
     matches = list(pattern.finditer(text or ""))
     if not matches:
@@ -126,6 +155,10 @@ def _expand_at_paths(text: str, cwd: Path, max_lines: int = 120) -> tuple[str, l
             continue
         if target.is_file():
             seen.add(target)
+            if target.suffix.lower() in _IMAGE_ATTACH_EXTS:
+                attachments.append(f"[Attached image `{target}`]")
+                labels.append(raw_p)
+                continue
             try:
                 all_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
                 head = "\n".join(all_lines[:max_lines])
@@ -273,10 +306,21 @@ async def _send_and_stream(
                         )
                         if event.get("preview"):
                             print(f"\033[90m  Preview: {event['preview']}\033[0m")
+                        diff_raw = str(event.get("diff") or "")
+                        show_full_diff = False
+                        if diff_raw:
+                            rendered_diff, hidden_cnt = _format_colored_diff(diff_raw, max_lines=16)
+                            if rendered_diff:
+                                print(rendered_diff)
+                            if hidden_cnt > 0:
+                                print(
+                                    f"\033[90m  (... +{hidden_cnt} more lines, type 'd' to toggle full diff)\033[0m"
+                                )
+                        confirm_prompt = t("cli_confirm_diff" if diff_raw else "cli_confirm", loc)
                         _flush_stdin()
                         stop_stdin = threading.Event()
                         stdin_task = asyncio.create_task(
-                            asyncio.to_thread(_read_line_cancelable, t("cli_confirm", loc), stop_stdin)
+                            asyncio.to_thread(_read_line_cancelable, confirm_prompt, stop_stdin)
                         )
                         ws_task = asyncio.create_task(ws.recv())
                         while True:
@@ -284,12 +328,28 @@ async def _send_and_stream(
                                 {stdin_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
                             )
                             if stdin_task in done:
+                                ans = (stdin_task.result() or "").strip().lower()
+                                if ans in {"d", "diff"} and diff_raw:
+                                    show_full_diff = not show_full_diff
+                                    limit = None if show_full_diff else 16
+                                    rendered_diff, hidden_cnt = _format_colored_diff(diff_raw, max_lines=limit)
+                                    if rendered_diff:
+                                        print(rendered_diff)
+                                    if hidden_cnt > 0:
+                                        print(
+                                            f"\033[90m  (... +{hidden_cnt} more lines, type 'd' to toggle full diff)\033[0m"
+                                        )
+                                    _flush_stdin()
+                                    stop_stdin = threading.Event()
+                                    stdin_task = asyncio.create_task(
+                                        asyncio.to_thread(_read_line_cancelable, confirm_prompt, stop_stdin)
+                                    )
+                                    continue
                                 ws_task.cancel()
                                 try:
                                     await ws_task
                                 except BaseException:
                                     pass
-                                ans = (stdin_task.result() or "").strip().lower()
                                 yes_set = set(t("cli_yes_tokens", loc).split(","))
                                 approved = ans in yes_set
                                 await ws.send(
@@ -539,9 +599,35 @@ def _short_cwd(cwd: Path) -> str:
         return str(cwd)
 
 
-async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
+def record_last_shell_error(
+    command: str, exit_code: int, cwd: str, stderr_text: str = ""
+) -> Path:
+    """Persist the latest failed terminal command and trailing stderr lines for `sysagent fix`."""
+    from datetime import datetime
+
+    err_file = DATA_DIR / "last_error.json"
+    err_file.parent.mkdir(parents=True, exist_ok=True)
+    stderr_clean = "\n".join((stderr_text or "").splitlines()[-30:])[-2500:]
+    payload = {
+        "command": str(command or "").strip()[:1000],
+        "exit_code": int(exit_code or 1),
+        "cwd": str(cwd or "."),
+        "stderr": stderr_clean,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    tmp = err_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, err_file)
+    return err_file
+
+
+async def _interactive_chat(
+    base_url: str,
+    locale: str | None = None,
+    initial_session_id: str | None = None,
+) -> None:
     settings = get_settings()
-    session_id = _load_last_session_id()
+    session_id = initial_session_id or _load_last_session_id()
     agent_lbl = settings.agent_name.lower()
     cwd = Path.cwd()
     hist_file = _setup_shell_readline(get_cwd=lambda: cwd)
@@ -577,9 +663,20 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
             if raw_line.startswith("!") and low != "!clip":
                 cmd = raw_line[1:].strip()
                 if cmd:
-                    proc = await asyncio.to_thread(subprocess.run, cmd, shell=True, cwd=str(cwd))
+                    proc = await asyncio.to_thread(
+                        subprocess.run,
+                        cmd,
+                        shell=True,
+                        cwd=str(cwd),
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    if proc.stderr:
+                        sys.stderr.write(proc.stderr)
+                        sys.stderr.flush()
                     if proc.returncode != 0:
                         print(f"\033[31m[exit {proc.returncode}]\033[0m")
+                        record_last_shell_error(cmd, proc.returncode, str(cwd), proc.stderr or "")
                 continue
 
             if raw_line == "cd" or raw_line.startswith("cd "):
@@ -690,30 +787,58 @@ async def _interactive_chat(base_url: str, locale: str | None = None) -> None:
                         print(f"\033[31m{exc}\033[0m")
                 elif cmd == "/resume":
                     if len(parts) < 2:
-                        print("\033[33mUsage: /resume <session_id_or_prefix>\033[0m")
+                        print("\033[33mUsage: /resume <session_id_or_topic>\033[0m")
                         continue
-                    prefix = parts[1].strip()
+                    query_txt = " ".join(parts[1:]).strip()
                     try:
-                        resp_sl = await asyncio.to_thread(
-                            ipc_get, f"{base_url}/api/sessions", headers=_auth_headers(), timeout=5
-                        )
-                        resp_sl.raise_for_status()
-                        sessions = resp_sl.json().get("sessions") or []
-                        match = next(
-                            (s["session_id"] for s in sessions if s["session_id"] == prefix or s["session_id"].startswith(prefix)),
-                            None,
-                        )
-                        if not match:
-                            print(f"\033[33mNo session matching '{prefix}'. Use /sessions to list.\033[0m")
-                            continue
+                        res_data: dict[str, object] | None = None
+                        try:
+                            resp_res = await asyncio.to_thread(
+                                ipc_post,
+                                f"{base_url}/api/sessions/resume",
+                                json={"query": query_txt},
+                                headers=_auth_headers(),
+                                timeout=5,
+                            )
+                            resp_res.raise_for_status()
+                            res_data = resp_res.json()
+                        except Exception:
+                            res_data = None
+                        if not res_data or not res_data.get("found"):
+                            resp_sl = await asyncio.to_thread(
+                                ipc_get, f"{base_url}/api/sessions", headers=_auth_headers(), timeout=5
+                            )
+                            resp_sl.raise_for_status()
+                            sessions = resp_sl.json().get("sessions") or []
+                            match = next(
+                                (
+                                    s["session_id"]
+                                    for s in sessions
+                                    if s["session_id"] == query_txt or s["session_id"].startswith(query_txt)
+                                ),
+                                None,
+                            )
+                            if not match:
+                                print(f"\033[33mNo session matching '{query_txt}'. Use /sessions to list.\033[0m")
+                                continue
+                            resp_m = await asyncio.to_thread(
+                                ipc_get,
+                                f"{base_url}/api/sessions/{match}/messages",
+                                headers=_auth_headers(),
+                                timeout=5,
+                            )
+                            resp_m.raise_for_status()
+                            msgs = resp_m.json().get("messages") or []
+                            ctx_prev = ""
+                        else:
+                            match = str(res_data["session_id"])
+                            msgs = list(res_data.get("messages") or [])
+                            ctx_prev = str(res_data.get("context_preview") or "")
                         session_id = match
                         _save_last_session_id(session_id)
-                        resp_m = await asyncio.to_thread(
-                            ipc_get, f"{base_url}/api/sessions/{session_id}/messages", headers=_auth_headers(), timeout=5
-                        )
-                        resp_m.raise_for_status()
-                        msgs = resp_m.json().get("messages") or []
                         print(f"\033[1;36mResumed {session_id}\033[0m ({len(msgs)} messages):")
+                        if ctx_prev:
+                            print(f"  \033[36m[Checkpoint]\033[0m {ctx_prev}")
                         for m in msgs[-4:]:
                             snippet = " ".join(str(m.get("content") or "").split())[:100]
                             print(f"  \033[90m{m.get('role')}: {snippet}\033[0m")
@@ -1107,69 +1232,283 @@ async def _quick_launcher(base_url: str, locale: str | None = None) -> None:
             print(reply_text)
 
 
-def _cmd_hook() -> None:
-    err_file = DATA_DIR / "last_error.json"
-    print(f"""# Add this to ~/.bashrc or ~/.zshrc:
-_sysagent_err_hook() {{
-  local ec=$?
-  if [ $ec -ne 0 ]; then
-    local last_cmd
-    last_cmd=$(fc -ln -1 2>/dev/null | sed 's/^[[:space:]]*//')
-    mkdir -p "{DATA_DIR}"
-    printf '{{"exit_code":%d,"command":"%s","cwd":"%s"}}\\n' "$ec" "${{last_cmd//\\"/\\\\\\"}}" "$PWD" > "{err_file}"
-  fi
-}}
-PROMPT_COMMAND="_sysagent_err_hook${{PROMPT_COMMAND:+; $PROMPT_COMMAND}}"
-alias fix="{_prog_name()} fix"
-""")
+def _resolve_hook_shell(shell: str = "auto") -> str:
+    """Resolve `auto` to `zsh` or `bash` based on `$SHELL`."""
+    sh = (shell or "auto").strip().lower()
+    if sh in {"zsh", "bash"}:
+        return sh
+    return "zsh" if "zsh" in os.environ.get("SHELL", "").lower() else "bash"
 
 
-def _prepare_fix_prompt(locale: str | None = None) -> str | None:
-    loc = locale or get_settings().locale
-    err_file = DATA_DIR / "last_error.json"
-    if not err_file.exists():
-        print(t("cli_no_last_error", loc), file=sys.stderr)
-        return None
-    try:
-        data = json.loads(err_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        raw = err_file.read_text(encoding="utf-8", errors="replace")
-        data = {"command": raw.strip(), "exit_code": 1, "cwd": "."}
-    cmd_str = str(data.get("command") or "")
-    exit_code = int(data.get("exit_code") or 1)
-    try:
-        from .self_guard import match_cached_fix
-        from .storage import Storage
-
-        with Storage() as st:
-            hit = match_cached_fix(st, cmd_str, exit_code)
-        if hit is not None:
-            print(f"[0-token fix memory | match {int(hit['score'] * 100)}%] ({hit['topic']})")
-            print(hit["lesson"])
-            return ""
-    except Exception:
-        pass
+def _render_shell_hook(shell: str = "auto") -> str:
+    """Render the Bash or Zsh error-capturing hook with safe `--record` JSON logging and `srun` stderr capture."""
+    target_shell = _resolve_hook_shell(shell)
+    cli_bin = _prog_name()
+    stderr_log = DATA_DIR / "last_stderr.log"
+    if target_shell == "zsh":
+        return (
+            f"# Add this to ~/.zshrc (or run `{cli_bin} hook zsh --install`):\n"
+            "autoload -Uz add-zsh-hook\n"
+            "_sysagent_preexec() {\n"
+            '  _SYSAGENT_LAST_CMD="$1"\n'
+            "}\n"
+            "_sysagent_err_hook() {\n"
+            "  local ec=$?\n"
+            '  if [ $ec -ne 0 ] && [ -n "$_SYSAGENT_LAST_CMD" ]; then\n'
+            f'    command {cli_bin} hook --record "$ec" "$PWD" "$_SYSAGENT_LAST_CMD" 2>/dev/null || true\n'
+            "  fi\n"
+            '  _SYSAGENT_LAST_CMD=""\n'
+            "}\n"
+            "add-zsh-hook preexec _sysagent_preexec\n"
+            "add-zsh-hook precmd _sysagent_err_hook\n"
+            f'srun() {{ "$@" 2> >(tee "{stderr_log}" >&2); }}\n'
+            f'alias fix="{cli_bin} fix"\n'
+        )
     return (
-        f"The user's last shell command failed in `{data.get('cwd')}` with exit code {exit_code}:\n"
-        f"`{cmd_str}`\n"
-        "Explain why it likely failed and suggest (or run if safe/approved) the fix."
+        f"# Add this to ~/.bashrc (or run `{cli_bin} hook bash --install`):\n"
+        "_sysagent_err_hook() {\n"
+        "  local ec=$?\n"
+        "  if [ $ec -ne 0 ]; then\n"
+        "    local last_cmd\n"
+        "    last_cmd=$(fc -ln -1 2>/dev/null | sed 's/^[[:space:]]*//')\n"
+        f'    command {cli_bin} hook --record "$ec" "$PWD" "$last_cmd" 2>/dev/null || true\n'
+        "  fi\n"
+        "}\n"
+        'PROMPT_COMMAND="_sysagent_err_hook${PROMPT_COMMAND:+; $PROMPT_COMMAND}"\n'
+        f'srun() {{ "$@" 2> >(tee "{stderr_log}" >&2); }}\n'
+        f'alias fix="{cli_bin} fix"\n'
     )
 
 
-async def _cmd_fix_async(base_url: str, locale: str | None = None) -> None:
-    prompt = _prepare_fix_prompt(locale)
+def _install_shell_hook(
+    shell: str = "auto", rc_path: Path | None = None
+) -> tuple[Path, str]:
+    """Idempotently install or update the managed SysAgent shell hook block in ~/.bashrc or ~/.zshrc."""
+    target_shell = _resolve_hook_shell(shell)
+    target_rc = rc_path or (Path.home() / (".zshrc" if target_shell == "zsh" else ".bashrc"))
+    begin_mark = "# >>> sysagent shell hook >>>"
+    end_mark = "# <<< sysagent shell hook <<<"
+    body = _render_shell_hook(target_shell).strip()
+    block = f"{begin_mark}\n{body}\n{end_mark}"
+
+    existing = target_rc.read_text(encoding="utf-8", errors="replace") if target_rc.is_file() else ""
+    pat = re.compile(rf"{re.escape(begin_mark)}.*?{re.escape(end_mark)}", flags=re.DOTALL)
+    if pat.search(existing):
+        updated = pat.sub(block, existing, count=1)
+    else:
+        sep = "" if (not existing or existing.endswith("\n")) else "\n"
+        extra_nl = "\n" if existing.strip() else ""
+        updated = f"{existing}{sep}{extra_nl}{block}\n"
+    target_rc.parent.mkdir(parents=True, exist_ok=True)
+    target_rc.write_text(updated, encoding="utf-8")
+    return target_rc, target_shell
+
+
+def _cmd_hook(
+    shell: str = "auto",
+    install: bool = False,
+    record_args: list[str] | None = None,
+) -> None:
+    if record_args is not None:
+        exit_code = int(record_args[0])
+        cwd_arg = str(record_args[1] or ".")
+        cmd_arg = str(record_args[2] or "").strip()
+        stderr_log = DATA_DIR / "last_stderr.log"
+        stderr_txt = ""
+        if stderr_log.is_file():
+            try:
+                stderr_txt = stderr_log.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                stderr_txt = ""
+            finally:
+                stderr_log.unlink(missing_ok=True)
+        record_last_shell_error(cmd_arg, exit_code, cwd_arg, stderr_txt)
+        return
+    if install:
+        rc_path, target_shell = _install_shell_hook(shell)
+        print(f"Installed SysAgent {target_shell} hook in {rc_path}")
+        print(f"Reload your shell or run: source {rc_path}")
+        return
+    print(_render_shell_hook(shell))
+
+
+def _prepare_fix_prompt(
+    locale: str | None = None,
+    extra_cmd: str | None = None,
+    no_cache: bool = False,
+) -> str | None:
+    loc = locale or get_settings().locale
+    err_file = DATA_DIR / "last_error.json"
+    stderr_log = DATA_DIR / "last_stderr.log"
+    data: dict[str, object] | None = None
+    if err_file.exists():
+        try:
+            loaded = json.loads(err_file.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {"command": str(loaded), "exit_code": 1, "cwd": "."}
+        except json.JSONDecodeError:
+            raw = err_file.read_text(encoding="utf-8", errors="replace")
+            data = {"command": raw.strip(), "exit_code": 1, "cwd": "."}
+    elif extra_cmd and extra_cmd.strip():
+        data = {"command": extra_cmd.strip(), "exit_code": 1, "cwd": str(Path.cwd()), "stderr": ""}
+    if data is None:
+        print(t("cli_no_last_error", loc), file=sys.stderr)
+        return None
+    cmd_str = str(data.get("command") or extra_cmd or "")
+    exit_code = int(data.get("exit_code") or 1)
+    stderr_txt = str(data.get("stderr") or "").strip()
+    if not stderr_txt and stderr_log.is_file():
+        try:
+            stderr_txt = "\n".join(stderr_log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:])[-2500:]
+        except Exception:
+            stderr_txt = ""
+    recovery_hint = ""
+    try:
+        from .self_guard import match_cached_fix
+        from .self_resilience import build_recovery_hint
+        from .storage import Storage
+
+        with Storage() as st:
+            if not no_cache:
+                hit = match_cached_fix(st, cmd_str, exit_code)
+                if hit is not None:
+                    print(f"[0-token fix memory | match {int(hit['score'] * 100)}%] ({hit['topic']})")
+                    print(hit["lesson"])
+                    return ""
+            hint_val = build_recovery_hint(
+                st,
+                "run_command",
+                {"command": cmd_str},
+                json.dumps({"exit_code": exit_code, "stderr": stderr_txt}, ensure_ascii=False),
+            )
+            if hint_val:
+                recovery_hint = hint_val
+    except Exception:
+        pass
+    parts = [
+        f"The user's last shell command failed in `{data.get('cwd') or '.'}` with exit code {exit_code}:",
+        f"`{cmd_str}`",
+    ]
+    if stderr_txt:
+        parts.append(f"Captured stderr (last lines):\n```text\n{stderr_txt[-1800:]}\n```")
+    if recovery_hint:
+        parts.append(recovery_hint)
+    parts.append("Explain why it likely failed and suggest (or run if safe/approved) the fix.")
+    return "\n".join(parts)
+
+
+async def _cmd_fix_async(
+    base_url: str,
+    locale: str | None = None,
+    extra_cmd: str | None = None,
+    no_cache: bool = False,
+) -> None:
+    prompt = _prepare_fix_prompt(locale, extra_cmd=extra_cmd, no_cache=no_cache)
     if not prompt:
         return
     await _send_and_stream(prompt, f"fix-{uuid.uuid4().hex[:6]}", base_url, locale)
 
 
-def _cmd_fix(base_url: str, locale: str | None = None) -> None:
-    prompt = _prepare_fix_prompt(locale)
+def _cmd_fix(
+    base_url: str,
+    locale: str | None = None,
+    extra_cmd: str | None = None,
+    no_cache: bool = False,
+) -> None:
+    prompt = _prepare_fix_prompt(locale, extra_cmd=extra_cmd, no_cache=no_cache)
     if prompt is None:
         sys.exit(1)
     if not prompt:
         return
     asyncio.run(_send_and_stream(prompt, f"fix-{uuid.uuid4().hex[:6]}", base_url, locale))
+
+
+def _cmd_resume(
+    base_url: str,
+    query_parts: list[str] | None = None,
+    list_only: bool = False,
+    fork_new: bool = False,
+    locale: str | None = None,
+) -> None:
+    query = " ".join(query_parts or []).strip()
+    if list_only or not query:
+        cps: list[dict[str, object]] = []
+        try:
+            resp = ipc_get(f"{base_url}/api/checkpoints", params={"limit": 15}, headers=_auth_headers(), timeout=5)
+            resp.raise_for_status()
+            cps = list(resp.json().get("checkpoints") or [])
+        except Exception:
+            with Storage() as st:
+                cps = list(st.list_session_checkpoints(limit=15))
+        if not cps:
+            print("No session checkpoints saved yet.")
+            return
+        print("\033[1;36mRecent Semantic Session Checkpoints:\033[0m")
+        for cp in cps:
+            sid = str(cp.get("session_id") or "")
+            ts = str(cp.get("created_at") or "")[:19].replace("T", " ")
+            topic = " ".join(str(cp.get("topic") or "").split())[:60]
+            files = ", ".join(Path(str(f)).name for f in (cp.get("files") or [])[:3])
+            suffix = f" \033[90m[{files}]\033[0m" if files else ""
+            print(f"  {sid:<16} {ts}  {topic}{suffix}")
+        return
+
+    res_data: dict[str, object] | None = None
+    try:
+        resp = ipc_post(
+            f"{base_url}/api/sessions/resume",
+            json={"query": query},
+            headers=_auth_headers(),
+            timeout=5,
+        )
+        resp.raise_for_status()
+        res_data = resp.json()
+    except Exception:
+        with Storage() as st:
+            hits = st.search_session_checkpoints(query, limit=3)
+            if hits:
+                cp0 = hits[0]
+                sid0 = str(cp0["session_id"])
+                res_data = {
+                    "found": True,
+                    "session_id": sid0,
+                    "checkpoint": cp0,
+                    "messages": st.get_messages(sid0, limit=12),
+                    "context_preview": Storage.format_checkpoint_context(cp0),
+                }
+
+    if not res_data or not res_data.get("found"):
+        print(f"No session or checkpoint matching '{query}'. Try `{_prog_name()} resume --list`.", file=sys.stderr)
+        sys.exit(1)
+
+    target_sid = str(res_data["session_id"])
+    cp = res_data.get("checkpoint")
+    if fork_new:
+        new_sid = f"cli-{uuid.uuid4().hex[:8]}"
+        if isinstance(cp, dict):
+            with Storage() as st:
+                st.save_session_checkpoint(
+                    session_id=new_sid,
+                    topic=str(cp.get("topic") or query),
+                    summary=str(cp.get("summary") or ""),
+                    files=[str(x) for x in (cp.get("files") or [])],
+                    commands=[str(x) for x in (cp.get("commands") or [])],
+                    decisions=[str(x) for x in (cp.get("decisions") or [])],
+                    cwd=str(cp.get("cwd") or ""),
+                    model=str(cp.get("model") or ""),
+                )
+        target_sid = new_sid
+
+    _save_last_session_id(target_sid)
+    ctx_prev = str(res_data.get("context_preview") or "")
+    msgs = list(res_data.get("messages") or [])
+    print(f"\033[1;36mResuming session {target_sid}\033[0m ({len(msgs)} recent messages):")
+    if ctx_prev:
+        print(f"  \033[36m[Checkpoint]\033[0m {ctx_prev}")
+    for m in msgs[-4:]:
+        if isinstance(m, dict):
+            snippet = " ".join(str(m.get("content") or "").split())[:100]
+            print(f"  \033[90m{m.get('role')}: {snippet}\033[0m")
+    asyncio.run(_interactive_chat(base_url, locale, initial_session_id=target_sid))
 
 
 
@@ -1302,8 +1641,17 @@ def main() -> None:
     name_parser = sub.add_parser("name", help="Set or update the assistant's name")
     name_parser.add_argument("new_name", nargs="+", help="New name (e.g. Jarvis)")
     sub.add_parser("quick", help="Open desktop quick command launcher")
-    sub.add_parser("fix", help="Analyze the last failed terminal command and suggest a fix")
-    sub.add_parser("hook", help="Print the Bash/Zsh error-capturing shell hook")
+    fix_parser = sub.add_parser("fix", help="Analyze the last failed terminal command and suggest a fix")
+    fix_parser.add_argument("--no-cache", action="store_true", help="Skip cached fix lessons and query the model")
+    fix_parser.add_argument("fix_command", nargs="*", help="Optional command text when no hook error was recorded")
+    hook_parser = sub.add_parser("hook", help="Print, install, or invoke the Bash/Zsh error-capturing shell hook")
+    hook_parser.add_argument("hook_shell", nargs="?", default="auto", choices=["auto", "bash", "zsh"])
+    hook_parser.add_argument("--install", action="store_true", help="Install/update the hook in ~/.bashrc or ~/.zshrc")
+    hook_parser.add_argument("--record", nargs=3, metavar=("EXIT_CODE", "CWD", "CMD"), default=None, help="Record failed command")
+    resume_parser = sub.add_parser("resume", help="List or semantically resume an earlier session by topic or ID")
+    resume_parser.add_argument("resume_query", nargs="*", help="Session ID, prefix, or topic keywords")
+    resume_parser.add_argument("--list", action="store_true", dest="resume_list", help="List saved semantic checkpoints")
+    resume_parser.add_argument("--new", action="store_true", dest="resume_new", help="Fork checkpoint into a fresh session ID")
     brain_parser = sub.add_parser("brain", help="Autonomous brain status / think / rules / digest / log")
     brain_parser.add_argument("brain_action", nargs="?", default="status", choices=["status", "think", "rules", "digest", "log"])
     evolve_parser = sub.add_parser("evolve", help="Self-evolution status / scan / log")
@@ -1361,7 +1709,7 @@ def main() -> None:
             filtered_argv.append(raw_argv[i])
             i += 1
 
-    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "notifications", "cortex", "self", "-h", "--help"}:
+    if filtered_argv and filtered_argv[0] in {"serve", "chat", "status", "digest", "doctor", "plugin", "search", "events", "name", "quick", "fix", "hook", "resume", "brain", "evolve", "prompts", "local", "neural", "login", "logout", "export", "import", "top", "rollback", "mcp", "schedule", "notifications", "cortex", "self", "-h", "--help"}:
         args = parser.parse_args(filtered_argv)
         if args.subcommand == "serve":
             sock = Path(settings.socket_path)
@@ -1391,9 +1739,18 @@ def main() -> None:
         elif args.subcommand == "quick":
             asyncio.run(_quick_launcher(settings.base_url, locale_override))
         elif args.subcommand == "fix":
-            _cmd_fix(settings.base_url, locale_override)
+            fc = " ".join(args.fix_command).strip() if args.fix_command else None
+            _cmd_fix(settings.base_url, locale_override, extra_cmd=fc, no_cache=bool(args.no_cache))
         elif args.subcommand == "hook":
-            _cmd_hook()
+            _cmd_hook(args.hook_shell, install=bool(args.install), record_args=args.record)
+        elif args.subcommand == "resume":
+            _cmd_resume(
+                settings.base_url,
+                args.resume_query,
+                list_only=bool(args.resume_list),
+                fork_new=bool(args.resume_new),
+                locale=locale_override,
+            )
         elif args.subcommand == "brain":
             _cmd_brain(settings.base_url, args.brain_action, locale_override)
         elif args.subcommand == "evolve":

@@ -201,18 +201,51 @@ class _LocalMindInteractions:
 
         if isinstance(input, list):
             orig_q = self._last_user_input.get(previous_interaction_id or "", "")
+            extracted_images: list[dict[str, str]] = []
+            sanitized_input: list[Any] = []
+            for item in input:
+                if not isinstance(item, dict):
+                    sanitized_input.append(item)
+                    continue
+                item_copy = dict(item)
+                res_val = item_copy.get("result")
+                if isinstance(res_val, list):
+                    clean_parts: list[Any] = []
+                    for part in res_val:
+                        if isinstance(part, dict) and part.get("type") == "image" and part.get("data"):
+                            extracted_images.append(
+                                {
+                                    "mime_type": str(part.get("mime_type") or "image/png"),
+                                    "data": str(part["data"]),
+                                }
+                            )
+                            clean_parts.append({"type": "image", "note": "[image attached]"})
+                        else:
+                            clean_parts.append(part)
+                    item_copy["result"] = clean_parts
+                sanitized_input.append(item_copy)
             summary_prompt = (
                 f"User request: {orig_q}\n"
-                f"Tool results: {_json.dumps(input, ensure_ascii=False)[:3400]}\n"
+                f"Tool results: {_json.dumps(sanitized_input, ensure_ascii=False)[:3400]}\n"
                 "Answer the user's request concisely in their language based on these tool results."
             )
+            mm_role = "multimodal" if extracted_images else None
             if on_delta is not None:
                 reply = self.mind.stream_gguf_inference(
-                    summary_prompt, system_instruction=sys_inst, history=prev_hist, on_delta=on_delta
+                    summary_prompt,
+                    system_instruction=sys_inst,
+                    preferred_role=mm_role,
+                    history=prev_hist,
+                    on_delta=on_delta,
+                    images=extracted_images or None,
                 )
             else:
                 reply = self.mind.run_gguf_inference(
-                    summary_prompt, system_instruction=sys_inst, history=prev_hist
+                    summary_prompt,
+                    system_instruction=sys_inst,
+                    preferred_role=mm_role,
+                    history=prev_hist,
+                    images=extracted_images or None,
                 )
             if not reply:
                 reply = self.mind.synthesize_reply(orig_q, tool_results=input, system_instruction=sys_inst)
@@ -220,6 +253,10 @@ class _LocalMindInteractions:
             return self._emit_text(new_id, reply, stream)
 
         user_text = str(input or "")
+        from .local_mind import extract_inline_images
+
+        _, inline_images = extract_inline_images(user_text)
+        mm_role = "multimodal" if inline_images else None
         self._last_user_input[new_id] = user_text
         self._history[new_id] = prev_hist
         if len(self._last_user_input) > 200:
@@ -236,8 +273,10 @@ class _LocalMindInteractions:
                 user_text,
                 tools=selected_tools,
                 system_instruction=sys_inst,
+                preferred_role=mm_role,
                 history=prev_hist,
                 on_delta=on_delta,
+                images=inline_images or None,
             )
             if native is not None:
                 native_calls = native.get("tool_calls") or []
@@ -259,18 +298,19 @@ class _LocalMindInteractions:
                     )[-16:]
                     return self._emit_text(new_id, native_text, stream)
 
-            from .self_guard import get_calibration
+            if not inline_images:
+                from .self_guard import get_calibration
 
-            tool_thresh = float(get_calibration(self.mind.storage)["local_tool_threshold"])
-            pred_tool, pred_args, score = self.mind.predict_tool(user_text, allowed_names=allowed)
-            if pred_tool and score >= tool_thresh:
-                step = SimpleNamespace(
-                    type="function_call",
-                    id=f"local_call_{uuid.uuid4().hex[:6]}",
-                    name=pred_tool,
-                    arguments=pred_args,
-                )
-                return self._emit_step(new_id, step, stream)
+                tool_thresh = float(get_calibration(self.mind.storage)["local_tool_threshold"])
+                pred_tool, pred_args, score = self.mind.predict_tool(user_text, allowed_names=allowed)
+                if pred_tool and score >= tool_thresh:
+                    step = SimpleNamespace(
+                        type="function_call",
+                        id=f"local_call_{uuid.uuid4().hex[:6]}",
+                        name=pred_tool,
+                        arguments=pred_args,
+                    )
+                    return self._emit_step(new_id, step, stream)
 
         extra_sys = self._format_tool_catalog(selected_tools or tools or [], user_text) if tools else ""
         if on_delta is not None:
@@ -292,16 +332,20 @@ class _LocalMindInteractions:
             reply = self.mind.stream_gguf_inference(
                 user_text,
                 system_instruction=sys_inst,
+                preferred_role=mm_role,
                 history=prev_hist,
                 extra_system=extra_sys,
                 on_delta=_guarded_delta,
+                images=inline_images or None,
             )
         else:
             reply = self.mind.run_gguf_inference(
                 user_text,
                 system_instruction=sys_inst,
+                preferred_role=mm_role,
                 history=prev_hist,
                 extra_system=extra_sys,
+                images=inline_images or None,
             )
         if reply and allowed:
             parsed = self._extract_tool_call(reply, allowed)
