@@ -48,6 +48,14 @@ from .self_guard import SelfGuard
 
 self_guard = SelfGuard(settings, storage, watcher=watcher, agent=agent, evolver=evolver)
 self_monitor.self_guard = self_guard
+watcher.runtime_refs = {
+    "brain": brain,
+    "cortex": brain.cortex,
+    "evolver": evolver,
+    "self_guard": self_guard,
+    "self_monitor": self_monitor,
+    "agent": agent,
+}
 
 
 async def _run_automation(auto: dict[str, Any], trigger_context: str) -> None:

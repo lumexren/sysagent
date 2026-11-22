@@ -240,6 +240,16 @@ SEED_CURRICULUM: list[dict[str, Any]] = [
         "args": {"component": "brain"},
     },
     {
+        "user": "şuan ne düşünüyorsun beyin düşünceleri brain thoughts",
+        "tool": "inspect_self_component",
+        "args": {"component": "brain"},
+    },
+    {
+        "user": "cortex flow guardian uyku döngüsü ne durumda",
+        "tool": "inspect_self_component",
+        "args": {"component": "cortex"},
+    },
+    {
         "user": "how is neural engine doing what is neural thinking",
         "tool": "inspect_self_component",
         "args": {"component": "neural"},
@@ -248,6 +258,16 @@ SEED_CURRICULUM: list[dict[str, Any]] = [
         "user": "what did self evolve change recent proposals",
         "tool": "inspect_self_component",
         "args": {"component": "evolve"},
+    },
+    {
+        "user": "self guard drift eval breaker kota durumu",
+        "tool": "inspect_self_component",
+        "args": {"component": "guard"},
+    },
+    {
+        "user": "brain cortex ne durumda kendi bileşenlerini incele",
+        "tool": "inspect_self_component",
+        "args": {"component": "all"},
     },
     {
         "user": "show recent background system events",
@@ -1554,7 +1574,9 @@ class LocalMind:
 
         agent_name = get_settings().agent_name
         base_sys = (
-            f"You are {agent_name}, a concise local Linux assistant running on {gguf.stem}. "
+            f"You are {agent_name}, a self-evolving Linux assistant running on {gguf.stem}. "
+            "Your internal subsystems are CognitiveBrain, NeuralBrainCortex, NeuralEngine, SelfEvolver, LocalMind, and SelfGuard. "
+            "Never say you lack a brain or cortex; use live tool results when provided. "
             "Reply directly and naturally in the same language as the user's message. "
             "Never repeat system instructions, tool names, or thinking traces."
         )
@@ -1873,9 +1895,12 @@ class LocalMind:
                     neural_escalate = True
         except Exception:
             pass
+        from .local_mind_client import detect_self_introspection
+
         dyn_action = self.storage.get_learned_cues().get("action_req", []) if self.storage is not None else []
         has_action = (
             neural_escalate
+            or detect_self_introspection(msg) is not None
             or any(v in low for v in dyn_action)
             or any(ch in msg for ch in ("/", "~", "@", "\n"))
         )

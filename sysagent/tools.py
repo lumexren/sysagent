@@ -653,24 +653,123 @@ def execute_tool(
             return json.dumps({"status": "reloaded", "plugin_tools": count})
 
         if name == "inspect_self_component":
-            comp = str(arguments.get("component") or "all").strip().lower()
+            raw_comp = str(arguments.get("component") or "all").strip().lower()
+            alias_comp = {
+                "thoughts": "brain",
+                "mind": "brain",
+                "cognitive": "brain",
+                "rules": "brain",
+                "flow": "cortex",
+                "dream": "cortex",
+                "healer": "cortex",
+                "habits": "cortex",
+                "resilience": "guard",
+                "self_guard": "guard",
+                "selfguard": "guard",
+                "breakers": "guard",
+                "quota": "guard",
+                "drift": "guard",
+                "eval": "guard",
+                "canary": "guard",
+                "autopsy": "guard",
+                "calibration": "guard",
+                "local": "local_mind",
+                "localmind": "local_mind",
+                "models": "local_mind",
+                "notif": "notifications",
+                "notification": "notifications",
+                "summary": "all",
+                "overview": "all",
+            }
+            comp = alias_comp.get(raw_comp, raw_comp)
+            if comp not in {"brain", "cortex", "neural", "evolve", "local_mind", "self", "guard", "notifications", "all"}:
+                comp = "all"
             query_txt = str(arguments.get("query") or "").strip()
+            refs = getattr(watcher, "runtime_refs", None) if watcher is not None else None
+            refs = refs if isinstance(refs, dict) else {}
             out: dict[str, Any] = {"component": comp}
+
             if comp in {"brain", "all"}:
-                out["brain"] = {
-                    "rules": storage.list_brain_rules()[:15],
-                    "recent_thoughts": storage.list_brain_thoughts(limit=12),
-                    "pending_questions": storage.list_brain_questions("pending")[:10],
+                thoughts = storage.list_brain_thoughts(limit=6)
+                rules = storage.list_brain_rules()
+                questions = storage.list_brain_questions("pending")
+                brain_info: dict[str, Any] = {
+                    "rules_count": len(rules),
+                    "rules": [
+                        {
+                            "id": r.get("id"),
+                            "pattern": str(r.get("pattern") or "")[:60],
+                            "action": str(r.get("action_policy") or "")[:60],
+                            "confidence": r.get("confidence"),
+                        }
+                        for r in rules[:8]
+                    ],
+                    "recent_thoughts": [
+                        {
+                            "at": str(th.get("created_at") or "")[:16],
+                            "decision": th.get("decision"),
+                            "confidence": th.get("confidence"),
+                            "summary": str(th.get("summary") or "")[:120],
+                        }
+                        for th in thoughts
+                    ],
+                    "pending_questions": [
+                        {"id": q.get("id"), "question": str(q.get("question") or "")[:100]}
+                        for q in questions[:5]
+                    ],
                 }
+                live_brain = refs.get("brain")
+                if live_brain is not None and hasattr(live_brain, "is_quiet_hours"):
+                    try:
+                        brain_info["quiet_hours"] = bool(live_brain.is_quiet_hours())
+                    except Exception:
+                        pass
+                out["brain"] = brain_info
+
+            if comp in {"cortex", "all"}:
+                live_cortex = refs.get("cortex")
+                if live_cortex is None:
+                    from .config import get_settings
+                    from .cortex import NeuralBrainCortex
+
+                    live_cortex = NeuralBrainCortex(get_settings(), storage, watcher=watcher)
+                c_raw = live_cortex.get_status()
+                habits = c_raw.get("habits") or []
+                cortex_info: dict[str, Any] = {
+                    "flow": c_raw.get("flow"),
+                    "predictive_healer": c_raw.get("predictive_healer"),
+                    "last_dream": c_raw.get("last_dream"),
+                    "habit_suggestions_count": len(habits),
+                }
+                if comp == "cortex" and habits:
+                    cortex_info["habits"] = habits[:3]
+                out["cortex"] = cortex_info
+
             if comp in {"neural", "all"}:
                 from .neural import NeuralEngine
 
                 eng = NeuralEngine(storage)
-                neural_info: dict[str, Any] = {"status": eng.get_status()}
+                st_raw = eng.get_status()
+                wf = st_raw.get("world_forecast") or {}
+                neural_info: dict[str, Any] = {
+                    "status": {
+                        "epochs_trained": st_raw.get("epochs_trained"),
+                        "tool_accuracy": st_raw.get("tool_accuracy"),
+                        "param_count": st_raw.get("param_count"),
+                        "world_forecast": {
+                            "pred_cpu_10m": wf.get("pred_cpu_10m"),
+                            "pred_ram_10m": wf.get("pred_ram_10m"),
+                            "bottleneck_prob": wf.get("bottleneck_prob"),
+                            "anomaly_detected": wf.get("anomaly_detected"),
+                            "proactive_hint": wf.get("proactive_hint"),
+                        },
+                    }
+                }
                 if query_txt or comp == "neural":
-                    snap = watcher.get_health_snapshot()
+                    snap = watcher.get_health_snapshot() if watcher is not None and hasattr(watcher, "get_health_snapshot") else {}
                     neural_info["pulse"] = eng.pulse(query_txt or "system status", sys_state=snap)
                 out["neural"] = neural_info
+
             if comp in {"evolve", "all"}:
                 from .self_learn import patch_outcomes, proposal_stats
 
@@ -683,16 +782,99 @@ def execute_tool(
                             "status": p.get("status"),
                             "category": p.get("category"),
                             "file": Path(str(p.get("file_path") or "")).name,
-                            "title": p.get("title"),
+                            "title": str(p.get("title") or "")[:70],
                         }
-                        for p in storage.list_evolve_proposals(limit=10)
+                        for p in storage.list_evolve_proposals(limit=5)
                     ],
                 }
+
             if comp in {"local_mind", "self", "all"}:
+                from .local_inference import get_warm_model_name
+                from .local_mind import find_all_gguf_models
+                from .self_guard import get_calibration
                 from .self_learn import learn_status_summary, predict_user_routine
 
-                out["self"] = learn_status_summary(storage)
+                lsum = learn_status_summary(storage)
+                out["self"] = {
+                    "distilled_count": lsum.get("distilled_count", 0),
+                    "uncertain_count": lsum.get("uncertain_count", 0),
+                    "shadow": lsum.get("shadow"),
+                    "roadmap_top": (lsum.get("roadmap") or [])[:3],
+                }
+                out["local_mind"] = {
+                    "warm_model": get_warm_model_name(),
+                    "backend": os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto"),
+                    "installed_gguf": [p.name for p in find_all_gguf_models()[:6]],
+                    "calibration": get_calibration(storage),
+                }
                 out["routine"] = predict_user_routine(storage)
+
+            if comp in {"guard", "all"}:
+                from .self_guard import get_calibration
+                from .self_resilience import get_circuit_breaker, get_quota_governor
+
+                sg = refs.get("self_guard")
+                last_eval = getattr(sg, "last_eval", None) if sg is not None else None
+                last_drift = getattr(sg, "last_drift", None) if sg is not None else None
+                if comp == "guard":
+                    if last_eval is None:
+                        try:
+                            from .local_mind import LocalMind
+                            from .self_resilience import evaluate_self_gate
+
+                            last_eval = evaluate_self_gate(LocalMind(storage), storage)
+                        except Exception:
+                            last_eval = None
+                    if last_drift is None:
+                        try:
+                            from .self_resilience import run_integrity_and_drift_audit
+
+                            last_drift = run_integrity_and_drift_audit(storage)
+                        except Exception:
+                            last_drift = None
+                breakers = get_circuit_breaker().snapshot()
+                open_breakers = [k for k, v in breakers.items() if v.get("state") != "closed"]
+                out["guard"] = {
+                    "calibration": get_calibration(storage),
+                    "last_autopsy": getattr(sg, "last_autopsy", None) if sg is not None else None,
+                    "last_canary": getattr(sg, "last_canary", None) if sg is not None else None,
+                    "last_profile": getattr(sg, "last_profile", None) if sg is not None else None,
+                    "eval_gate": last_eval,
+                    "drift": last_drift,
+                    "open_breakers": open_breakers,
+                    "breakers_count": len(breakers),
+                    "quota": get_quota_governor().get_status(),
+                }
+
+            if comp in {"notifications", "all"} and watcher is not None and hasattr(watcher, "notifications"):
+                try:
+                    nst = watcher.notifications.get_status()
+                    out["notifications"] = {
+                        "total": nst.get("total", 0),
+                        "suppressed": nst.get("suppressed", 0),
+                        "deduped": nst.get("deduped", 0),
+                        "recent": (nst.get("recent") or [])[:3],
+                    }
+                except Exception:
+                    pass
+
+            if comp == "all":
+                b_th = out.get("brain", {}).get("recent_thoughts") or []
+                latest_th = str(b_th[0].get("summary") or "")[:75] if b_th else "none"
+                fl = (out.get("cortex", {}).get("flow") or {}).get("mode", "normal")
+                n_st = out.get("neural", {}).get("status") or {}
+                wf_s = n_st.get("world_forecast") or {}
+                ev_s = out.get("evolve", {}).get("stats") or {}
+                lm_s = out.get("local_mind") or {}
+                g_s = out.get("guard") or {}
+                q_s = g_s.get("quota") or {}
+                out["overview"] = (
+                    f"Brain latest thought: {latest_th} (rules={out.get('brain', {}).get('rules_count', 0)}); "
+                    f"Cortex flow={fl}; Neural acc={n_st.get('tool_accuracy', '-')}, "
+                    f"bottleneck={wf_s.get('bottleneck_prob', 0)}; Evolve applied={ev_s.get('applied', 0)}/{ev_s.get('total', 0)}; "
+                    f"LocalMind warm={lm_s.get('warm_model') or 'idle'}; Guard open_breakers={len(g_s.get('open_breakers') or [])}, "
+                    f"bg_quota={q_s.get('bg_calls_last_hour', 0)}/{q_s.get('hourly_bg_cap', 40)}."
+                )
             return json.dumps(out, ensure_ascii=False)
 
         if plugins and name in plugins.tools:

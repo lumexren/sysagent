@@ -512,13 +512,19 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "inspect_self_component",
-        "description": "Inspect SysAgent's own internal components: 'brain' (recent thoughts, learned rules, pending questions), 'neural' (NeuralEngine weights, accuracy, synapses, world forecast, optional pulse), 'evolve' (self-evolution proposals & outcomes), 'local_mind' (shadow eval, coverage, roadmap), or 'all'.",
+        "description": (
+            "Inspect SysAgent's live internal runtime components: 'brain' (recent thoughts, rules, questions), "
+            "'cortex' (Flow Guardian, Dream Cycle, Predictive Healer, Habit Copilot), "
+            "'neural' (NeuralEngine accuracy, world forecast, pulse), 'evolve' (proposals & outcomes), "
+            "'local_mind' (warm GGUF model, backend, calibration), 'guard' (SelfGuard canary, eval gate, drift, circuit breakers, quota), "
+            "'notifications', or 'all'. Call this whenever asked what you are thinking or about Brain, Cortex, Neural, Evolve, LocalMind, SelfGuard, or internal state."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "component": {
                     "type": "string",
-                    "description": "Target component: 'brain', 'neural', 'evolve', 'local_mind', or 'all' (default 'all').",
+                    "description": "Target component: 'brain', 'cortex', 'neural', 'evolve', 'local_mind', 'guard', 'notifications', or 'all' (default 'all').",
                 },
                 "query": {
                     "type": "string",

@@ -13,6 +13,94 @@ if TYPE_CHECKING:
     pass
 
 
+_SELF_ASK_CUES = (
+    "durum", "nasil", "nasilsin", "ne ", "neler", "status", "incele", "goster",
+    "bak", "rapor", "ozet", "summary", "list", "what", "how", "hangi", "kac",
+)
+
+_THOUGHT_PHRASES = (
+    "ne dusunuyorsun", "neler dusunuyorsun", "aklindan ne geciyor", "suan ne dusun",
+    "what are you thinking", "what do you think", "your thoughts", "dusunce",
+)
+
+
+def detect_self_introspection(user_text: str) -> dict[str, str] | None:
+    """Detect explicit SysAgent self-introspection requests and map them to inspect_self_component args."""
+    raw = (user_text or "").strip()
+    if not raw:
+        return None
+    low = " ".join(raw.lower().replace("\u0307", "").split())
+    ascii_low = (
+        low.replace("ş", "s")
+        .replace("ğ", "g")
+        .replace("ü", "u")
+        .replace("ö", "o")
+        .replace("ç", "c")
+        .replace("ı", "i")
+    )
+
+    if any(w in ascii_low for w in ("modele gec", "modeline gec", "switch model", "use model", "modelini kullan")):
+        return None
+
+    matched: list[str] = []
+    if any(p in ascii_low for p in _THOUGHT_PHRASES) or any(
+        w in ascii_low for w in ("brain thought", "beyin dusunce", "beyin kural", "brain rule")
+    ):
+        matched.append("brain")
+
+    if any(w in ascii_low for w in ("cortex", "korteks", "flow guardian", "dream cycle", "uyku dongu")):
+        matched.append("cortex")
+
+    if any(w in ascii_low for w in ("neural engine", "neuralengine", "sinaps", "synapse", "world forecast")):
+        matched.append("neural")
+
+    if any(w in ascii_low for w in ("self-evolve", "self_evolve", "self evolve", "evolve proposal", "evrim oneri")):
+        matched.append("evolve")
+
+    if any(
+        w in ascii_low
+        for w in (
+            "self-guard", "self_guard", "selfguard", "circuit breaker", "devre kesici",
+            "quota governor", "eval gate", "drift audit", "canary", "autopsy", "kalibrasyon",
+        )
+    ):
+        matched.append("guard")
+
+    has_cue = any(c in ascii_low for c in _SELF_ASK_CUES) or "?" in raw
+    if has_cue:
+        if any(w in ascii_low for w in ("local-mind", "local_mind", "localmind", "local mind")) and "brain" not in ascii_low:
+            matched.append("local_mind")
+        if any(w in ascii_low for w in ("bildirim gecmis", "notification center", "notifications status")):
+            matched.append("notifications")
+        if "brain" in ascii_low or "beyin" in ascii_low:
+            matched.append("brain")
+        if "neural" in ascii_low:
+            matched.append("neural")
+        if "evolve" in ascii_low:
+            matched.append("evolve")
+        if any(w in ascii_low for w in ("breaker", "kota", "quota", "drift", "eval")):
+            matched.append("guard")
+
+    if any(
+        w in ascii_low
+        for w in (
+            "kendi bilesen", "bilesenlerin", "componentlerin", "ic durum",
+            "self durum", "self status", "kendini incele", "inspect self",
+        )
+    ):
+        return {"component": "all"}
+
+    unique = list(dict.fromkeys(matched))
+    if not unique:
+        return None
+    if len(unique) >= 2:
+        return {"component": "all"}
+    target = unique[0]
+    if target == "neural":
+        return {"component": "neural", "query": raw[:120]}
+    return {"component": target}
+
+
 class _LocalMindInteractions:
     """Drop-in `.interactions.create(...)` implementation backed by `LocalMind`."""
 
@@ -24,17 +112,31 @@ class _LocalMindInteractions:
         self._history: dict[str, list[dict[str, str]]] = {}
 
     @staticmethod
-    def _format_tool_catalog(tools: list[dict[str, Any]]) -> str:
+    def _format_tool_catalog(tools: list[dict[str, Any]], user_text: str = "") -> str:
+        valid = [t for t in tools if isinstance(t, dict) and t.get("name")]
+        if not valid:
+            return ""
+        q_tokens = {tok for tok in (user_text or "").lower().split() if len(tok) >= 2}
+        intro_hit = detect_self_introspection(user_text) is not None
+        essentials = {"system_status", "run_command", "read_file", "inspect_self_component", "switch_model"}
+
+        def _rank(tool: dict[str, Any]) -> tuple[int, int]:
+            name = str(tool["name"])
+            hay = f"{name} {tool.get('description') or ''}".lower()
+            score = sum(3 for tok in q_tokens if tok in hay)
+            if intro_hit and name == "inspect_self_component":
+                score += 50
+            if name in essentials:
+                score += 4
+            return (score, 1 if name == "inspect_self_component" else 0)
+
+        ranked = sorted(valid, key=_rank, reverse=True)
         lines: list[str] = []
-        for t in tools[:14]:
-            if not isinstance(t, dict) or not t.get("name"):
-                continue
+        for t in ranked[:16]:
             params = list(((t.get("parameters") or {}).get("properties") or {}).keys())[:5]
             desc = str(t.get("description") or "").splitlines()[0][:85]
             sig = f"{t['name']}({', '.join(params)})"
             lines.append(f"- {sig}: {desc}")
-        if not lines:
-            return ""
         return (
             "Available tools:\n"
             + "\n".join(lines)
@@ -127,7 +229,7 @@ class _LocalMindInteractions:
             orig_q = self._last_user_input.get(previous_interaction_id or "", "")
             summary_prompt = (
                 f"User request: {orig_q}\n"
-                f"Tool results: {_json.dumps(input, ensure_ascii=False)[:2400]}\n"
+                f"Tool results: {_json.dumps(input, ensure_ascii=False)[:3400]}\n"
                 "Answer the user's request concisely in their language based on these tool results."
             )
             if on_delta is not None:
@@ -168,6 +270,17 @@ class _LocalMindInteractions:
                         )
                         return self._emit_step(new_id, step, stream)
 
+            if "inspect_self_component" in allowed:
+                intro_args = detect_self_introspection(user_text)
+                if intro_args is not None:
+                    step = SimpleNamespace(
+                        type="function_call",
+                        id=f"local_call_{uuid.uuid4().hex[:6]}",
+                        name="inspect_self_component",
+                        arguments=intro_args,
+                    )
+                    return self._emit_step(new_id, step, stream)
+
             from .self_guard import get_calibration
 
             tool_thresh = float(get_calibration(self.mind.storage)["local_tool_threshold"])
@@ -181,7 +294,7 @@ class _LocalMindInteractions:
                 )
                 return self._emit_step(new_id, step, stream)
 
-        extra_sys = self._format_tool_catalog(tools) if tools else ""
+        extra_sys = self._format_tool_catalog(tools, user_text) if tools else ""
         if on_delta is not None:
             stream_mode: list[str] = ["pending" if allowed else "live"]
 
