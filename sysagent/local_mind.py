@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,68 @@ SPECIALIST_ROLES: tuple[str, ...] = (
     "multimodal",
     "embedding",
 )
+
+
+class _ThinkStreamFilter:
+    """Stateful token stream filter that strips <think>...</think> blocks without stalling normal text."""
+
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+        self._emitted_any = False
+
+    def feed(self, token: str) -> str:
+        self._buf += token
+        out: list[str] = []
+        while self._buf:
+            if self._in_think:
+                end = self._buf.find(self._CLOSE)
+                if end != -1:
+                    self._buf = self._buf[end + len(self._CLOSE) :]
+                    self._in_think = False
+                    continue
+                if len(self._buf) > len(self._CLOSE):
+                    self._buf = self._buf[-len(self._CLOSE) :]
+                break
+            start = self._buf.find(self._OPEN)
+            if start != -1:
+                if start > 0:
+                    out.append(self._buf[:start])
+                self._buf = self._buf[start + len(self._OPEN) :]
+                self._in_think = True
+                continue
+            hold = 0
+            max_check = min(len(self._buf), len(self._OPEN) - 1)
+            for k in range(max_check, 0, -1):
+                if self._OPEN.startswith(self._buf[-k:]):
+                    hold = k
+                    break
+            emit_len = len(self._buf) - hold
+            if emit_len > 0:
+                out.append(self._buf[:emit_len])
+                self._buf = self._buf[emit_len:]
+            break
+        chunk = "".join(out)
+        if not self._emitted_any:
+            chunk = chunk.lstrip()
+            if chunk:
+                self._emitted_any = True
+        return chunk
+
+    def flush(self) -> str:
+        if self._in_think or not self._buf:
+            self._buf = ""
+            return ""
+        chunk = self._buf
+        self._buf = ""
+        if not self._emitted_any:
+            chunk = chunk.lstrip()
+            if chunk:
+                self._emitted_any = True
+        return chunk
 
 ROLE_DEFAULT_PRESETS: dict[str, str] = {
     "coding": "omnicoder-9b",
@@ -1417,16 +1480,14 @@ class LocalMind:
         """Lazily load and cache a llama_cpp.Llama instance with full GPU offload."""
         return get_llama_cpp_model(gguf)
 
-    def _run_single_gguf(
+    def _build_gguf_messages(
         self,
         gguf: Path,
         prompt: str,
         system_instruction: str = "",
         history: list[dict[str, str]] | None = None,
         extra_system: str = "",
-    ) -> str | None:
-        import httpx
-
+    ) -> tuple[str, list[dict[str, str]]]:
         examples = self.retrieve_similar_examples(prompt, top_k=2) if not extra_system else []
         role_hint = ""
         if ROLE_ADAPTERS_FILE.is_file():
@@ -1460,6 +1521,21 @@ class LocalMind:
             if r in {"user", "assistant"} and c:
                 messages.append({"role": r, "content": c[:800]})
         messages.append({"role": "user", "content": prompt.strip()})
+        return sys_msg, messages
+
+    def _run_single_gguf(
+        self,
+        gguf: Path,
+        prompt: str,
+        system_instruction: str = "",
+        history: list[dict[str, str]] | None = None,
+        extra_system: str = "",
+    ) -> str | None:
+        import httpx
+
+        sys_msg, messages = self._build_gguf_messages(
+            gguf, prompt, system_instruction, history=history, extra_system=extra_system
+        )
 
         def _try_server() -> str | None:
             srv_url = self._ensure_llama_server(gguf)
@@ -1604,6 +1680,106 @@ class LocalMind:
                 self.weights["qa_memory"] = qa[-150:]
         return final_out
 
+    def stream_gguf_inference(
+        self,
+        prompt: str,
+        system_instruction: str = "",
+        preferred_role: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        extra_system: str = "",
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str | None:
+        """Stream visible tokens live from warm llama-server SSE while suppressing <think> blocks."""
+        if on_delta is None:
+            return self.run_gguf_inference(
+                prompt,
+                system_instruction=system_instruction,
+                preferred_role=preferred_role,
+                history=history,
+                extra_system=extra_system,
+            )
+        models = [m for m in find_all_gguf_models() if classify_gguf_role(m) != "embedding"]
+        if not models:
+            return None
+        target_role = preferred_role or classify_task_role(prompt)
+        specialist = find_gguf_model(target_role, strict=True) or find_gguf_model(target_role) or models[0]
+        backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
+        if backend not in {"llama_cli", "llama-cli", "cli"}:
+            srv_url = self._ensure_llama_server(specialist)
+            if srv_url:
+                import httpx
+
+                _, messages = self._build_gguf_messages(
+                    specialist, prompt, system_instruction, history=history, extra_system=extra_system
+                )
+                filt = _ThinkStreamFilter()
+                collected: list[str] = []
+                try:
+                    with httpx.stream(
+                        "POST",
+                        f"{srv_url}/v1/chat/completions",
+                        json={
+                            "messages": messages,
+                            "temperature": 0.2,
+                            "max_tokens": 1024,
+                            "stream": True,
+                        },
+                        timeout=60,
+                    ) as resp:
+                        if resp.status_code == 200:
+                            for line in resp.iter_lines():
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                payload = line[5:].strip()
+                                if payload == "[DONE]":
+                                    break
+                                try:
+                                    chunk_obj = json.loads(payload)
+                                except Exception:
+                                    continue
+                                choices = chunk_obj.get("choices") or []
+                                if not choices:
+                                    continue
+                                token = str((choices[0].get("delta") or {}).get("content") or "")
+                                if not token:
+                                    continue
+                                visible = filt.feed(token)
+                                if visible:
+                                    collected.append(visible)
+                                    on_delta(visible)
+                    tail = filt.flush()
+                    if tail:
+                        collected.append(tail)
+                        on_delta(tail)
+                    final_out = "".join(collected).strip()
+                    if final_out:
+                        if not extra_system and len(prompt.strip()) >= 8:
+                            qa = self.weights.setdefault("qa_memory", [])
+                            qa.append(
+                                {
+                                    "role": target_role,
+                                    "user": prompt.strip()[:300],
+                                    "tool_calls": [],
+                                    "reply": final_out[:600],
+                                }
+                            )
+                            if len(qa) > 150:
+                                self.weights["qa_memory"] = qa[-150:]
+                        return final_out
+                except Exception:
+                    pass
+
+        fallback_out = self.run_gguf_inference(
+            prompt,
+            system_instruction=system_instruction,
+            preferred_role=preferred_role,
+            history=history,
+            extra_system=extra_system,
+        )
+        if fallback_out:
+            on_delta(fallback_out)
+        return fallback_out
+
     def try_local_cascade(
         self, user_message: str, system_instruction: str = ""
     ) -> dict[str, Any] | None:
@@ -1648,10 +1824,13 @@ class LocalMind:
             specialist = find_gguf_model("chat", strict=True) or find_gguf_model("chat") or models[0]
             eligible = word_count <= 14 and pred_tool is None and not has_action
         elif local_first and role in {"general", "coding", "reasoning"}:
+            from .self_guard import get_calibration
+
+            max_words = int(get_calibration(self.storage)["local_max_words"])
             specialist = find_gguf_model(role, strict=True)
             eligible = (
                 specialist is not None
-                and word_count <= 24
+                and word_count <= max_words
                 and pred_tool is None
                 and not has_action
             )

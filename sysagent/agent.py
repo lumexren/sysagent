@@ -349,6 +349,7 @@ class AgentManager:
     async def _call_model_with_failover(self, session_id: str, **kwargs: Any) -> Any:
         """Call Gemini Interactions API with key rotation, light_model fallback, and offline LocalMind fallback."""
         client = self._get_client()
+        on_delta = kwargs.pop("on_delta", None)
         model = str(kwargs["model"])
         if model in {"local", "local-mind", "local_mind"}:
             local_client = getattr(self, "_local_client", None)
@@ -358,7 +359,10 @@ class AgentManager:
                 local_client = LocalMindClient(self.storage)
                 self._local_client = local_client
             self.storage.record_model_request("local-mind")
-            return await asyncio.to_thread(local_client.interactions.create, **kwargs)
+            local_kwargs = dict(kwargs)
+            if on_delta is not None:
+                local_kwargs["on_delta"] = on_delta
+            return await asyncio.to_thread(local_client.interactions.create, **local_kwargs)
         try:
             self.storage.record_model_request(model)
             return await self._create_safe(client, kwargs)
@@ -406,7 +410,10 @@ class AgentManager:
                 local_client = LocalMindClient(self.storage)
                 self._local_client = local_client
             self.storage.record_model_request("local-mind")
-            return await asyncio.to_thread(local_client.interactions.create, **kwargs)
+            local_kwargs = dict(kwargs)
+            if on_delta is not None:
+                local_kwargs["on_delta"] = on_delta
+            return await asyncio.to_thread(local_client.interactions.create, **local_kwargs)
 
     async def run_turn(
         self,
@@ -571,6 +578,20 @@ class AgentManager:
         }
         if prev_id:
             kwargs["previous_interaction_id"] = prev_id
+
+        loop = asyncio.get_running_loop()
+        live_streamed = False
+
+        def _local_on_delta(chunk: str) -> None:
+            nonlocal live_streamed
+            if chunk:
+                live_streamed = True
+                loop.call_soon_threadsafe(
+                    asyncio.create_task, _emit({"type": "text_delta", "text": chunk})
+                )
+
+        if interactive:
+            kwargs["on_delta"] = _local_on_delta
 
         await _emit({"type": "status", "message": "analyzing request..."})
         interaction = await self._call_model_with_failover(session_id, **kwargs)
@@ -951,6 +972,7 @@ class AgentManager:
                             "and only send your final plain-text answer after the work and verification are completely done."
                         )
                     await _emit({"type": "status", "message": f"continuing task (nudge {nudge_count})..."})
+                    live_streamed = False
                     interaction = await self._call_model_with_failover(
                         session_id,
                         model=selected_model,
@@ -986,7 +1008,7 @@ class AgentManager:
                                 )
                             except Exception:
                                 pass
-                if interactive and text:
+                if interactive and text and not live_streamed:
                     chunk_size = 64
                     for idx in range(0, len(text), chunk_size):
                         await _emit({"type": "text_delta", "text": text[idx : idx + chunk_size]})
@@ -1046,6 +1068,7 @@ class AgentManager:
                     return reply
 
             await _emit({"type": "status", "message": f"step {step_count}: processing tool results..."})
+            live_streamed = False
             interaction = await self._call_model_with_failover(
                 session_id,
                 model=selected_model,
@@ -1053,6 +1076,7 @@ class AgentManager:
                 previous_interaction_id=interaction.id,
                 tools=pruned_tools,
                 system_instruction=system_instruction,
+                on_delta=(_local_on_delta if interactive else None),
             )
             selected_model = self._session_models.get(session_id, selected_model)
             self.sessions[session_id] = interaction.id

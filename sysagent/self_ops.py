@@ -509,6 +509,17 @@ class SelfMonitor:
             pruned_synapses = eng.prune_weak_synapses()
         except Exception:
             pass
+        self_guard_res: dict[str, Any] = {}
+        sg = getattr(self, "self_guard", None)
+        if sg is not None:
+            try:
+                self_guard_res = {
+                    "canary": sg.run_canary_probes(),
+                    "profile": sg.run_memory_profiler(),
+                    "calibration": sg.calibrate_thresholds(),
+                }
+            except Exception:
+                pass
         return {
             "rss_mb": round(rss_mb, 1),
             "cleared_cache": cleared_cache,
@@ -533,6 +544,7 @@ class SelfMonitor:
             "pruned": pruned,
             "skill_questions": skill_questions,
             "local_mind": local_stats,
+            "self_guard": self_guard_res,
         }
 
     async def _loop(self) -> None:

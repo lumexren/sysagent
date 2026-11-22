@@ -1132,9 +1132,22 @@ def _cmd_fix(base_url: str, locale: str | None = None) -> None:
     except json.JSONDecodeError:
         raw = err_file.read_text(encoding="utf-8", errors="replace")
         data = {"command": raw.strip(), "exit_code": 1, "cwd": "."}
+    cmd_str = str(data.get("command") or "")
+    exit_code = int(data.get("exit_code") or 1)
+    try:
+        from .self_guard import match_cached_fix
+        from .storage import Storage
+
+        hit = match_cached_fix(Storage(), cmd_str, exit_code)
+        if hit is not None:
+            print(f"[0-token fix memory | match {int(hit['score'] * 100)}%] ({hit['topic']})")
+            print(hit["lesson"])
+            return
+    except Exception:
+        pass
     prompt = (
-        f"The user's last shell command failed in `{data.get('cwd')}` with exit code {data.get('exit_code')}:\n"
-        f"`{data.get('command')}`\n"
+        f"The user's last shell command failed in `{data.get('cwd')}` with exit code {exit_code}:\n"
+        f"`{cmd_str}`\n"
         "Explain why it likely failed and suggest (or run if safe/approved) the fix."
     )
     asyncio.run(_send_and_stream(prompt, f"fix-{uuid.uuid4().hex[:6]}", base_url, locale))

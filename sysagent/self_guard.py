@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import subprocess
 import time
 from collections import Counter
@@ -18,6 +19,90 @@ from .config import DATA_DIR, Settings
 from .storage import Storage
 
 _MARKER_FILE = DATA_DIR / "daemon.running"
+
+DEFAULT_CALIBRATION: dict[str, Any] = {
+    "local_tool_threshold": 0.72,
+    "local_max_words": 24,
+    "bottleneck_defer_threshold": 0.75,
+}
+
+_FIX_STOPWORDS = frozenset(
+    {"sudo", "the", "and", "for", "with", "from", "into", "that", "this", "failed", "error", "exit", "code"}
+)
+
+
+def get_calibration(storage: Storage | None) -> dict[str, Any]:
+    """Read live self-calibrated thresholds from storage, falling back to safe defaults."""
+    cal = dict(DEFAULT_CALIBRATION)
+    if storage is None:
+        return cal
+    try:
+        raw = storage.get_memory("_internal:self_calibration")
+        if raw:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                if isinstance(data.get("local_tool_threshold"), (int, float)):
+                    cal["local_tool_threshold"] = float(data["local_tool_threshold"])
+                if isinstance(data.get("local_max_words"), (int, float)):
+                    cal["local_max_words"] = int(data["local_max_words"])
+                if isinstance(data.get("bottleneck_defer_threshold"), (int, float)):
+                    cal["bottleneck_defer_threshold"] = float(data["bottleneck_defer_threshold"])
+    except Exception:
+        pass
+    return cal
+
+
+def _tokenize_fix(text: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9][a-z0-9._/-]{1,}", (text or "").lower())
+    return {t for t in tokens if t not in _FIX_STOPWORDS}
+
+
+def match_cached_fix(storage: Storage | None, command: str, exit_code: int = 1) -> dict[str, Any] | None:
+    """Match a failed shell command against previously learned lessons for a 0-token local fix."""
+    if storage is None:
+        return None
+    cmd_norm = " ".join((command or "").strip().lower().split())
+    cmd_bare = cmd_norm[5:].strip() if cmd_norm.startswith("sudo ") else cmd_norm
+    cmd_tokens = _tokenize_fix(cmd_bare)
+    if not cmd_tokens:
+        return None
+    try:
+        lessons = storage.list_lessons(limit=50)
+    except Exception:
+        return None
+
+    best: dict[str, Any] | None = None
+    best_score = 0.0
+    for item in lessons:
+        context = str(item.get("context") or item.get("topic") or "")
+        if context == "self_autopsy":
+            continue
+        insight = str(item.get("insight") or item.get("lesson") or "").strip()
+        resolution = str(item.get("resolution") or "").strip()
+        lesson_text = f"{insight}\n{resolution}".strip() if resolution and resolution not in insight else insight
+        if not lesson_text:
+            continue
+        haystack = f"{context} {lesson_text}".lower()
+        lesson_tokens = _tokenize_fix(haystack)
+        if not lesson_tokens:
+            continue
+        overlap = len(cmd_tokens & lesson_tokens) / len(cmd_tokens)
+        score = overlap
+        if len(cmd_bare) >= 6 and cmd_bare in haystack:
+            score = max(score, 0.85)
+        if exit_code and (f"exit {exit_code}" in haystack or f"exit code {exit_code}" in haystack):
+            score = min(1.0, score + 0.05)
+        if score > best_score:
+            best_score = score
+            best = {
+                "topic": context,
+                "lesson": lesson_text,
+                "resolution": resolution,
+                "score": round(score, 3),
+            }
+    if best is not None and best_score >= 0.55:
+        return best
+    return None
 
 
 class SelfGuard:

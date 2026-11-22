@@ -47,6 +47,7 @@ self_monitor = SelfMonitor(storage, watcher, plugins=plugins, agent=agent, evolv
 from .self_guard import SelfGuard
 
 self_guard = SelfGuard(settings, storage, watcher=watcher, agent=agent, evolver=evolver)
+self_monitor.self_guard = self_guard
 
 
 async def _run_automation(auto: dict[str, Any], trigger_context: str) -> None:

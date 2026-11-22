@@ -877,8 +877,11 @@ class SystemWatcher:
             if quiet_now and ttype == "interval":
                 continue
 
+            from .self_guard import get_calibration
+
+            defer_thresh = float(get_calibration(self.storage)["bottleneck_defer_threshold"])
             b_prob = float(world_forecast.get("bottleneck_prob", 0.0) or 0.0)
-            if ttype in {"daily_time", "interval"} and b_prob >= 0.75:
+            if ttype in {"daily_time", "interval"} and b_prob >= defer_thresh:
                 self.add_event(
                     "info",
                     "info",

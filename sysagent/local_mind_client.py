@@ -108,6 +108,7 @@ class _LocalMindInteractions:
         import json as _json
 
         new_id = f"local-{uuid.uuid4().hex[:10]}"
+        on_delta = kwargs.pop("on_delta", None)
         sys_inst = system_instruction or ""
         prev_hist = list(self._history.get(previous_interaction_id or "", []))
 
@@ -126,9 +127,16 @@ class _LocalMindInteractions:
                 f"Tool results: {_json.dumps(input, ensure_ascii=False)[:2400]}\n"
                 "Answer the user's request concisely in their language based on these tool results."
             )
-            reply = self.mind.run_gguf_inference(
-                summary_prompt, system_instruction=sys_inst, history=prev_hist
-            ) or self.mind.synthesize_reply(orig_q, tool_results=input, system_instruction=sys_inst)
+            if on_delta is not None:
+                reply = self.mind.stream_gguf_inference(
+                    summary_prompt, system_instruction=sys_inst, history=prev_hist, on_delta=on_delta
+                )
+            else:
+                reply = self.mind.run_gguf_inference(
+                    summary_prompt, system_instruction=sys_inst, history=prev_hist
+                )
+            if not reply:
+                reply = self.mind.synthesize_reply(orig_q, tool_results=input, system_instruction=sys_inst)
             self._history[new_id] = (prev_hist + [{"role": "user", "content": orig_q}, {"role": "assistant", "content": reply}])[-8:]
             return self._emit_text(new_id, reply, stream)
 
@@ -157,8 +165,11 @@ class _LocalMindInteractions:
                         )
                         return self._emit_step(new_id, step, stream)
 
+            from .self_guard import get_calibration
+
+            tool_thresh = float(get_calibration(self.mind.storage)["local_tool_threshold"])
             pred_tool, pred_args, score = self.mind.predict_tool(user_text, allowed_names=allowed)
-            if pred_tool and score >= 0.72:
+            if pred_tool and score >= tool_thresh:
                 step = SimpleNamespace(
                     type="function_call",
                     id=f"local_call_{uuid.uuid4().hex[:6]}",
@@ -168,12 +179,36 @@ class _LocalMindInteractions:
                 return self._emit_step(new_id, step, stream)
 
         extra_sys = self._format_tool_catalog(tools) if tools else ""
-        reply = self.mind.run_gguf_inference(
-            user_text,
-            system_instruction=sys_inst,
-            history=prev_hist,
-            extra_system=extra_sys,
-        )
+        if on_delta is not None:
+            stream_mode: list[str] = ["pending" if allowed else "live"]
+
+            def _guarded_delta(chunk: str) -> None:
+                if stream_mode[0] == "suppress":
+                    return
+                if stream_mode[0] == "pending":
+                    stripped = chunk.lstrip()
+                    if not stripped:
+                        return
+                    if stripped[0] in {"{", "`"}:
+                        stream_mode[0] = "suppress"
+                        return
+                    stream_mode[0] = "live"
+                on_delta(chunk)
+
+            reply = self.mind.stream_gguf_inference(
+                user_text,
+                system_instruction=sys_inst,
+                history=prev_hist,
+                extra_system=extra_sys,
+                on_delta=_guarded_delta,
+            )
+        else:
+            reply = self.mind.run_gguf_inference(
+                user_text,
+                system_instruction=sys_inst,
+                history=prev_hist,
+                extra_system=extra_sys,
+            )
         if reply and allowed:
             parsed = self._extract_tool_call(reply, allowed)
             if parsed is not None:
