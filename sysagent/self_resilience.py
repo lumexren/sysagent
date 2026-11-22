@@ -368,9 +368,13 @@ class ContextBudgeter:
 
     @staticmethod
     def budget_tool_output(
-        storage: Storage | None, tool_name: str, text: str, max_chars: int = 4000
+        storage: Storage | None,
+        tool_name: str,
+        text: str,
+        max_chars: int = 4000,
+        query: str = "",
     ) -> str:
-        """Cache oversized tool outputs in SQLite and return a head+tail slice with retrieval key."""
+        """Cache oversized tool outputs in SQLite and return a query-aware head+salient_middle+tail slice."""
         if len(text) <= max_chars:
             return text
         ref_id = ""
@@ -382,6 +386,35 @@ class ContextBudgeter:
                 ref_id = ref_key
             except Exception:
                 ref_id = ""
+
+        q_toks = set(re.findall(r"\w{3,}", (query or "").lower()))
+        if q_toks and max_chars >= 400:
+            head_len = max(60, int(max_chars * 0.45))
+            tail_len = max(40, int(max_chars * 0.20))
+            mid_budget = max(80, int(max_chars * 0.28))
+            mid_region = text[head_len : max(head_len, len(text) - tail_len)]
+            if len(mid_region) > mid_budget:
+                win_size = min(len(mid_region), mid_budget)
+                step = max(60, win_size // 2)
+                best_win = ""
+                best_score = 0
+                for start in range(0, max(1, len(mid_region) - win_size + 1), step):
+                    chunk = mid_region[start : start + win_size]
+                    c_toks = set(re.findall(r"\w{3,}", chunk.lower()))
+                    overlap = len(q_toks & c_toks)
+                    if overlap > best_score:
+                        best_score = overlap
+                        best_win = chunk
+                if best_score > 0 and best_win:
+                    cache_note = f"; cached as {ref_id}" if ref_id else ""
+                    return (
+                        text[:head_len]
+                        + f"\n...[query-matched middle excerpt ({best_score} terms{cache_note})]...\n"
+                        + best_win
+                        + "\n...[compacted tail]...\n"
+                        + text[-tail_len:]
+                    )
+
         head = max(40, int(max_chars * 0.65))
         tail = max(20, int(max_chars * 0.25))
         marker = (

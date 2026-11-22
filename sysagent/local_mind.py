@@ -973,6 +973,7 @@ class LocalMind:
         user_request: str,
         tool_name: str,
         tool_args: dict[str, Any],
+        invoke_llm_critic: bool = False,
     ) -> dict[str, Any]:
         """Critique a proposed tool call using schema rules, contrastive preference memory, and the 4B reasoning slot."""
         schema_map = self._build_tool_schema_map()
@@ -987,17 +988,25 @@ class LocalMind:
             }
         req = spec.get("required") or []
         props = spec.get("properties") or {}
-        missing = [rk for rk in req if rk not in (tool_args or {}) or (tool_args or {}).get(rk) in {None, ""}]
+        raw_args = dict(tool_args or {})
+        missing = [rk for rk in req if rk not in raw_args or raw_args.get(rk) in {None, ""}]
         if missing:
+            repaired_args = {k: v for k, v in raw_args.items() if k in props}
+            if len(req) == 1 and req[0] in missing:
+                unknown_vals = [
+                    v for k, v in raw_args.items() if k not in props and v is not None and str(v).strip() != ""
+                ]
+                if len(unknown_vals) == 1:
+                    repaired_args[req[0]] = unknown_vals[0]
             return {
                 "approved": False,
                 "risk": "medium",
                 "critique": f"Missing required parameter(s) for '{tool_name}': {missing}",
                 "suggested_tool": tool_name,
-                "suggested_args": dict(tool_args or {}),
+                "suggested_args": repaired_args,
             }
 
-        for k, val in (tool_args or {}).items():
+        for k, val in raw_args.items():
             pdef = props.get(k)
             if (
                 isinstance(pdef, dict)
@@ -1005,18 +1014,24 @@ class LocalMind:
                 and pdef["enum"]
                 and val not in pdef["enum"]
             ):
+                repaired_enum_args = dict(raw_args)
+                if isinstance(val, str):
+                    enum_map = {str(e).lower(): e for e in pdef["enum"]}
+                    close = difflib.get_close_matches(val.strip().lower(), list(enum_map.keys()), n=1, cutoff=0.6)
+                    if close:
+                        repaired_enum_args[k] = enum_map[close[0]]
                 return {
                     "approved": False,
                     "risk": "medium",
                     "critique": f"Invalid enum value '{val}' for '{tool_name}.{k}' (allowed: {pdef['enum']}).",
                     "suggested_tool": tool_name,
-                    "suggested_args": dict(tool_args or {}),
+                    "suggested_args": repaired_enum_args,
                 }
 
         for pair in self.retrieve_contrastive_hints(user_request, top_k=2):
             rej = pair.get("rejected") or {}
             cho = pair.get("chosen") or {}
-            if rej.get("tool") == tool_name and rej.get("args") == (tool_args or {}):
+            if rej.get("tool") == tool_name and (not rej.get("args") or rej.get("args") == raw_args):
                 return {
                     "approved": False,
                     "risk": "medium",
@@ -1025,7 +1040,7 @@ class LocalMind:
                     "suggested_args": dict(cho.get("args") or {}),
                 }
 
-        reasoner = find_gguf_model("reasoning", strict=True)
+        reasoner = find_gguf_model("reasoning", strict=True) if invoke_llm_critic else None
         if reasoner is not None and tool_name in {"edit_file", "write_file", "run_command", "trash_file"}:
             critic_prompt = json.dumps(
                 {

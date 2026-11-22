@@ -281,8 +281,13 @@ class AgentManager:
         recorded_tool_calls: list[dict[str, Any]],
         batch_id: str,
         user_message: str = "",
+        run_impact_tests: bool = True,
     ) -> dict[str, Any]:
-        """Verify mutated files in the current turn and auto-rollback broken edits to their pre-turn checkpoint."""
+        """Verify mutated files (syntax + AST impact unit tests) and auto-rollback broken edits to pre-turn checkpoint."""
+        import os as _os
+        import subprocess as _sp
+        import sys as _sys
+
         checked: set[str] = set()
         for tc in reversed(recorded_tool_calls):
             if tc.get("failed") or tc.get("rolled_back"):
@@ -298,6 +303,40 @@ class AgentManager:
             if not fp.is_file():
                 continue
             ver = verify_written_file(fp)
+            failed_test_name = ""
+            if ver.get("ok", True) and run_impact_tests and fp.suffix.lower() == ".py":
+                tests_dir = fp.parent.parent / "tests"
+                if tests_dir.is_dir():
+                    try:
+                        from .evolve_ast import analyze_symbol_blast_radius
+
+                        blast = analyze_symbol_blast_radius(fp.name, pkg_dir=fp.parent)
+                        covering = [
+                            tests_dir / tf
+                            for tf in (blast.get("covering_tests") or [])
+                            if (tests_dir / tf).is_file()
+                        ][:2]
+                        env = {**_os.environ, "PYTHONPATH": str(fp.parent.parent)}
+                        for tf in covering:
+                            proc = _sp.run(
+                                [_sys.executable, str(tf)],
+                                cwd=str(fp.parent.parent),
+                                env=env,
+                                capture_output=True,
+                                text=True,
+                                timeout=15,
+                            )
+                            if proc.returncode != 0:
+                                failed_test_name = tf.name
+                                tail_err = (proc.stderr or proc.stdout or "").strip()[-240:]
+                                ver = {
+                                    "ok": False,
+                                    "kind": "impact_test",
+                                    "error": f"Impact test {tf.name} failed: {tail_err}",
+                                }
+                                break
+                    except Exception:
+                        pass
             if ver.get("ok", True):
                 continue
 
@@ -332,7 +371,7 @@ class AgentManager:
                 self.storage.add_lesson(
                     f"tx_rollback:{fp.name}",
                     f"Broken {tname} on {fp.name}: {err_msg[:120]}",
-                    "Transactional rollback restored clean state; verify syntax before saving.",
+                    "Transactional rollback restored clean state; verify syntax and unit tests before saving.",
                 )
             except Exception:
                 pass
@@ -351,6 +390,7 @@ class AgentManager:
                 "file": fp.name,
                 "path": str(fp),
                 "error": err_msg,
+                "failed_test": failed_test_name or None,
             }
         return {"rolled_back": False}
 
@@ -854,6 +894,33 @@ class AgentManager:
             import traceback
 
             args = dict(call.arguments or {})
+            if call.name in builtin_names:
+                try:
+                    from .local_mind import LocalMind
+
+                    review = LocalMind(self.storage).local_actor_critic_review(
+                        user_message, call.name, args, invoke_llm_critic=False
+                    )
+                    sug_tool = review.get("suggested_tool")
+                    sug_args = review.get("suggested_args")
+                    if (
+                        not review.get("approved")
+                        and isinstance(sug_tool, str)
+                        and sug_tool in builtin_names
+                        and isinstance(sug_args, dict)
+                        and (sug_tool != call.name or sug_args != args)
+                    ):
+                        call.name = sug_tool
+                        args = dict(sug_args)
+                        call.arguments = args
+                        await _emit(
+                            {
+                                "type": "status",
+                                "message": f"actor-critic auto-corrected call -> {call.name}",
+                            }
+                        )
+                except Exception:
+                    pass
             recorded_tool_calls.append({"name": call.name, "arguments": args})
             await _emit(
                 {
@@ -1109,7 +1176,11 @@ class AgentManager:
                                 result_payload = f"{result_payload}\n{hint}"
                         if isinstance(result_payload, str):
                             result_payload = ContextBudgeter.budget_tool_output(
-                                self.storage, call.name, scrub_secrets(result_payload), max_chars=4000
+                                self.storage,
+                                call.name,
+                                scrub_secrets(result_payload),
+                                max_chars=4000,
+                                query=user_message,
                             )
                         if call.name in {"write_file", "edit_file", "trash_file", "undo_last_action", "undo_batch_actions", "run_command", "forge_skill"}:
                             self._tool_cache.invalidate_all()

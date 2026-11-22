@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import psutil
@@ -116,11 +117,14 @@ class NeuralBrainCortex:
         return {"unloaded_gguf": unloaded, "pruned_thoughts": pruned}
 
     def evaluate_predictive_healer(
-        self, force: bool = False, notify: bool = True
+        self,
+        force: bool = False,
+        notify: bool = True,
+        twin_snapshots: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Predict impending bottleneck/anomaly, match past root causes, and offer one-click relief."""
+        """Predict impending bottleneck/anomaly or process memory leak, match root causes, and offer relief."""
         now = time.monotonic()
-        if not force and (now - self._last_heal_ts) < 1200.0:
+        if not force and twin_snapshots is None and (now - self._last_heal_ts) < 1200.0:
             return {"status": "cooldown", "last_heal": self.last_heal}
 
         wf: dict[str, Any] = {}
@@ -134,10 +138,27 @@ class NeuralBrainCortex:
         except Exception:
             wf = {}
 
+        twin: dict[str, Any] = {}
+        leaks: list[dict[str, Any]] = []
+        try:
+            from .self_learn import analyze_causal_digital_twin
+
+            twin = analyze_causal_digital_twin(
+                self.storage, self.watcher, snapshots=twin_snapshots
+            )
+            leaks = list(twin.get("memory_leaks") or [])
+        except Exception:
+            twin = {}
+
         prob = float(wf.get("bottleneck_prob", 0.0) or 0.0)
-        anomaly = bool(wf.get("anomaly_detected"))
+        anomaly = bool(wf.get("anomaly_detected")) or bool(leaks)
         if not force and not anomaly and prob < 0.70:
-            return {"status": "healthy", "bottleneck_prob": prob, "anomaly_detected": anomaly}
+            return {
+                "status": "healthy",
+                "bottleneck_prob": prob,
+                "anomaly_detected": anomaly,
+                "digital_twin": twin,
+            }
 
         top_proc = ""
         try:
@@ -151,13 +172,32 @@ class NeuralBrainCortex:
         except Exception:
             pass
 
-        lessons = self.storage.list_lessons(limit=5)
-        lesson_hint = (
-            str(lessons[0].get("insight") or lessons[0].get("resolution") or "")[:60]
-            if lessons
-            else ""
-        )
-        cause_hint = str(hits[0].get("key")) if hits else (lesson_hint or top_proc or "resource spike")
+        leak_qid: int | None = None
+        if leaks:
+            top_leak = leaks[0]
+            cause_hint = (
+                f"memory_leak:{top_leak['name']}(PID {top_leak['pid']}, "
+                f"+{top_leak['slope_mb_per_min']} MB/min, OOM ~{top_leak['oom_eta_min']}m)"
+            )
+            try:
+                leak_qid = self.storage.create_brain_question(
+                    f"Process '{top_leak['name']}' (PID {top_leak['pid']}) is leaking "
+                    f"+{top_leak['slope_mb_per_min']} MB/min (OOM ETA ~{top_leak['oom_eta_min']}m). "
+                    f"Terminate PID {top_leak['pid']} or free RAM?",
+                    f"Causal Digital Twin leak detection: {top_leak}",
+                    f"kill_leak:{top_leak['pid']}",
+                )
+            except Exception:
+                leak_qid = None
+        else:
+            lessons = self.storage.list_lessons(limit=5)
+            lesson_hint = (
+                str(lessons[0].get("insight") or lessons[0].get("resolution") or "")[:60]
+                if lessons
+                else ""
+            )
+            cause_hint = str(hits[0].get("key")) if hits else (lesson_hint or top_proc or "resource spike")
+
         summary = (
             f"10m forecast: CPU {wf.get('pred_cpu_10m', '?')}%, RAM {wf.get('pred_ram_10m', '?')}% "
             f"(bottleneck={prob:.2f}). Likely factor: {cause_hint}."
@@ -173,6 +213,8 @@ class NeuralBrainCortex:
             "cause_hint": cause_hint,
             "top_process": top_proc,
             "summary": summary,
+            "digital_twin": twin,
+            "leak_question_id": leak_qid,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
         self.last_heal = result
@@ -201,6 +243,72 @@ class NeuralBrainCortex:
                 on_action=_on_action,
             )
         return result
+
+    def consolidate_episodic_project_graph(self) -> dict[str, Any]:
+        """Extract project names, touched files, and solved topics from session_checkpoints into the Knowledge Graph."""
+        projects: set[str] = set()
+        edges_added = 0
+        project_topics: dict[str, list[str]] = {}
+        try:
+            checkpoints = self.storage.list_session_checkpoints(limit=40)
+        except Exception:
+            checkpoints = []
+
+        for cp in checkpoints:
+            cwd = str(cp.get("cwd") or "").strip()
+            files = cp.get("files") if isinstance(cp.get("files"), list) else []
+            topic = str(cp.get("topic") or "").strip()
+            proj_name = ""
+            if cwd:
+                p_cwd = Path(cwd)
+                if p_cwd.name and p_cwd.name not in {"home", "eren", "tmp", "/"}:
+                    proj_name = p_cwd.name
+            if not proj_name and files:
+                first_f = Path(str(files[0]))
+                parts = [pt for pt in first_f.parts if pt not in {"/", "home", "eren", "Projects", "tmp", "sysagent"}]
+                if "Projects" in first_f.parts:
+                    idx = first_f.parts.index("Projects")
+                    if idx + 1 < len(first_f.parts):
+                        proj_name = first_f.parts[idx + 1]
+                elif parts:
+                    proj_name = first_f.parent.name or parts[0]
+            if not proj_name:
+                continue
+
+            proj_node = f"project:{proj_name}"
+            projects.add(proj_name)
+            if topic:
+                bucket = project_topics.setdefault(proj_name, [])
+                if topic[:80] not in bucket:
+                    bucket.append(topic[:80])
+                try:
+                    self.storage.add_kg_edge(proj_node, "recent_topic", topic[:80])
+                    edges_added += 1
+                except Exception:
+                    pass
+            for f_str in files[:6]:
+                fname = Path(str(f_str)).name
+                if fname:
+                    try:
+                        self.storage.add_kg_edge(proj_node, "touched_file", fname)
+                        edges_added += 1
+                    except Exception:
+                        pass
+
+        for pname, topics in project_topics.items():
+            try:
+                self.storage.set_memory(
+                    f"project:{pname}",
+                    f"Active project '{pname}'; recent work: {' | '.join(topics[:4])}"[:360],
+                )
+            except Exception:
+                pass
+
+        return {
+            "projects_indexed": len(projects),
+            "kg_edges_added": edges_added,
+            "projects": sorted(projects),
+        }
 
     def run_dream_cycle(self, force: bool = False) -> dict[str, Any]:
         """Consolidate memories, decay stale rules, distill recurring patterns, and sync Neural synapses."""
@@ -253,6 +361,7 @@ class NeuralBrainCortex:
         except Exception:
             pass
 
+        episodic_projects = self.consolidate_episodic_project_graph()
         thoughts = self.storage.list_brain_thoughts(limit=80)
         decision_counts = Counter(str(t.get("decision") or "") for t in thoughts)
 
@@ -276,6 +385,7 @@ class NeuralBrainCortex:
             "pruned_thoughts": pruned_thoughts,
             "pruned_codebase_memories": pruned_code_mems,
             "codebase_trained_samples": codebase_trained,
+            "episodic_projects": episodic_projects,
             "thought_summary": dict(decision_counts),
             "synapses": synapses,
             "timestamp": datetime.now().isoformat(timespec="seconds"),

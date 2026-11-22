@@ -885,6 +885,138 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             kg_edges = st.query_kg("leak:leaky_worker:9991")
             self.assertTrue(any(e.get("relation") == "causes" for e in kg_edges))
 
+    def test_five_live_runtime_integration_features(self) -> None:
+        from sysagent.cortex import NeuralBrainCortex
+        from sysagent.self_resilience import ContextBudgeter
+
+        with Storage(db_path=self.root / "live_five.db") as st:
+            lm = LocalMind(st)
+            lm.train()
+
+            # 1) Live Pre-Execution Actor-Critic Interception in AgentManager.run_turn
+            lm.record_preference_pair(
+                "promptlar ne durumda",
+                chosen_tool="inspect_self_component",
+                chosen_args={"component": "prompts"},
+                rejected_tool="list_directory",
+                rejected_args={"path": "/tmp"},
+                reason="Use inspect_self_component for prompt inspection",
+            )
+            watcher = SimpleNamespace(current_context="normal", _send_desktop_notification=MagicMock())
+            am = AgentManager(Settings(), watcher, st, PluginRegistry(), MagicMock(is_configured=True))
+            turn_seq = [
+                SimpleNamespace(
+                    id="ac1",
+                    steps=[
+                        SimpleNamespace(
+                            type="function_call",
+                            id="c1",
+                            name="list_directory",
+                            arguments={"path": "/tmp"},
+                        )
+                    ],
+                    output_text="",
+                ),
+                SimpleNamespace(id="ac2", steps=[], output_text="PromptRegistry incelendi."),
+            ]
+            with (
+                patch.object(am, "_get_client", return_value=MagicMock()),
+                patch.object(am, "_match_zero_llm_fastpath", return_value=None),
+                patch.object(am, "_call_model_with_failover", side_effect=turn_seq),
+            ):
+                ac_out = asyncio.run(am.run_turn("s-ac", "promptlar ne durumda"))
+            self.assertIn("PromptRegistry incelendi", ac_out)
+            _, last_tools = am._last_turn_info["s-ac"]
+            self.assertEqual(last_tools[0]["name"], "inspect_self_component")
+            self.assertEqual(last_tools[0]["arguments"], {"component": "prompts"})
+
+            # 2) Impact-Guided Transactional Test Gate rolls back syntax-valid edit that breaks unit tests
+            mini_repo = self.root / "mini_repo"
+            mini_pkg = mini_repo / "pkg"
+            mini_tests = mini_repo / "tests"
+            mini_pkg.mkdir(parents=True, exist_ok=True)
+            mini_tests.mkdir(parents=True, exist_ok=True)
+            mod_file = mini_pkg / "calc_mod.py"
+            test_file = mini_tests / "test_calc_mod.py"
+            good_mod_src = "def add_two(x: int) -> int:\n    return x + 2\n"
+            mod_file.write_text(good_mod_src, encoding="utf-8")
+            test_file.write_text(
+                "from pkg.calc_mod import add_two\nassert add_two(3) == 5, 'broken calc'\n",
+                encoding="utf-8",
+            )
+            tx_batch = "impact-batch-1"
+            execute_tool(
+                "edit_file",
+                {"path": str(mod_file), "target": "return x + 2", "replacement": "return x + 999"},
+                None,
+                st,
+                batch_id=tx_batch,
+            )
+            self.assertIn("999", mod_file.read_text(encoding="utf-8"))
+            rec_calls = [{"name": "edit_file", "arguments": {"path": str(mod_file)}}]
+            imp_res = am.verify_and_transactional_rollback(
+                rec_calls, tx_batch, user_message="update add_two", run_impact_tests=True
+            )
+            self.assertTrue(imp_res["rolled_back"])
+            self.assertEqual(imp_res["failed_test"], "test_calc_mod.py")
+            self.assertEqual(mod_file.read_text(encoding="utf-8"), good_mod_src)
+
+            # 3) Cortex Proactive Leak & Anomaly Auto-Healer
+            cortex = NeuralBrainCortex(Settings(), st, watcher=watcher)
+            leak_snaps = [
+                {
+                    "ts": 2000.0,
+                    "ram_percent": 70.0,
+                    "avail_ram_mb": 3000.0,
+                    "total_ram_mb": 16000.0,
+                    "processes": [{"pid": 7771, "name": "runaway_daemon", "rss_mb": 500.0, "cpu_percent": 15.0}],
+                },
+                {
+                    "ts": 2120.0,
+                    "ram_percent": 74.0,
+                    "avail_ram_mb": 2900.0,
+                    "total_ram_mb": 16000.0,
+                    "processes": [{"pid": 7771, "name": "runaway_daemon", "rss_mb": 600.0, "cpu_percent": 16.0}],
+                },
+            ]
+            heal_res = cortex.evaluate_predictive_healer(force=False, notify=False, twin_snapshots=leak_snaps)
+            self.assertEqual(heal_res["status"], "alerted")
+            self.assertIsNotNone(heal_res["leak_question_id"])
+            self.assertIn("runaway_daemon", heal_res["cause_hint"])
+            pending_qs = st.list_brain_questions("pending")
+            self.assertTrue(any("runaway_daemon" in str(q.get("question")) for q in pending_qs))
+
+            # 4) Query-Aware Semantic Context Budgeter 2.0 preserves query-matching middle lines
+            filler_head = "HEAD_LINE_ALPHA\n" * 120
+            salient_mid = "\nCRITICAL_VRAM_OVERFLOW_SIGNAL detected on GPU0 at 14:59:00 with error_code=E991\n"
+            filler_tail = "TAIL_LINE_OMEGA\n" * 120
+            big_output = filler_head + salient_mid + filler_tail
+            budgeted = ContextBudgeter.budget_tool_output(
+                st,
+                "read_journal_logs",
+                big_output,
+                max_chars=900,
+                query="CRITICAL_VRAM_OVERFLOW_SIGNAL error_code E991",
+            )
+            self.assertLessEqual(len(budgeted), 1050)
+            self.assertIn("CRITICAL_VRAM_OVERFLOW_SIGNAL", budgeted)
+            self.assertIn("query-matched middle excerpt", budgeted)
+
+            # 5) Episodic Project Knowledge Graph in Dream Cycle
+            st.save_session_checkpoint(
+                "cli-ep1",
+                "Fix Wi-Fi KCM crash on disconnect",
+                "Patched kcm.cpp null pointer",
+                cwd="/home/eren/Projects/plasma-networkd",
+                files=["/home/eren/Projects/plasma-networkd/kcm/kcm.cpp"],
+            )
+            ep_graph = cortex.consolidate_episodic_project_graph()
+            self.assertGreaterEqual(ep_graph["projects_indexed"], 1)
+            self.assertIn("plasma-networkd", ep_graph["projects"])
+            proj_edges = st.query_kg("project:plasma-networkd")
+            self.assertTrue(any(e.get("object") == "kcm.cpp" for e in proj_edges))
+            self.assertIsNotNone(st.get_memory("project:plasma-networkd"))
+
 
 if __name__ == "__main__":
     unittest.main()
