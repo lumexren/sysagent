@@ -178,7 +178,7 @@ def select_relevant_tools(
 
 
 class ToolCache:
-    """Thread-safe short-TTL cache for read-only tool results."""
+    """Thread-safe adaptive-TTL cache for read-only tool results."""
 
     CACHEABLE = frozenset(
         {
@@ -186,6 +186,7 @@ class ToolCache:
             "list_directory",
             "search_files",
             "system_status",
+            "inspect_self_component",
             "read_journal_logs",
             "list_systemd_units",
             "list_processes",
@@ -198,19 +199,56 @@ class ToolCache:
         }
     )
 
+    _FAST_FS_TOOLS = frozenset({"read_file", "list_directory", "search_files"})
+
     def __init__(self, ttl_sec: float = 15.0, max_entries: int = 128) -> None:
         self.ttl_sec = ttl_sec
         self.max_entries = max_entries
         self._lock = threading.Lock()
         self._store: dict[str, tuple[float, Any]] = {}
+        self._tool_ttls: dict[str, float] = {}
+
+    def get_ttl(self, name: str) -> float:
+        """Return the adaptive TTL for `name` (falling back to default `ttl_sec`)."""
+        return float(self._tool_ttls.get(name, self.ttl_sec))
+
+    def calibrate_from_metrics(self, storage: Storage | None) -> dict[str, float]:
+        """Dynamically tune per-tool cache TTLs based on observed tool latency and error telemetry."""
+        if storage is None:
+            return dict(self._tool_ttls)
+        try:
+            metrics = storage.get_tool_metrics()
+        except Exception:
+            return dict(self._tool_ttls)
+        new_ttls: dict[str, float] = {}
+        for m in metrics:
+            tname = str(m.get("tool_name") or "")
+            if tname not in self.CACHEABLE:
+                continue
+            calls = max(1, int(m.get("calls", 1) or 1))
+            errors = int(m.get("errors", 0) or 0)
+            avg_ms = float(m.get("avg_ms", 0.0) or 0.0)
+            err_rate = errors / calls
+            if err_rate >= 0.25:
+                new_ttls[tname] = max(3.0, min(10.0, self.ttl_sec * 0.25))
+            elif tname in self._FAST_FS_TOOLS:
+                new_ttls[tname] = max(5.0, min(30.0, self.ttl_sec * 0.4))
+            elif avg_ms >= 250.0:
+                new_ttls[tname] = round(min(300.0, max(self.ttl_sec, avg_ms / 8.0)), 1)
+            else:
+                new_ttls[tname] = self.ttl_sec
+        with self._lock:
+            self._tool_ttls.update(new_ttls)
+        return dict(self._tool_ttls)
 
     def get(self, name: str, args: dict[str, Any]) -> Any | None:
         if name not in self.CACHEABLE:
             return None
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
+        eff_ttl = self.get_ttl(name)
         with self._lock:
             entry = self._store.get(key)
-            if entry and (time.monotonic() - entry[0]) <= self.ttl_sec:
+            if entry and (time.monotonic() - entry[0]) <= eff_ttl:
                 return entry[1]
             self._store.pop(key, None)
         return None
@@ -222,7 +260,11 @@ class ToolCache:
         now = time.monotonic()
         with self._lock:
             if len(self._store) >= self.max_entries:
-                expired = [k for k, (ts, _) in self._store.items() if (now - ts) > self.ttl_sec]
+                expired = [
+                    k
+                    for k, (ts, _) in self._store.items()
+                    if (now - ts) > self.get_ttl(k.split(":", 1)[0])
+                ]
                 for k in expired:
                     self._store.pop(k, None)
                 if len(self._store) >= self.max_entries:

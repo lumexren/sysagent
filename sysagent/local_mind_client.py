@@ -496,29 +496,53 @@ class _LocalMindInteractions:
                     return self._emit_text(new_id, native_text, stream)
 
             if not inline_images and not is_nudge:
+                from .safety import SAFE_TOOLS
                 from .self_guard import get_calibration
 
                 tool_thresh = float(get_calibration(self.mind.storage)["local_tool_threshold"])
                 pred_tool, pred_args, score = self.mind.predict_tool(effective_q, allowed_names=allowed)
                 if pred_tool and score >= tool_thresh:
-                    cid = f"local_call_{uuid.uuid4().hex[:6]}"
-                    step = SimpleNamespace(
-                        type="function_call",
-                        id=cid,
-                        name=pred_tool,
-                        arguments=pred_args,
-                    )
+                    batch_calls: list[tuple[str, dict[str, Any]]] = [(pred_tool, pred_args)]
+                    if pred_tool in SAFE_TOOLS and score >= max(tool_thresh, 0.72):
+                        chain = self.mind.predict_tool_chain(effective_q, allowed_names=allowed, max_steps=2)
+                        if (
+                            len(chain) >= 2
+                            and chain[0].get("name") == pred_tool
+                            and chain[1].get("name") in SAFE_TOOLS
+                            and float(chain[1].get("score", 0.0) or 0.0) >= 0.50
+                        ):
+                            batch_calls.append(
+                                (
+                                    str(chain[1]["name"]),
+                                    dict(chain[1].get("arguments") or {}),
+                                )
+                            )
+                    steps = []
+                    oai_calls = []
+                    new_sigs = []
+                    for b_name, b_args in batch_calls:
+                        cid = f"local_call_{uuid.uuid4().hex[:6]}"
+                        steps.append(
+                            SimpleNamespace(
+                                type="function_call",
+                                id=cid,
+                                name=b_name,
+                                arguments=b_args,
+                            )
+                        )
+                        oai_calls.append(self._oai_tool_call_entry(cid, b_name, b_args))
+                        new_sigs.append(self._call_sig(b_name, b_args))
                     active_trace.append(
-                        {"role": "assistant", "content": "", "tool_calls": [self._oai_tool_call_entry(cid, pred_tool, pred_args)]}
+                        {"role": "assistant", "content": "", "tool_calls": oai_calls}
                     )
                     self._store_turn_state(
                         new_id,
                         effective_q,
                         prev_hist,
                         active_trace,
-                        prev_sigs + [self._call_sig(pred_tool, pred_args)],
+                        prev_sigs + new_sigs,
                     )
-                    return self._emit_step(new_id, step, stream)
+                    return self._emit_steps(new_id, steps, stream)
 
         extra_sys = self._format_tool_catalog(selected_tools or tools or [], effective_q) if tools else ""
         if on_delta is not None:

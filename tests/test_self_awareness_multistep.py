@@ -1017,6 +1017,91 @@ class SelfAwarenessAndMultiStepTests(unittest.TestCase):
             self.assertTrue(any(e.get("object") == "kcm.cpp" for e in proj_edges))
             self.assertIsNotNone(st.get_memory("project:plasma-networkd"))
 
+    def test_five_end_to_end_autonomous_acceleration_features(self) -> None:
+        from sysagent.agent import extract_cwd_project_context
+        from sysagent.brain import CognitiveBrain
+        from sysagent.evolve_ast import analyze_symbol_blast_radius
+        from sysagent.self_ops import ToolCache
+
+        with Storage(db_path=self.root / "accel.db") as st:
+            # 1) Speculative Multi-Tool Batch Execution in LocalMindClient
+            cli = LocalMindClient(st)
+            with (
+                patch.object(cli.interactions.mind, "run_gguf_chat_with_tools", return_value=None),
+                patch.object(
+                    cli.interactions.mind,
+                    "predict_tool",
+                    return_value=("system_status", {}, 0.88),
+                ),
+                patch.object(
+                    cli.interactions.mind,
+                    "predict_tool_chain",
+                    return_value=[
+                        {"name": "system_status", "arguments": {}, "score": 0.88},
+                        {"name": "list_processes", "arguments": {"limit": 10}, "score": 0.65},
+                    ],
+                ),
+            ):
+                spec_res = cli.interactions.create(
+                    input="check system status and top processes",
+                    tools=TOOL_DECLARATIONS,
+                )
+            self.assertEqual([s.name for s in spec_res.steps], ["system_status", "list_processes"])
+
+            # 2) CWD Project-Graph Auto-Context injection
+            st.set_memory("project:plasma-networkd", "Active project 'plasma-networkd'; recent work: Fix Wi-Fi KCM")
+            st.add_kg_edge("project:plasma-networkd", "touched_file", "kcm.cpp")
+            st.add_kg_edge("project:plasma-networkd", "recent_topic", "Fix Wi-Fi KCM crash")
+            p_ctx = extract_cwd_project_context(st, "[cwd: /home/eren/Projects/plasma-networkd/kcm]\nstatus?")
+            self.assertIn("Active project graph (plasma-networkd):", p_ctx)
+            self.assertIn("kcm.cpp", p_ctx)
+            self.assertIn("Fix Wi-Fi KCM crash", p_ctx)
+
+            # 3) Closed-Loop Brain Action Executor on BrainQuestion confirmation
+            watcher = SimpleNamespace(
+                current_context="normal",
+                _send_desktop_notification=MagicMock(),
+                get_health_snapshot=lambda: {"cpu_percent": 10.0, "ram_percent": 50.0},
+            )
+            fake_agent = SimpleNamespace(
+                auth=MagicMock(is_configured=False),
+                run_turn=MagicMock(),
+                reset_session=MagicMock(),
+            )
+            brain = CognitiveBrain(Settings(), watcher, st, fake_agent)
+            qid = st.create_brain_question(
+                "Process 'leaky_app' (PID 98765) is leaking +45 MB/min. Terminate?",
+                "Causal Digital Twin leak alert",
+                "kill_leak:98765",
+            )
+            fake_proc = MagicMock()
+            fake_proc.name.return_value = "leaky_app"
+            with patch("psutil.Process", return_value=fake_proc):
+                ans_res = asyncio.run(brain.answer_question(qid, "evet", learn_rule=False))
+            self.assertEqual(ans_res["status"], "answered")
+            self.assertTrue(ans_res["closed_loop"]["executed"])
+            self.assertEqual(ans_res["closed_loop"]["process"], "leaky_app")
+            fake_proc.terminate.assert_called_once()
+            fake_agent.run_turn.assert_not_called()
+
+            # 4) Blast-Radius Guided SelfEvolver metadata
+            mod_blast = analyze_symbol_blast_radius("local_mind.py", storage=st)
+            self.assertIn("local_mind.py", mod_blast["affected_modules"])
+            self.assertGreaterEqual(len(mod_blast["covering_tests"]), 1)
+            self.assertGreaterEqual(len(mod_blast["direct_callers"]), 1)
+
+            # 5) Adaptive ToolCache & Latency Optimizer
+            cache = ToolCache(ttl_sec=30.0)
+            self.assertIn("inspect_self_component", ToolCache.CACHEABLE)
+            for _ in range(4):
+                st.record_tool_metric("read_file", 8.0, False)
+                st.record_tool_metric("list_systemd_units", 960.0, False)
+            ttls = cache.calibrate_from_metrics(st)
+            self.assertIn("read_file", ttls)
+            self.assertIn("list_systemd_units", ttls)
+            self.assertGreater(cache.get_ttl("list_systemd_units"), cache.get_ttl("read_file"))
+            self.assertGreaterEqual(cache.get_ttl("list_systemd_units"), 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

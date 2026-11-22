@@ -485,6 +485,77 @@ class CognitiveBrain:
             )
             break
 
+    def _execute_closed_loop_action(self, action_code: str, user_answer: str) -> dict[str, Any] | None:
+        """Deterministically execute structured remediation actions (`kill_leak:<pid>`, `free_vram`) upon user confirmation."""
+        code = (action_code or "").strip()
+        if not code.startswith(("kill_leak:", "free_vram", "clean_cache")):
+            return None
+        ans_low = (user_answer or "").strip().lower()
+        negative_tokens = {"no", "n", "hayir", "hayır", "reddet", "iptal", "cancel", "dismiss", "ignore", "0", "false"}
+        if not ans_low or ans_low in negative_tokens or any(tok in ans_low.split() for tok in negative_tokens):
+            return {"executed": False, "action": code, "status": "declined"}
+
+        import psutil as _ps
+
+        avail_before_mb = round(_ps.virtual_memory().available / (1024 * 1024), 1)
+        if code.startswith("kill_leak:"):
+            raw_pid = code.split(":", 1)[1].strip()
+            if not raw_pid.isdigit():
+                return {"executed": False, "action": code, "error": "invalid_pid"}
+            pid = int(raw_pid)
+            terminated = False
+            proc_name = f"pid:{pid}"
+            try:
+                proc = _ps.Process(pid)
+                proc_name = proc.name()
+                proc.terminate()
+                terminated = True
+            except (_ps.NoSuchProcess, _ps.AccessDenied) as exc:
+                return {
+                    "executed": False,
+                    "action": code,
+                    "pid": pid,
+                    "error": str(exc),
+                }
+            avail_after_mb = round(_ps.virtual_memory().available / (1024 * 1024), 1)
+            freed_mb = round(max(0.0, avail_after_mb - avail_before_mb), 1)
+            summary = f"Terminated leaking process '{proc_name}' (PID {pid}); freed ~{freed_mb} MB RAM."
+            try:
+                self.storage.add_lesson(
+                    f"closed_loop:{code}",
+                    f"User approved terminating leaking process {proc_name} (PID {pid})",
+                    summary,
+                )
+                from .neural import NeuralEngine
+
+                NeuralEngine(self.storage).online_step(f"remediate memory leak {proc_name}", "system_status", reward=1.3)
+            except Exception:
+                pass
+            return {
+                "executed": terminated,
+                "action": code,
+                "pid": pid,
+                "process": proc_name,
+                "freed_ram_mb": freed_mb,
+                "summary": summary,
+            }
+
+        if code == "free_vram":
+            from .local_inference import _release_all_warm_models
+
+            unloaded = _release_all_warm_models()
+            avail_after_mb = round(_ps.virtual_memory().available / (1024 * 1024), 1)
+            freed_mb = round(max(0.0, avail_after_mb - avail_before_mb), 1)
+            summary = f"Released warm GGUF models (unloaded={unloaded}); freed ~{freed_mb} MB RAM."
+            return {
+                "executed": True,
+                "action": code,
+                "unloaded_gguf": unloaded,
+                "freed_ram_mb": freed_mb,
+                "summary": summary,
+            }
+        return None
+
     async def answer_question(
         self, question_id: int, user_answer: str, learn_rule: bool = True
     ) -> dict[str, Any]:
@@ -519,6 +590,24 @@ class CognitiveBrain:
                 except Exception:
                     pass
             learned_rule_id = self.storage.add_brain_rule(pattern, policy, confidence=85)
+
+        closed_loop = self._execute_closed_loop_action(
+            str(q.get("suggested_rule") or ""), user_answer
+        )
+        if closed_loop is not None and closed_loop.get("executed"):
+            reply = str(closed_loop.get("summary") or "Closed-loop remediation executed.")
+            self.storage.add_brain_thought(
+                "act",
+                95,
+                f"Closed-loop action for #{question_id}: {closed_loop.get('action')}",
+                reply[:300],
+            )
+            return {
+                "status": "answered",
+                "learned_rule_id": learned_rule_id,
+                "closed_loop": closed_loop,
+                "reply": reply,
+            }
 
         exec_prompt = (
             f"Regarding this situation:\nQuestion: {q['question']}\nContext: {q['context']}\n"

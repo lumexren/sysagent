@@ -341,12 +341,25 @@ class SelfEvolver:
             if passed:
                 tests_dir = PACKAGE_DIR.parent / "tests"
                 if tests_dir.is_dir():
-                    test_files = [
+                    impact_tests: list[Path] = []
+                    try:
+                        from .evolve_ast import analyze_symbol_blast_radius
+
+                        blast = analyze_symbol_blast_radius(rel_name, pkg_dir=PACKAGE_DIR)
+                        for tf_name in (blast.get("covering_tests") or [])[:4]:
+                            cand_tf = tests_dir / tf_name
+                            if cand_tf.is_file():
+                                impact_tests.append(cand_tf)
+                    except Exception:
+                        pass
+                    raw_test_files = [
                         *(tests_dir.glob("test_core.py")),
                         *(tests_dir.glob("test_server.py")),
                         *(tests_dir.glob("test_self_learn.py")),
+                        *impact_tests,
                         *sorted(tests_dir.glob("test_evolve_*.py"))[:10],
                     ]
+                    test_files = list(dict.fromkeys(raw_test_files))
                     for tf in test_files:
                         t_start = time.monotonic()
                         rp = subprocess.run(
@@ -632,12 +645,25 @@ class SelfEvolver:
             src = codebase[name]
             slice_info = extract_ast_focus_slice(src, c["why"], code_map[name]["ast_findings"])
             await _log(f"[2/5] Reading {name} in full ({code_map[name]['lines']} lines) [{idx}/{len(candidates)}]...")
+            blast_info: dict[str, Any] = {}
+            try:
+                from .evolve_ast import analyze_symbol_blast_radius
+
+                blast_info = analyze_symbol_blast_radius(name, pkg_dir=PACKAGE_DIR)
+            except Exception:
+                blast_info = {}
             deep_payload = {
                 "file": name,
                 "source": src,
                 "focus_slice": slice_info if slice_info.get("sliced") else None,
                 "why_selected": c["why"],
                 "ast_findings": code_map[name]["ast_findings"],
+                "blast_radius": {
+                    "direct_callers": blast_info.get("direct_callers", [])[:15],
+                    "affected_modules": blast_info.get("affected_modules", []),
+                    "covering_tests": blast_info.get("covering_tests", []),
+                    "risk_score": blast_info.get("risk_score", 0.0),
+                },
                 "recent_proposals_for_file": [p for p in recent_proposals if p["file"] == name],
                 "other_modules_outline": {k: v["symbols"] for k, v in code_map.items() if k != name},
                 "tool_metrics": survey_payload["tool_metrics"],

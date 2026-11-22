@@ -111,6 +111,53 @@ def _has_fenced_shell_block(reply_txt: str) -> bool:
         return False
     return bool(re.search(r"```(?:bash|sh|shell|zsh)\s*\n\s*\S", txt, flags=re.IGNORECASE))
 
+
+def extract_cwd_project_context(storage: Storage | None, user_message: str) -> str:
+    """Extract `[cwd: ...]` project identity and retrieve its Knowledge Graph edges & summary."""
+    if storage is None:
+        return ""
+    msg = (user_message or "").strip()
+    if not msg.startswith("[cwd:"):
+        return ""
+    end_idx = msg.find("]")
+    if end_idx == -1:
+        return ""
+    cwd_str = msg[5:end_idx].strip()
+    if not cwd_str:
+        return ""
+    p_cwd = Path(cwd_str)
+    proj_name = ""
+    if "Projects" in p_cwd.parts:
+        idx = p_cwd.parts.index("Projects")
+        if idx + 1 < len(p_cwd.parts):
+            proj_name = p_cwd.parts[idx + 1]
+    if not proj_name and p_cwd.name and p_cwd.name not in {"home", "eren", "tmp", "/"}:
+        proj_name = p_cwd.name
+    if not proj_name:
+        return ""
+
+    proj_key = f"project:{proj_name}"
+    lines: list[str] = []
+    try:
+        mem_summary = storage.get_memory(proj_key)
+        if mem_summary:
+            lines.append(str(mem_summary)[:240])
+    except Exception:
+        pass
+    try:
+        edges = storage.query_kg(proj_key, limit=10)
+        files = [str(e.get("object")) for e in edges if e.get("relation") == "touched_file" and e.get("object")]
+        topics = [str(e.get("object")) for e in edges if e.get("relation") == "recent_topic" and e.get("object")]
+        if files:
+            lines.append("Touched files: " + ", ".join(dict.fromkeys(files[:6])))
+        if topics:
+            lines.append("Recent topics: " + " | ".join(dict.fromkeys(topics[:3])))
+    except Exception:
+        pass
+    if not lines:
+        return ""
+    return f"Active project graph ({proj_name}):\n" + "\n".join(f"- {ln}" for ln in lines)
+
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -819,6 +866,9 @@ class AgentManager:
                         system_instruction += f"\nActive session checkpoint:\n{cp_ctx}\n"
             except Exception:
                 pass
+        proj_ctx = extract_cwd_project_context(self.storage, user_message)
+        if proj_ctx:
+            system_instruction += f"\n{proj_ctx}\n"
         self.storage.upsert_session(session_id, prev_id, title=user_message[:60])
         self.storage.add_message(session_id, "user", user_message)
         self.storage.record_activity("prompt", user_message[:80])
@@ -1170,6 +1220,7 @@ class AgentManager:
                                     except Exception:
                                         pass
                         self.storage.record_tool_metric(call.name, elapsed_ms, is_err)
+                        self._tool_cache.calibrate_from_metrics(self.storage)
                         if (is_err or cmd_nonzero) and isinstance(result_payload, str):
                             hint = build_recovery_hint(self.storage, call.name, args, result_payload)
                             if hint:
