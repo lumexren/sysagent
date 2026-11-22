@@ -158,6 +158,7 @@ GOLDEN_EVAL_CASES: list[dict[str, Any]] = [
     {"kind": "route", "prompt": "recall saved memories facts what do you remember", "expected_tool": "recall_memories"},
     {"kind": "route", "prompt": "what did brain do recently what rules exist", "expected_tool": "inspect_self_component"},
     {"kind": "route", "prompt": "brain cortex ne durumda kendi bileşenlerini incele", "expected_tool": "inspect_self_component"},
+    {"kind": "route", "prompt": "promptlar ne durumda prompt versions status", "expected_tool": "inspect_self_component"},
     {"kind": "chat", "prompt": "naber"},
     {"kind": "chat", "prompt": "merhaba nasilsin"},
     {"kind": "chat", "prompt": "hello thank you"},

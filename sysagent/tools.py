@@ -697,16 +697,105 @@ def execute_tool(
                 "models": "local_mind",
                 "notif": "notifications",
                 "notification": "notifications",
+                "prompt": "prompts",
+                "prompts": "prompts",
+                "prompt_registry": "prompts",
+                "templates": "prompts",
+                "promptlar": "prompts",
+                "promptlari": "prompts",
+                "promptları": "prompts",
+                "promptların": "prompts",
+                "checkpoint": "checkpoints",
+                "checkpoints": "checkpoints",
+                "sessions": "checkpoints",
+                "session": "checkpoints",
+                "code": "codebase",
+                "codebase": "codebase",
+                "source": "codebase",
+                "modules": "codebase",
+                "git": "codebase",
                 "summary": "all",
                 "overview": "all",
             }
             comp = alias_comp.get(raw_comp, raw_comp)
-            if comp not in {"brain", "cortex", "neural", "evolve", "local_mind", "self", "guard", "notifications", "all"}:
+            if comp not in {
+                "brain", "cortex", "neural", "evolve", "local_mind", "self",
+                "guard", "notifications", "prompts", "checkpoints", "codebase", "all",
+            }:
                 comp = "all"
             query_txt = str(arguments.get("query") or "").strip()
             refs = getattr(watcher, "runtime_refs", None) if watcher is not None else None
             refs = refs if isinstance(refs, dict) else {}
             out: dict[str, Any] = {"component": comp}
+
+            if comp in {"prompts", "all"}:
+                from .prompts import PromptRegistry
+
+                reg = PromptRegistry(storage)
+                all_hist = storage.list_prompt_versions()
+                by_key_hist: dict[str, list[dict[str, Any]]] = {}
+                for hv in all_hist:
+                    pk = str(hv.get("prompt_key") or "")
+                    by_key_hist.setdefault(pk, []).append(
+                        {
+                            "version": int(hv.get("version") or 0),
+                            "active": bool(hv.get("active")),
+                            "successes": int(hv.get("successes") or 0),
+                            "failures": int(hv.get("failures") or 0),
+                            "reason": str(hv.get("reason") or "")[:140],
+                            "created_at": hv.get("created_at"),
+                        }
+                    )
+                p_items: list[dict[str, Any]] = []
+                for p in reg.list_status():
+                    k = str(p["key"])
+                    kh = by_key_hist.get(k, [])
+                    entry: dict[str, Any] = {
+                        "key": k,
+                        "active_version": int(p.get("version") or 0),
+                        "total_versions": len(kh),
+                        "successes": int(p.get("successes") or 0),
+                        "failures": int(p.get("failures") or 0),
+                        "reason": str(p.get("reason") or "")[:140],
+                        "last_updated": kh[0].get("created_at") if kh else None,
+                        "history": kh[:5],
+                    }
+                    if comp == "prompts":
+                        entry["template_preview"] = str(p.get("template") or "")[:260]
+                    p_items.append(entry)
+                evolved_cnt = sum(1 for it in p_items if it["active_version"] > 0)
+                out["prompts"] = {
+                    "evolved_count": evolved_cnt,
+                    "total_keys": len(p_items),
+                    "total_versions_saved": len(all_hist),
+                    "prompts": p_items,
+                }
+
+            if comp in {"checkpoints", "all"}:
+                cps = storage.list_session_checkpoints(limit=12 if comp == "checkpoints" else 5)
+                all_cps = storage.list_session_checkpoints(limit=200)
+                out["checkpoints"] = {
+                    "count": len(all_cps),
+                    "recent": [
+                        {
+                            "session_id": c.get("session_id"),
+                            "topic": c.get("topic"),
+                            "files": c.get("files"),
+                            "commands": c.get("commands"),
+                            "summary": str(c.get("summary") or "")[:120],
+                            "created_at": c.get("created_at"),
+                        }
+                        for c in (cps if comp == "checkpoints" else cps[:3])
+                    ],
+                }
+
+            if comp in {"codebase", "all"}:
+                from .self_ops import get_live_codebase_summary
+
+                out["codebase"] = {
+                    "summary": get_live_codebase_summary(),
+                    "package_dir": str(Path(__file__).resolve().parent),
+                }
 
             if comp in {"brain", "all"}:
                 thoughts = storage.list_brain_thoughts(limit=6)
@@ -891,6 +980,7 @@ def execute_tool(
                     pass
 
             if comp == "all":
+                pr_s = out.get("prompts") or {}
                 b_th = out.get("brain", {}).get("recent_thoughts") or []
                 latest_th = str(b_th[0].get("summary") or "")[:75] if b_th else "none"
                 fl = (out.get("cortex", {}).get("flow") or {}).get("mode", "normal")
@@ -902,6 +992,8 @@ def execute_tool(
                 g_s = out.get("guard") or {}
                 q_s = g_s.get("quota") or {}
                 out["overview"] = (
+                    f"Prompts evolved={pr_s.get('evolved_count', 0)}/{pr_s.get('total_keys', 0)} "
+                    f"({pr_s.get('total_versions_saved', 0)} versions); "
                     f"Brain latest thought: {latest_th} (rules={out.get('brain', {}).get('rules_count', 0)}); "
                     f"Cortex flow={fl}; Neural acc={n_st.get('tool_accuracy', '-')}, "
                     f"bottleneck={wf_s.get('bottleneck_prob', 0)}; Evolve applied={ev_applied}/{ev_s.get('total', 0)}; "

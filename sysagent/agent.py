@@ -73,6 +73,16 @@ def build_system_instruction(
             for idx, h in enumerate(tail)
         )
         base += f"\nRecent conversation context (prior turns/sessions):\n{hist_lines}\n"
+    contract = (
+        "\nRuntime self-awareness contract:\n"
+        "- For ANY question about your own prompts, prompt evolution, Brain thoughts/rules, Cortex, NeuralEngine, "
+        "SelfEvolver, LocalMind, SelfGuard, checkpoints, or SysAgent source modules, call `inspect_self_component` "
+        "(use component=\"prompts\" for prompts/PromptRegistry, \"all\" for overall state, \"checkpoints\" for saved sessions, "
+        "or \"codebase\" for modules) IMMEDIATELY regardless of any [cwd: ...] directory prefix.\n"
+        "- Execute actions directly using your tools and chain multiple tool calls in the same turn when needed "
+        "(e.g. list -> read -> edit). NEVER output runnable bash commands like ```bash\\ncat ...\\n``` or announce "
+        "that you will check a file instead of invoking a tool."
+    )
     loc = (locale or "auto").strip()
     if loc.lower() == "auto":
         lang_rule = (
@@ -84,7 +94,50 @@ def build_system_instruction(
             f"Language rule: Always respond in locale {loc}, "
             "unless the user explicitly asks for another language."
         )
-    return f"{base}\n{lang_rule}"
+    return f"{base}{contract}\n{lang_rule}"
+
+
+def _looks_like_unexecuted_tool_stall(user_msg: str, reply_txt: str) -> bool:
+    """Detect short replies that print a fake runnable bash command instead of calling a tool."""
+    import re
+
+    txt = (reply_txt or "").strip()
+    if not txt or len(txt) > 900:
+        return False
+    u_low = (user_msg or "").lower()
+    if any(
+        k in u_low
+        for k in (
+            "örnek",
+            "example",
+            "snippet",
+            "how to",
+            "nasıl yazar",
+            "komutu nedir",
+            "komut nedir",
+            "komut ver",
+            "script",
+            "kod örneği",
+        )
+    ):
+        return False
+    blocks = re.findall(
+        r"```(?:bash|sh|shell|zsh)?\s*\n(.*?)\n```", txt, flags=re.DOTALL | re.IGNORECASE
+    )
+    if not blocks:
+        return False
+    runnable_cmds = (
+        "cat", "head", "tail", "sed", "awk", "grep", "rg", "ls", "find",
+        "clear", "reset", "systemctl", "journalctl", "ps", "df", "free", "du",
+        "git", "python", "python3", "pytest",
+    )
+    for blk in blocks:
+        lines = [ln.strip() for ln in blk.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        if 1 <= len(lines) <= 4:
+            first_tok = lines[0].split(None, 1)[0].split("/")[-1].lower()
+            if first_tok in runnable_cmds:
+                return True
+    return False
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -1078,10 +1131,12 @@ class AgentManager:
                                         except SyntaxError as exc:
                                             broken_py_err = f"{fp.name}: {exc}"
                                             break
+                    unexecuted_cmd_stall = _looks_like_unexecuted_tool_stall(user_message, text)
                     should_nudge = (
                         nudge_count < 3
                         and (
                             leaked_tool_json
+                            or unexecuted_cmd_stall
                             or read_only_stalled
                             or neural_stall
                             or bool(broken_py_err)
@@ -1094,6 +1149,11 @@ class AgentManager:
                             nudge_msg = (
                                 "[System]: Your previous reply contained raw `__tool_calls__` JSON instead of valid function calls. "
                                 "Emit ONLY clean, valid tool calls right now."
+                            )
+                        elif unexecuted_cmd_stall:
+                            nudge_msg = (
+                                "[System]: Do NOT output runnable bash commands like `cat` or `clear` for the user. "
+                                "Execute `inspect_self_component`, `read_file`, or `run_command` RIGHT NOW and report the real result."
                             )
                         elif broken_py_err:
                             nudge_msg = (
@@ -1115,6 +1175,7 @@ class AgentManager:
                             previous_interaction_id=interaction.id,
                             tools=pruned_tools,
                             system_instruction=system_instruction,
+                            on_delta=(_local_on_delta if interactive else None),
                         )
                         selected_model = self._session_models.get(session_id, selected_model)
                         self.sessions[session_id] = interaction.id

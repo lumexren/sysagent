@@ -513,18 +513,25 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "type": "function",
         "name": "inspect_self_component",
         "description": (
-            "Inspect SysAgent's live internal runtime components: 'brain' (recent thoughts, rules, questions), "
+            "Inspect SysAgent's live internal runtime components: 'prompts' (PromptRegistry active versions, "
+            "prompt evolution history, win/loss metrics, reasons), 'brain' (recent thoughts, rules, questions), "
             "'cortex' (Flow Guardian, Dream Cycle, Predictive Healer, Habit Copilot), "
             "'neural' (NeuralEngine accuracy, world forecast, pulse), 'evolve' (proposals & outcomes), "
-            "'local_mind' (warm GGUF model, backend, calibration), 'guard' (SelfGuard canary, eval gate, drift, circuit breakers, quota), "
-            "'notifications', or 'all'. Call this whenever asked what you are thinking or about Brain, Cortex, Neural, Evolve, LocalMind, SelfGuard, or internal state."
+            "'local_mind' (warm GGUF model, backend, calibration, VRAM, vision readiness), "
+            "'guard' (SelfGuard canary, eval gate, drift, circuit breakers, quota), 'notifications', "
+            "'checkpoints' (cross-session semantic checkpoints), 'codebase' (live SysAgent Python modules & git commits), "
+            "or 'all'. Call this for ANY question about SysAgent's own prompts, internal state, thoughts, rules, "
+            "evolution, models, guard, checkpoints, or modules — regardless of the user's current working directory."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "component": {
                     "type": "string",
-                    "description": "Target component: 'brain', 'cortex', 'neural', 'evolve', 'local_mind', 'guard', 'notifications', or 'all' (default 'all').",
+                    "description": (
+                        "Target component: 'prompts', 'brain', 'cortex', 'neural', 'evolve', "
+                        "'local_mind', 'guard', 'notifications', 'checkpoints', 'codebase', or 'all' (default 'all')."
+                    ),
                 },
                 "query": {
                     "type": "string",

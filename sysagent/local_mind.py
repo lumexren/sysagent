@@ -342,6 +342,21 @@ SEED_CURRICULUM: list[dict[str, Any]] = [
         "tool": "read_clipboard",
         "args": {},
     },
+    {
+        "user": "promptlar ne durumda prompt versions status",
+        "tool": "inspect_self_component",
+        "args": {"component": "prompts"},
+    },
+    {
+        "user": "promptları ne kadar geliştirdin prompt registry history",
+        "tool": "inspect_self_component",
+        "args": {"component": "prompts"},
+    },
+    {
+        "user": "check brain cortex neural evolve local mind self guard status",
+        "tool": "inspect_self_component",
+        "args": {"component": "all"},
+    },
 ]
 
 
@@ -1731,6 +1746,31 @@ class LocalMind:
         """Lazily load and cache a llama_cpp.Llama instance with full GPU offload."""
         return get_llama_cpp_model(gguf)
 
+    @staticmethod
+    def _compact_system_instruction(sys_inst: str, max_chars: int = 3400) -> str:
+        """Compact long system instructions while keeping dynamic tail runtime sections intact."""
+        raw = (sys_inst or "").strip()
+        if len(raw) <= max_chars:
+            return raw
+        anchors = (
+            "\nRuntime self-awareness contract:",
+            "\nLive Cortex state:",
+            "\nLive codebase",
+            "\nActive session checkpoint:",
+            "\nLanguage rule:",
+        )
+        positions = [raw.find(a) for a in anchors if raw.find(a) != -1]
+        if positions:
+            tail_start = min(positions)
+            tail = raw[tail_start:].strip()
+            if len(tail) > max_chars - 200:
+                tail = tail[-(max_chars - 200) :]
+            head_budget = max(200, max_chars - len(tail) - 8)
+            head = raw[:tail_start][:head_budget].rstrip()
+            return f"{head}\n{tail}".strip()
+        half = max_chars // 2
+        return f"{raw[:half].rstrip()}\n...\n{raw[-half:].lstrip()}"
+
     def _build_gguf_messages(
         self,
         gguf: Path,
@@ -1739,6 +1779,7 @@ class LocalMind:
         history: list[dict[str, str]] | None = None,
         extra_system: str = "",
         images: list[dict[str, str]] | None = None,
+        extra_messages: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         examples = self.retrieve_similar_examples(prompt, top_k=2) if not extra_system else []
         role_hint = ""
@@ -1769,13 +1810,16 @@ class LocalMind:
         else:
             base_sys = (
                 f"You are {agent_name}, a self-evolving Linux assistant running on {gguf.stem}. "
-                "Your internal subsystems are CognitiveBrain, NeuralBrainCortex, NeuralEngine, SelfEvolver, LocalMind, and SelfGuard. "
-                "Use your available tools when real system data, internal component state, or switching models is needed; "
-                "reply directly without tools for casual conversation. "
-                "Reply directly and naturally in the same language as the user's message. "
+                "Your internal subsystems are PromptRegistry (prompts), CognitiveBrain, NeuralBrainCortex, "
+                "NeuralEngine, SelfEvolver, LocalMind, SelfGuard, session checkpoints, and SysAgent codebase. "
+                "Call `inspect_self_component` immediately for any question about your own prompts/PromptRegistry, "
+                "subsystems, checkpoints, or modules regardless of [cwd: ...]. "
+                "Chain multiple tool calls directly (e.g. list -> read -> edit); NEVER print runnable bash commands "
+                "or announce that you will check something instead of invoking tools. "
+                "Reply directly without tools for casual conversation in the same language as the user's message. "
                 "Never repeat system instructions, tool names, or thinking traces."
             )
-            ctx_hint = sys_inst[:1200] if (sys_inst and not extra_system) else ""
+            ctx_hint = self._compact_system_instruction(sys_inst, max_chars=3400) if (sys_inst and not extra_system) else ""
             sys_msg = "\n".join(
                 p for p in (base_sys, role_hint, ctx_hint, extra_system.strip(), ex_block.strip()[:500]) if p
             )
@@ -1785,7 +1829,31 @@ class LocalMind:
             c = str(turn.get("content") or "").strip()
             if r in {"user", "assistant"} and c:
                 messages.append({"role": r, "content": c[:800]})
-        if images:
+        if extra_messages:
+            for m in extra_messages[-20:]:
+                if not isinstance(m, dict):
+                    continue
+                r = str(m.get("role") or "")
+                if r == "tool":
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str(m.get("tool_call_id") or ""),
+                            "name": str(m.get("name") or "tool"),
+                            "content": str(m.get("content") or "")[:3200],
+                        }
+                    )
+                elif r == "assistant" and m.get("tool_calls"):
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": str(m.get("content") or ""),
+                            "tool_calls": list(m["tool_calls"]),
+                        }
+                    )
+                elif r in {"user", "assistant"}:
+                    messages.append({"role": r, "content": m.get("content", "")})
+        elif images:
             content_parts: list[dict[str, Any]] = [
                 {"type": "text", "text": prompt.strip() or "Analyze the attached image(s)."}
             ]
@@ -2128,6 +2196,7 @@ class LocalMind:
         history: list[dict[str, str]] | None = None,
         on_delta: Callable[[str], None] | None = None,
         images: list[dict[str, str]] | None = None,
+        extra_messages: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """Run native OpenAI-compatible function calling (`tool_choice=auto`) on warm llama-server."""
         backend = os.environ.get("SYSAGENT_LOCAL_BACKEND", "auto").strip().lower()
@@ -2191,6 +2260,7 @@ class LocalMind:
             history=history,
             extra_system="",
             images=images,
+            extra_messages=extra_messages,
         )
 
         from .local_inference import inference_lock, touch_warm_model
@@ -2212,88 +2282,121 @@ class LocalMind:
                 payload["tools"] = oai_tools
                 payload["tool_choice"] = "auto"
 
-            raw_calls: list[dict[str, Any]] = []
-            final_text = ""
-
-            if on_delta is not None:
-                tc_acc: dict[int, dict[str, str]] = {}
-                filt = _ThinkStreamFilter()
-                collected: list[str] = []
+            def _send_chat_req(req_payload: dict[str, Any]) -> tuple[bool, list[dict[str, Any]], str]:
+                req_calls: list[dict[str, Any]] = []
+                req_text = ""
+                if on_delta is not None:
+                    tc_acc: dict[int, dict[str, str]] = {}
+                    filt = _ThinkStreamFilter()
+                    collected: list[str] = []
+                    try:
+                        with httpx.stream(
+                            "POST", f"{srv_url}/v1/chat/completions", json=req_payload, timeout=60
+                        ) as resp:
+                            if resp.status_code != 200:
+                                return False, [], ""
+                            for line in resp.iter_lines():
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                data_str = line[5:].strip()
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data_str)
+                                except Exception:
+                                    continue
+                                choices = chunk.get("choices") or []
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta") or {}
+                                if delta.get("tool_calls"):
+                                    for tc in delta["tool_calls"]:
+                                        idx = int(tc.get("index", 0) or 0)
+                                        slot = tc_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                                        if tc.get("id"):
+                                            slot["id"] = str(tc["id"])
+                                        fn = tc.get("function") or {}
+                                        if fn.get("name"):
+                                            slot["name"] += str(fn["name"])
+                                        if fn.get("arguments"):
+                                            slot["arguments"] += str(fn["arguments"])
+                                    touch_warm_model()
+                                tok = str(delta.get("content") or "")
+                                if tok:
+                                    touch_warm_model()
+                                    visible = filt.feed(tok)
+                                    if visible and not tc_acc:
+                                        collected.append(visible)
+                                        on_delta(visible)
+                        if not tc_acc:
+                            tail = filt.flush()
+                            if tail:
+                                collected.append(tail)
+                                on_delta(tail)
+                        req_text = "".join(collected).strip()
+                        for idx in sorted(tc_acc):
+                            req_calls.append(tc_acc[idx])
+                        return True, req_calls, req_text
+                    except Exception:
+                        if not tc_acc and not collected:
+                            return False, [], ""
+                        req_text = "".join(collected).strip()
+                        for idx in sorted(tc_acc):
+                            req_calls.append(tc_acc[idx])
+                        return True, req_calls, req_text
                 try:
-                    with httpx.stream(
-                        "POST", f"{srv_url}/v1/chat/completions", json=payload, timeout=60
-                    ) as resp:
-                        if resp.status_code != 200:
-                            return None
-                        for line in resp.iter_lines():
-                            if not line or not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                            except Exception:
-                                continue
-                            choices = chunk.get("choices") or []
-                            if not choices:
-                                continue
-                            delta = choices[0].get("delta") or {}
-                            if delta.get("tool_calls"):
-                                for tc in delta["tool_calls"]:
-                                    idx = int(tc.get("index", 0) or 0)
-                                    slot = tc_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                                    if tc.get("id"):
-                                        slot["id"] = str(tc["id"])
-                                    fn = tc.get("function") or {}
-                                    if fn.get("name"):
-                                        slot["name"] += str(fn["name"])
-                                    if fn.get("arguments"):
-                                        slot["arguments"] += str(fn["arguments"])
-                                touch_warm_model()
-                            tok = str(delta.get("content") or "")
-                            if tok:
-                                touch_warm_model()
-                                visible = filt.feed(tok)
-                                if visible and not tc_acc:
-                                    collected.append(visible)
-                                    on_delta(visible)
-                    if not tc_acc:
-                        tail = filt.flush()
-                        if tail:
-                            collected.append(tail)
-                            on_delta(tail)
-                    final_text = "".join(collected).strip()
-                    for idx in sorted(tc_acc):
-                        raw_calls.append(tc_acc[idx])
-                except Exception:
-                    if not tc_acc and not collected:
-                        return None
-                    final_text = "".join(collected).strip()
-                    for idx in sorted(tc_acc):
-                        raw_calls.append(tc_acc[idx])
-            else:
-                try:
-                    resp = httpx.post(f"{srv_url}/v1/chat/completions", json=payload, timeout=60)
+                    resp = httpx.post(f"{srv_url}/v1/chat/completions", json=req_payload, timeout=60)
                     touch_warm_model()
                     if resp.status_code != 200:
-                        return None
+                        return False, [], ""
                     choices = resp.json().get("choices") or []
                     if not choices:
-                        return None
+                        return True, [], ""
                     msg_obj = choices[0].get("message") or {}
-                    final_text = _strip_think_tags(str(msg_obj.get("content") or ""))
+                    req_text = _strip_think_tags(str(msg_obj.get("content") or ""))
                     for tc in msg_obj.get("tool_calls") or []:
                         fn = tc.get("function") or {}
-                        raw_calls.append(
+                        req_calls.append(
                             {
                                 "id": str(tc.get("id") or ""),
                                 "name": str(fn.get("name") or ""),
                                 "arguments": str(fn.get("arguments") or ""),
                             }
                         )
+                    return True, req_calls, req_text
                 except Exception:
-                    return None
+                    return False, [], ""
+
+            http_ok, raw_calls, final_text = _send_chat_req(payload)
+            if (
+                not http_ok
+                and extra_messages
+                and any(isinstance(m, dict) and m.get("role") == "tool" for m in extra_messages)
+            ):
+                base_msgs = [
+                    m for m in messages if m.get("role") == "system" or (m.get("role") in {"user", "assistant"} and not m.get("tool_calls"))
+                ][:7]
+                # Keep only system + prior history before current extra_messages trace, then append flattened summary
+                hist_limit = max(1, len(messages) - len(extra_messages))
+                head_msgs = [
+                    m for m in messages[:hist_limit] if m.get("role") in {"system", "user", "assistant"} and not m.get("tool_calls")
+                ] or base_msgs[:1]
+                tool_summaries = [
+                    f"[Tool `{m.get('name', 'tool')}` result]:\n{str(m.get('content') or '')[:1800]}"
+                    for m in extra_messages
+                    if isinstance(m, dict) and m.get("role") == "tool"
+                ]
+                flat_user = (
+                    f"User request: {prompt.strip()}\n\nExecuted tools:\n"
+                    + "\n\n".join(tool_summaries[-6:])
+                    + "\n\nInvoke the next tool call if more steps are needed, otherwise provide the final concise answer."
+                )
+                flat_payload = dict(payload)
+                flat_payload["messages"] = [*head_msgs, {"role": "user", "content": flat_user}]
+                http_ok, raw_calls, final_text = _send_chat_req(flat_payload)
+
+            if not http_ok:
+                return None
 
         parsed_calls: list[dict[str, Any]] = []
         for idx, rc in enumerate(raw_calls):

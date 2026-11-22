@@ -20,6 +20,8 @@ _LOCAL_CORE_TOOLS = frozenset(
         "system_status",
         "run_command",
         "read_file",
+        "list_directory",
+        "edit_file",
         "search_memory_and_history",
     }
 )
@@ -34,15 +36,20 @@ class _LocalMindInteractions:
         self.mind = LocalMind(storage)
         self._last_user_input: dict[str, str] = {}
         self._history: dict[str, list[dict[str, str]]] = {}
+        self._turn_messages: dict[str, list[dict[str, Any]]] = {}
+        self._turn_calls: dict[str, list[str]] = {}
 
     def _select_tools_for_local(
-        self, user_text: str, tools: list[dict[str, Any]], limit: int = 12
+        self, user_text: str, tools: list[dict[str, Any]], limit: int = 14
     ) -> list[dict[str, Any]]:
         """Rank and select the most relevant OpenAI tool declarations using NeuralEngine, LocalMind, and schemas."""
+        import re
+
         valid = [t for t in tools if isinstance(t, dict) and t.get("name")]
         if len(valid) <= limit:
             return valid
 
+        clean_text = re.sub(r"^\[cwd:[^\]]+\]\s*", "", user_text or "").strip() or (user_text or "")
         scores: dict[str, float] = {str(t["name"]): 0.0 for t in valid}
         if self.mind.storage is not None:
             try:
@@ -50,20 +57,20 @@ class _LocalMindInteractions:
 
                 eng = NeuralEngine(self.mind.storage)
                 if int(eng.meta.get("epochs_trained", 0)) > 0:
-                    for name, prob in eng.predict_tool_probs(user_text).items():
+                    for name, prob in eng.predict_tool_probs(clean_text).items():
                         if name in scores:
                             scores[name] += float(prob) * 10.0
             except Exception:
                 pass
         try:
             pred_name, _, pred_score = self.mind.predict_tool(
-                user_text, allowed_names=set(scores), record_uncertain=False
+                clean_text, allowed_names=set(scores), record_uncertain=False
             )
             if pred_name and pred_name in scores:
                 scores[pred_name] += float(pred_score) * 8.0
         except TypeError:
             try:
-                pred_name, _, pred_score = self.mind.predict_tool(user_text, allowed_names=set(scores))
+                pred_name, _, pred_score = self.mind.predict_tool(clean_text, allowed_names=set(scores))
                 if pred_name and pred_name in scores:
                     scores[pred_name] += float(pred_score) * 8.0
             except Exception:
@@ -71,7 +78,7 @@ class _LocalMindInteractions:
         except Exception:
             pass
 
-        q_tokens = {tok for tok in (user_text or "").lower().split() if len(tok) >= 2}
+        q_tokens = {tok for tok in clean_text.lower().split() if len(tok) >= 2}
         for t in valid:
             tname = str(t["name"])
             if tname in _LOCAL_CORE_TOOLS:
@@ -170,6 +177,43 @@ class _LocalMindInteractions:
             return _tgen()
         return SimpleNamespace(id=new_id, steps=[], output_text=reply)
 
+    def _store_turn_state(
+        self,
+        interaction_id: str,
+        user_text: str,
+        history: list[dict[str, str]],
+        turn_messages: list[dict[str, Any]] | None = None,
+        turn_calls: list[str] | None = None,
+    ) -> None:
+        self._last_user_input[interaction_id] = user_text
+        self._history[interaction_id] = history
+        if turn_messages is not None:
+            self._turn_messages[interaction_id] = turn_messages[-20:]
+        if turn_calls is not None:
+            self._turn_calls[interaction_id] = turn_calls
+        if len(self._last_user_input) > 200:
+            oldest = next(iter(self._last_user_input))
+            self._last_user_input.pop(oldest, None)
+            self._history.pop(oldest, None)
+            self._turn_messages.pop(oldest, None)
+            self._turn_calls.pop(oldest, None)
+
+    @staticmethod
+    def _oai_tool_call_entry(call_id: str, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        import json as _json
+
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": _json.dumps(args or {}, ensure_ascii=False)},
+        }
+
+    @staticmethod
+    def _call_sig(name: str, args: dict[str, Any]) -> str:
+        import json as _json
+
+        return f"{name}:{_json.dumps(args or {}, sort_keys=True, ensure_ascii=False)}"
+
     def create(
         self,
         *,
@@ -188,7 +232,8 @@ class _LocalMindInteractions:
         sys_inst = system_instruction or ""
         from .self_resilience import ContextBudgeter
 
-        raw_hist = list(self._history.get(previous_interaction_id or "", []))
+        prev_id = previous_interaction_id or ""
+        raw_hist = list(self._history.get(prev_id, []))
         prev_hist = ContextBudgeter.compact_history(raw_hist, max_chars=2400, keep_recent=4)
 
         if "Respond ONLY with valid JSON" in sys_inst or "Respond ONLY with JSON" in sys_inst:
@@ -200,9 +245,10 @@ class _LocalMindInteractions:
             return self._emit_text(new_id, json_reply, stream)
 
         if isinstance(input, list):
-            orig_q = self._last_user_input.get(previous_interaction_id or "", "")
+            orig_q = self._last_user_input.get(prev_id, "")
             extracted_images: list[dict[str, str]] = []
             sanitized_input: list[Any] = []
+            tool_trace_msgs: list[dict[str, Any]] = []
             for item in input:
                 if not isinstance(item, dict):
                     sanitized_input.append(item)
@@ -223,13 +269,83 @@ class _LocalMindInteractions:
                         else:
                             clean_parts.append(part)
                     item_copy["result"] = clean_parts
+                    res_str = _json.dumps(clean_parts, ensure_ascii=False)
+                else:
+                    res_str = str(res_val or "")
                 sanitized_input.append(item_copy)
+                tool_trace_msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(item_copy.get("call_id") or ""),
+                        "name": str(item_copy.get("name") or "tool"),
+                        "content": res_str[:3200],
+                    }
+                )
+
+            mm_role = "multimodal" if extracted_images else None
+            prior_tmsgs = list(
+                self._turn_messages.get(prev_id) or ([{"role": "user", "content": orig_q}] if orig_q else [])
+            )
+            turn_msgs = (prior_tmsgs + tool_trace_msgs)[-20:]
+            prev_sigs = list(self._turn_calls.get(prev_id) or [])
+
+            if tools and len(prev_sigs) < 8:
+                selected_tools = self._select_tools_for_local(orig_q, tools, limit=14)
+                native = self.mind.run_gguf_chat_with_tools(
+                    orig_q,
+                    tools=selected_tools,
+                    system_instruction=sys_inst,
+                    preferred_role=mm_role,
+                    history=prev_hist,
+                    on_delta=on_delta,
+                    images=extracted_images or None,
+                    extra_messages=turn_msgs,
+                )
+                if native is not None:
+                    native_calls = native.get("tool_calls") or []
+                    if native_calls:
+                        new_sigs = [
+                            self._call_sig(str(tc["name"]), dict(tc.get("arguments") or {}))
+                            for tc in native_calls
+                        ]
+                        prev_sig_set = set(prev_sigs)
+                        if not all(sig in prev_sig_set for sig in new_sigs):
+                            steps: list[Any] = []
+                            oai_calls: list[dict[str, Any]] = []
+                            for tc in native_calls:
+                                cid = str(tc.get("id") or f"local_call_{uuid.uuid4().hex[:6]}")
+                                cname = str(tc["name"])
+                                cargs = dict(tc.get("arguments") or {})
+                                steps.append(
+                                    SimpleNamespace(
+                                        type="function_call",
+                                        id=cid,
+                                        name=cname,
+                                        arguments=cargs,
+                                    )
+                                )
+                                oai_calls.append(self._oai_tool_call_entry(cid, cname, cargs))
+                            turn_msgs.append({"role": "assistant", "content": "", "tool_calls": oai_calls})
+                            self._store_turn_state(
+                                new_id, orig_q, raw_hist, turn_msgs, prev_sigs + new_sigs
+                            )
+                            return self._emit_steps(new_id, steps, stream)
+                    native_text = str(native.get("text") or "").strip()
+                    if native_text and not native_calls:
+                        self._store_turn_state(
+                            new_id,
+                            orig_q,
+                            (raw_hist + [{"role": "user", "content": orig_q}, {"role": "assistant", "content": native_text}])[-16:],
+                            [],
+                            [],
+                        )
+                        return self._emit_text(new_id, native_text, stream)
+
             summary_prompt = (
                 f"User request: {orig_q}\n"
                 f"Tool results: {_json.dumps(sanitized_input, ensure_ascii=False)[:3400]}\n"
                 "Answer the user's request concisely in their language based on these tool results."
             )
-            mm_role = "multimodal" if extracted_images else None
             if on_delta is not None:
                 reply = self.mind.stream_gguf_inference(
                     summary_prompt,
@@ -249,70 +365,116 @@ class _LocalMindInteractions:
                 )
             if not reply:
                 reply = self.mind.synthesize_reply(orig_q, tool_results=input, system_instruction=sys_inst)
-            self._history[new_id] = (raw_hist + [{"role": "user", "content": orig_q}, {"role": "assistant", "content": reply}])[-16:]
+            self._store_turn_state(
+                new_id,
+                orig_q,
+                (raw_hist + [{"role": "user", "content": orig_q}, {"role": "assistant", "content": reply}])[-16:],
+                [],
+                [],
+            )
             return self._emit_text(new_id, reply, stream)
 
         user_text = str(input or "")
+        is_nudge = user_text.lstrip().startswith("[System]:") and bool(prev_id) and (prev_id in self._last_user_input)
+        effective_q = self._last_user_input[prev_id] if is_nudge else user_text
+
         from .local_mind import extract_inline_images
 
-        _, inline_images = extract_inline_images(user_text)
+        _, inline_images = extract_inline_images(effective_q)
         mm_role = "multimodal" if inline_images else None
-        self._last_user_input[new_id] = user_text
-        self._history[new_id] = prev_hist
-        if len(self._last_user_input) > 200:
-            oldest = next(iter(self._last_user_input))
-            self._last_user_input.pop(oldest, None)
-            self._history.pop(oldest, None)
+        if is_nudge:
+            prior_tmsgs = list(
+                self._turn_messages.get(prev_id) or [{"role": "user", "content": effective_q}]
+            )
+            turn_msgs_for_model: list[dict[str, Any]] | None = (
+                prior_tmsgs + [{"role": "user", "content": user_text}]
+            )[-20:]
+            active_trace = list(turn_msgs_for_model)
+            prev_sigs = list(self._turn_calls.get(prev_id) or [])
+        else:
+            turn_msgs_for_model = None
+            active_trace = [{"role": "user", "content": user_text}]
+            prev_sigs = []
+
+        self._store_turn_state(new_id, effective_q, prev_hist, active_trace, prev_sigs)
 
         allowed: set[str] = set()
         selected_tools: list[dict[str, Any]] = []
         if tools:
-            selected_tools = self._select_tools_for_local(user_text, tools, limit=12)
+            selected_tools = self._select_tools_for_local(effective_q, tools, limit=14)
             allowed = {str(t["name"]) for t in selected_tools if isinstance(t, dict) and t.get("name")}
             native = self.mind.run_gguf_chat_with_tools(
-                user_text,
+                effective_q,
                 tools=selected_tools,
                 system_instruction=sys_inst,
                 preferred_role=mm_role,
                 history=prev_hist,
                 on_delta=on_delta,
                 images=inline_images or None,
+                extra_messages=turn_msgs_for_model,
             )
             if native is not None:
                 native_calls = native.get("tool_calls") or []
                 if native_calls:
-                    steps = [
-                        SimpleNamespace(
-                            type="function_call",
-                            id=str(tc.get("id") or f"local_call_{uuid.uuid4().hex[:6]}"),
-                            name=str(tc["name"]),
-                            arguments=dict(tc.get("arguments") or {}),
+                    steps = []
+                    oai_calls = []
+                    new_sigs = []
+                    for tc in native_calls:
+                        cid = str(tc.get("id") or f"local_call_{uuid.uuid4().hex[:6]}")
+                        cname = str(tc["name"])
+                        cargs = dict(tc.get("arguments") or {})
+                        steps.append(
+                            SimpleNamespace(
+                                type="function_call",
+                                id=cid,
+                                name=cname,
+                                arguments=cargs,
+                            )
                         )
-                        for tc in native_calls
-                    ]
+                        oai_calls.append(self._oai_tool_call_entry(cid, cname, cargs))
+                        new_sigs.append(self._call_sig(cname, cargs))
+                    active_trace.append({"role": "assistant", "content": "", "tool_calls": oai_calls})
+                    self._store_turn_state(
+                        new_id, effective_q, prev_hist, active_trace, prev_sigs + new_sigs
+                    )
                     return self._emit_steps(new_id, steps, stream)
                 native_text = str(native.get("text") or "").strip()
                 if native_text:
-                    self._history[new_id] = (
-                        raw_hist + [{"role": "user", "content": user_text}, {"role": "assistant", "content": native_text}]
-                    )[-16:]
+                    self._store_turn_state(
+                        new_id,
+                        effective_q,
+                        (raw_hist + [{"role": "user", "content": effective_q}, {"role": "assistant", "content": native_text}])[-16:],
+                        [],
+                        [],
+                    )
                     return self._emit_text(new_id, native_text, stream)
 
-            if not inline_images:
+            if not inline_images and not is_nudge:
                 from .self_guard import get_calibration
 
                 tool_thresh = float(get_calibration(self.mind.storage)["local_tool_threshold"])
-                pred_tool, pred_args, score = self.mind.predict_tool(user_text, allowed_names=allowed)
+                pred_tool, pred_args, score = self.mind.predict_tool(effective_q, allowed_names=allowed)
                 if pred_tool and score >= tool_thresh:
+                    cid = f"local_call_{uuid.uuid4().hex[:6]}"
                     step = SimpleNamespace(
                         type="function_call",
-                        id=f"local_call_{uuid.uuid4().hex[:6]}",
+                        id=cid,
                         name=pred_tool,
                         arguments=pred_args,
                     )
+                    active_trace.append(
+                        {"role": "assistant", "content": "", "tool_calls": [self._oai_tool_call_entry(cid, pred_tool, pred_args)]}
+                    )
+                    self._store_turn_state(
+                        new_id,
+                        effective_q,
+                        prev_hist,
+                        active_trace,
+                        prev_sigs + [self._call_sig(pred_tool, pred_args)],
+                    )
                     return self._emit_step(new_id, step, stream)
 
-        extra_sys = self._format_tool_catalog(selected_tools or tools or [], user_text) if tools else ""
+        extra_sys = self._format_tool_catalog(selected_tools or tools or [], effective_q) if tools else ""
         if on_delta is not None:
             stream_mode: list[str] = ["pending" if allowed else "live"]
 
@@ -351,17 +513,34 @@ class _LocalMindInteractions:
             parsed = self._extract_tool_call(reply, allowed)
             if parsed is not None:
                 tname, targs = parsed
+                cid = f"local_call_{uuid.uuid4().hex[:6]}"
                 step = SimpleNamespace(
                     type="function_call",
-                    id=f"local_call_{uuid.uuid4().hex[:6]}",
+                    id=cid,
                     name=tname,
                     arguments=targs,
+                )
+                active_trace.append(
+                    {"role": "assistant", "content": "", "tool_calls": [self._oai_tool_call_entry(cid, tname, targs)]}
+                )
+                self._store_turn_state(
+                    new_id,
+                    effective_q,
+                    prev_hist,
+                    active_trace,
+                    prev_sigs + [self._call_sig(tname, targs)],
                 )
                 return self._emit_step(new_id, step, stream)
 
         if not reply:
-            reply = self.mind.synthesize_reply(user_text, tool_results=None, system_instruction=sys_inst)
-        self._history[new_id] = (raw_hist + [{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])[-16:]
+            reply = self.mind.synthesize_reply(effective_q, tool_results=None, system_instruction=sys_inst)
+        self._store_turn_state(
+            new_id,
+            effective_q,
+            (raw_hist + [{"role": "user", "content": effective_q}, {"role": "assistant", "content": reply}])[-16:],
+            [],
+            [],
+        )
         return self._emit_text(new_id, reply, stream)
 
 
